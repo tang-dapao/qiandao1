@@ -1,0 +1,78 @@
+# ============================================================
+# 自动签到 + 看广告 配置
+# 目标: QQ (com.tencent.mobileqq) 机器人任务中心
+# 注意: 所有坐标基于固定的模拟器分辨率，改动分辨率需重新抓取
+# ============================================================
+
+device:
+  # MuMu 模拟器 adb 序列号
+  # MuMu 有两个 adb 入口：
+  #   - emulator-5554：MuMu 底层 QEMU 内核，adb server 自动发现，daemon 重启自动重连（稳定，推荐）
+  #   - 127.0.0.1:16384：MuMu 网络 adb 转发端口，需手动 `adb connect`，daemon 重启会丢
+  # 实测本机 MuMu（机型模拟小米 12 / cupid）稳定入口为 emulator-5554
+  udid: "emulator-5554"
+  platform: "Android"
+  platformVersion: "15.0"        # MuMu 12 = Android 15
+  noReset: true                  # 不重置应用数据（保持已登录状态）
+
+app:
+  package: "com.tencent.mobileqq"
+  activity: "com.tencent.mobileqq.activity.SplashActivity"
+
+# ------------------------------------------------------------
+# 流程控制
+# ------------------------------------------------------------
+workflow:
+  # 每个机器人看广告的次数
+  ad_times_per_robot: 10
+  # 看广告时在广告页停留的随机区间（秒）
+  ad_wait_min: 18
+  ad_wait_max: 20
+  # 广告观看后的 CD（秒）
+  ad_cooldown: 60
+  # 广告关闭重试轮数（广告时长不固定，播完才出现关闭按钮，需轮询）
+  ad_close_retries: 12
+  # 是否跳过昵称包含“内测中”的机器人
+  skip_beta: true
+  # 昵称重复的机器人是否跳过（不重复进聊天框）
+  skip_duplicate_name: true
+
+# ------------------------------------------------------------
+# 点击频率控制（防风控）
+# ------------------------------------------------------------
+timing:
+  # 两次点击之间的随机间隔区间（秒）
+  click_min: 1.5
+  click_max: 3.0
+  # 页面切换后的等待时间（秒）
+  page_wait: 2.5
+  # 进入个人页后等待任务中心刷新的时间（秒）
+  taskcenter_wait: 3.0
+  # 广告页关闭后等待返回任务中心的时间（秒）
+  ad_close_wait: 2.0
+  # 元素校验最大重试次数
+  max_retry: 3
+  # 元素存在检测轮询间隔（秒）
+  poll_interval: 1.0
+  # 单个元素超时（秒）
+  element_timeout: 15
+
+# ------------------------------------------------------------
+# OCR 配置
+# ------------------------------------------------------------
+ocr:
+  engine: "pytesseract"          # 目前仅支持 pytesseract
+  tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  # 识别语言: chi_sim=简体中文, eng=英文; + 表示组合（中英混合识别）
+  lang: "chi_sim+eng"
+  # 识别文字时的置信度阈值（0~100），低于此值视为未命中
+  confidence: 60
+  # 识别时是否放大截图（提高小字识别率）
+  scale: 2.0
+
+# ------------------------------------------------------------
+# 日志
+# ------------------------------------------------------------
+logging:
+  level: "INFO"                  # DEBUG / INFO / WARNING / ERROR
+  file: "logs/run.log"

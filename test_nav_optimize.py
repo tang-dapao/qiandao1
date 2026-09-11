@@ -67,7 +67,7 @@ class FakeUI:
         self.taps = []
         self.dump_fail_streak = 0   # flow._dump_stuck 读取（0 = 页面正常）
 
-    def nodes(self):
+    def nodes(self, timeout=None):
         return list(self.pages[self.pos])
 
     def refresh(self):
@@ -85,7 +85,7 @@ class FakeUI:
     def swipe_down(self, pause=1.0):
         self._move(-1)
 
-    def find(self, text, ymin=0, ymax=99999, xmin=0, xmax=99999):
+    def find(self, text, ymin=0, ymax=99999, xmin=0, xmax=99999, timeout=None):
         for n in self.nodes():
             if (n.text == text and ymin <= n.y1 <= ymax
                     and xmin <= n.x1 <= xmax):
@@ -243,7 +243,7 @@ class TestNavFastPath(unittest.TestCase):
                 super().__init__([[]])
                 self.stage = "home_msg"
 
-            def nodes(self):
+            def nodes(self, timeout=None):
                 if self.stage == "home_msg":
                     return _bottom_tabs("消息") + [nd("某会话", 400)]
                 if self.stage == "contacts_no_cat":

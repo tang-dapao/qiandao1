@@ -71,7 +71,7 @@ class AdbCacheBase(unittest.TestCase):
         self.xml = None
         self.dump_calls = 0
 
-        def _dump():
+        def _dump(timeout=None):
             self.dump_calls += 1
             return self.xml
 

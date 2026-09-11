@@ -150,9 +150,13 @@ class Flow:
     # 基础：uiautomator 定位（带滚动）
     # ----------------------------------------------------------
     def _find(self, text: str, ymin: int = 0, ymax: int = 99999,
-              xmin: int = 0, xmax: int = 99999) -> Optional[Node]:
-        """按文本精确查找第一个节点（可限定区域；F1 加 x 范围支持机器人分类）。"""
-        return self.ui.find(text, ymin=ymin, ymax=ymax, xmin=xmin, xmax=xmax)
+              xmin: int = 0, xmax: int = 99999,
+              timeout: Optional[float] = None) -> Optional[Node]:
+        """按文本精确查找第一个节点（可限定区域；F1 加 x 范围支持机器人分类）。
+        timeout 透传给 dump，供关闭广告场景压低单次 dump 等待（#2）。
+        """
+        return self.ui.find(text, ymin=ymin, ymax=ymax, xmin=xmin, xmax=xmax,
+                             timeout=timeout)
 
     # ----------------------------------------------------------
     # 任务中心行定位 + 完成度判定（2026-09-09 校准点）
@@ -1125,8 +1129,12 @@ class Flow:
             return (x, y)
         return None
 
-    def _back_at_taskcenter(self) -> bool:
+    def _back_at_taskcenter(self, timeout: Optional[float] = None) -> bool:
         """判断是否真的回到了「任务中心」页面（F10+ 严格版）。
+
+        timeout（2026-09-11 优化 A）：透传给 dump，供 _close_ad 关闭广告场景压低
+        确认阶段的单次 dump 等待（默认 None→DUMP_TIMEOUT=4s；_close_ad 传
+        ad_close_dump_timeout=2.5s）。关闭动画期 dump 必然超时，用短超时快速失败。
 
         必须同时满足：
         - uiautomator 看到核心任务行（获取随机/看广告 + 每日签到 或 任务中心）。
@@ -1136,17 +1144,19 @@ class Flow:
           误判回任务中心 → 静默假成功，22s sleep 在问卷上白耗）。
         - OCR 顶部条带无「关闭广告/关闭/跳过」按钮（广告未关）。
 
-        性能优化（2026-09-10）：**OCR 先行、dump 作二次确认**。视频/动画期间
-        uiautomator 无法 idle → dump 必然失败且每次要耗 4s×2 重试 ≈8.3s；而任务
-        中心特征词同样能用 OCR 读到（且不受动画影响，~1.3s）。因此先用 OCR 排除
-        广告页，只有 OCR 命中时才付出 dump 的代价做严格二次确认。
+        性能优化（2026-09-10，dump 重试 #2 于 2026-09-10 再优化）：**OCR 先行、
+        dump 作二次确认**。视频/动画期间 uiautomator 无法 idle → dump 必然超时
+        （现已改为超时即失败、不重试，单次 ~4s 而非 4s×2≈8.3s；关闭广告路径更用
+        2.5s）；而任务中心特征词同样能用 OCR 读到（且不受动画影响，~1.3s）。因此
+        先用 OCR 排除广告页，只有 OCR 命中时才付出 dump 的代价做严格二次确认。
         """
         # 1) OCR 先验（快路径）：读不到任务中心特征 → 一定没回任务中心
         if not self._taskcenter_confirmed_by_ocr():
             return False
         # 2) dump 二次确认：防全屏 H5 / 问卷页 OCR 误命中导致的静默假成功
         #    （旧版漏洞：问卷页 tap 无效却被判成功，白白空等 22s）
-        if not (self._find("获取随机") or self._find("看广告")):
+        if not (self._find("获取随机", timeout=timeout)
+                or self._find("看广告", timeout=timeout)):
             # dump 不可用（视频期/界面未稳定）＝ 无法排除，此时信任 OCR 正向命中，
             # 避免因 dump 暂时失效把"已回任务中心"误判成没回去（会白跑一轮关闭）。
             if getattr(self.ui, "dump_fail_streak", 0) > 0:
@@ -1154,7 +1164,8 @@ class Flow:
                             "以 OCR 判定为准", self.ui.dump_fail_streak)
                 return True
             return False
-        if not (self._find("每日签到") or self._find("任务中心")):
+        if not (self._find("每日签到", timeout=timeout)
+                or self._find("任务中心", timeout=timeout)):
             return False
         # 关闭按钮消失（仍覆盖 → 广告没关）
         if self._ocr_find("关闭广告", "关闭", "跳过",
@@ -1252,18 +1263,19 @@ class Flow:
         return self._ocr_find("关闭广告", "关闭", "跳过", "取消",
                               ymax=400, region=AD_TOP_REGION)
 
-    def _find_close_node(self) -> Optional[Node]:
+    def _find_close_node(self, timeout: Optional[float] = None) -> Optional[Node]:
         """uiautomator 定位广告页关闭按钮节点，返回 Node（None = 未命中）。
 
         匹配：精确「关闭广告」→ 含「跳过」/「关闭」开头的候选（部分广告用
         「跳过」或「关闭」按钮）。坐标来自真实 dump bounds —— F11 认可的
         节点点击，比 OCR 像素定位更稳（17:29 实测 OCR 漏读药丸、dump 一次命中）。
-        视频播放期 dump 有界失败（DUMP_TIMEOUT 4s×2）→ 返回 None 交上层转 OCR。
+        视频播放期 dump 有界失败 → 返回 None 交上层转 OCR（#2：超时不再重试，
+        单次等待从 4s×2≈8s 降到 timeout 值，默认 2.5s）。
         """
-        n = self._find("关闭广告")
+        n = self._find("关闭广告", timeout=timeout)
         if n:
             return n
-        for cand in self.ui.nodes():
+        for cand in self.ui.nodes(timeout=timeout):
             t = cand.text or ""
             if "跳过" in t or t.startswith("关闭"):
                 return cand
@@ -1304,6 +1316,14 @@ class Flow:
         （≤9s），长广告场景的代价可控，故对调。
         """
         max_tries = self.wf.get("ad_close_retries", max_tries)
+        # #2 优化（2026-09-10）：关闭广告时 uiautomator dump 用更短超时（默认 2.5s）
+        # 且不重试，压低视频/动画期每次查找的等待（原 DUMP_TIMEOUT 4s×2≈8s 是日志里
+        # 123 次 dump 超时浪费的主因）。dump 超时即失败、转 OCR 兜底路径。
+        ad_close_dump_timeout = float(self.wf.get("ad_close_dump_timeout", 2.5))
+        # B 优化（2026-09-11）：关闭按钮 tap 后的"沉降"等待（秒）。广告关闭动画/任务中心
+        # 重载期 UI 无法 idle、OCR 读不到特征，立即确认必然撞 dump 超时（代柯 32s 实测）。
+        # 沉降后再确认，让动画播完、OCR/首次 dump 直接命中任务中心。
+        ad_close_settle = float(self.wf.get("ad_close_settle", 2.0))
         # 0) 快路径 + 正向直关
         #   - F1：连续 2 次 OCR 都读到任务中心特征词 → 广告已自动关闭并回任务中心
         #     → 收工（间隔 0.8s 跨过首屏渲染期，代价 +1.3s；**保留双检**——广告
@@ -1317,12 +1337,13 @@ class Flow:
                 time.sleep(0.8)
         # 1) uiautomator 直关（2026-09-10 对调）：页面 idle 时 1-3s 命中。
         #    直关失败（tap 未生效/页面又变了）→ 巡检一次覆盖层再走 OCR/兜底。
-        n = self._find_close_node()
+        n = self._find_close_node(timeout=ad_close_dump_timeout)
         if n is not None:
             logger.info("uiautomator 定位到关闭按钮 @ %s（直关，第 1 步）", n.center)
             self._tap_node(n, pause=1.5)
             time.sleep(1.5)
-            if self._back_at_taskcenter():
+            time.sleep(ad_close_settle)
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                 logger.info("广告已关闭（uiautomator 直关路径）")
                 return True
             logger.info("uiautomator 直关未生效，巡检一次 Badcase/AI 好友后走兜底")
@@ -1339,7 +1360,8 @@ class Flow:
             # 放行任务中心页的盲点禁令。
             self._tap(*pos, pause=1.5, trusted=True)
             time.sleep(2.0)
-            if self._back_at_taskcenter():
+            time.sleep(ad_close_settle)
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                 logger.info("广告已关闭（OCR 直关路径）")
                 return True
             logger.info("OCR 直关未生效（%s），巡检一次 Badcase/AI 好友后走兜底", pos)
@@ -1358,18 +1380,19 @@ class Flow:
             # 1) 已回任务中心？（广告自动结束）—— 必须先于 uiautomator：
             #    防 dump 残留/穿透在任务中心页读到「关闭」类节点而误点
             #    （该坐标带与顶部 banner 重叠，见坑 13/14）。
-            if self._back_at_taskcenter():
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                 logger.info("广告已自动结束")
                 return True
             # 2) uiautomator 定位关闭按钮（页面 idle 时 1-3s 最快最准；
             #    视频期 dump 有界失败转第 3 步）
-            n = self._find_close_node()
+            n = self._find_close_node(timeout=ad_close_dump_timeout)
             if n:
                 logger.info("uiautomator 定位到关闭按钮 @ %s (第%d次)",
                             n.center, i + 1)
                 self._tap_node(n, pause=1.5)
                 time.sleep(1.5)
-                if self._back_at_taskcenter():
+                time.sleep(ad_close_settle)
+                if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                     logger.info("广告已关闭（uiautomator 路径）")
                     return True
                 continue
@@ -1379,7 +1402,8 @@ class Flow:
                 logger.info("OCR 定位到关闭按钮 @ %s (第%d次)", pos, i + 1)
                 self._tap(*pos, pause=1.5, trusted=True)   # F11：OCR 正向定位，非盲点
                 time.sleep(1.5)
-                if self._back_at_taskcenter():
+                time.sleep(ad_close_settle)
+                if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                     logger.info("广告已关闭（OCR 路径）")
                     return True
                 continue
@@ -1403,11 +1427,11 @@ class Flow:
                            "（第 %d/%d 次 BACK）", i + 1, ad_close_backs, max_backs)
             self.ui.back(pause=random.uniform(1.2, 1.8))
             time.sleep(self.t.get("page_wait", 2.0))
-            if self._back_at_taskcenter():
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                 logger.info("物理 BACK 后已回到任务中心（广告已结束）")
                 return True
         # 最后一搏：整体确认一次
-        return self._back_at_taskcenter()
+        return self._back_at_taskcenter(timeout=ad_close_dump_timeout)
 
     # ----------------------------------------------------------
     # 编排

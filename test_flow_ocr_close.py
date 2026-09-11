@@ -458,7 +458,7 @@ class TestCloseAd(Base):
         f = self._stub()
         calls = []
         f._back_at_taskcenter = mock.Mock(
-            side_effect=lambda: calls.append("back") or False)
+            side_effect=lambda *a, **k: calls.append("back") or False)
         f._ocr_find = mock.Mock(
             side_effect=lambda *a, **k: calls.append("ocr") or None)
         f._find = mock.Mock(

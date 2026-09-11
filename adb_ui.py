@@ -33,6 +33,11 @@ DEFAULT_DEV = "127.0.0.1:16384"
 #                  后交给上层 OCR 路径（正常静态页 dump 实测 <1.5s，4s 足够）
 CMD_TIMEOUT = 20.0
 DUMP_TIMEOUT = 4.0
+# 滑动锚点 x（#1 优化 2026-09-10）：刻意避开中列 540 —— 任务中心页中列是「签到」按钮 /
+# 「问题反馈」/ 顶部 banner 的命中区，滑动起止点落中列时 WebView 自绘页会误判为点按
+# 这些元素而"飘"到对应页面；左列 140 是列表左侧留白/头像区，纯纵向滑动由 ScrollView
+# 接管，不会误触按钮。要微调改这一行即可。
+SWIPE_X = 140
 
 _NODE_RE = re.compile(r"<node\b[^>]*>")
 _ATTR_RE = re.compile(r'\b(text|content-desc|selected|checked|bounds)="([^"]*)"')
@@ -155,7 +160,7 @@ class AdbUI:
         return False
 
     # ----------------------------------------------------------
-    def dump(self) -> Optional[str]:
+    def dump(self, timeout: Optional[float] = None) -> Optional[str]:
         """dump 当前 UI 层次，返回 XML 字符串；失败返回 None。
 
         注意1：MuMu 等模拟器上 uiautomator 正常 dump 完成后，进程退出时也常
@@ -163,23 +168,30 @@ class AdbUI:
         「dumped to」而非 returncode（故此处不走 _run 的 rc 检查）。
         注意2：uiautomator 真失败时 rc 也可能是 0（错误只打在 stdout），
         需检查输出文本，否则会 cat 到上一次的旧 XML（假页面）。
+        超时即失败（#2 优化 2026-09-10）：视频/动画期 UI 无法 idle，uiautomator
+        会一直空等到自己超时（实测 ~12s）。此处用 timeout 主动掐断后**立即返回
+        None、不重试** —— 页面处于播放态时重试只会再白等一个整超时（原 range(2)
+        重试导致每次失败耗 4s×2≈8s，是日志里 123 次 dump 超时浪费的主因）；上层
+        有 OCR 兜底路径会重新 poll。仅"dump 已执行但未 idle 成功"（rc=139 段错误
+        等瞬态）会在循环里重试一次。timeout 默认 DUMP_TIMEOUT，关闭广告等场景可传
+        更短值（如 2.5s）进一步压低单次等待。
         """
-        for _ in range(2):  # 失败重试一次
+        if timeout is None:
+            timeout = DUMP_TIMEOUT
+        for _ in range(2):  # 失败重试一次（仅限非超时的瞬态失败）
             try:
                 cmd = [self.adb, "-s", self.device, "shell",
                        "uiautomator", "dump", "/sdcard/ui.xml"]
                 try:
-                    p = subprocess.run(cmd, capture_output=True,
-                                       timeout=DUMP_TIMEOUT)
+                    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
                 except subprocess.TimeoutExpired:
                     # 视频播放期 UI 无法 idle，uiautomator 会空等到自己超时
-                    # （实测 ~12s）—— 这里主动 4s 掐断，让上层尽快转 OCR 路径。
+                    # （实测 ~12s）—— 这里主动掐断后**立即失败交上层**，不重试
+                    # （重试只会再白等一个整超时，是 dump 超时浪费的主因）。
                     logger.warning("uiautomator dump 超时 (> %ss)，"
-                                   "页面可能仍在动画/视频中", DUMP_TIMEOUT)
-                    p = None
-                if p is None:
-                    time.sleep(0.3)
-                    continue
+                                   "页面可能仍在动画/视频中", timeout)
+                    self._dump_fail_streak += 1
+                    return None
                 out = p.stdout.decode("utf-8", errors="replace")
                 if "dumped to" not in out:
                     logger.warning("uiautomator dump 未成功 (rc=%s): %s",
@@ -199,19 +211,21 @@ class AdbUI:
         """连续完全失败的 dump() 调用次数（成功即清零）。供上层判断页面卡死。"""
         return self._dump_fail_streak
 
-    def nodes(self, include_desc: bool = True) -> List[Node]:
+    def nodes(self, include_desc: bool = True,
+              timeout: Optional[float] = None) -> List[Node]:
         """解析当前屏幕所有带文本/描述节点（0.8s TTL 缓存）。
 
         TTL 内且无界面动作时重复调用直接返回缓存；dump 失败返回 [] 且
         **不写缓存**（页面可能正处于广告播放等无法 idle 的状态，下一秒
         内容可能就不同了，缓存空结果会掩盖真实页面）。
+        timeout 透传给 dump —— 关闭广告等场景可传更短值压低单次等待（#2）。
         """
         now = time.time()
         if (self._nodes_cache is not None
                 and self._nodes_include_desc == include_desc
                 and now - self._nodes_ts < self._nodes_ttl):
             return self._nodes_cache
-        xml = self.dump()
+        xml = self.dump(timeout)
         if not xml:
             return []
         nodes = _parse_xml(xml, include_desc)
@@ -222,9 +236,11 @@ class AdbUI:
 
     def find(self, text: str,
              ymin: int = 0, ymax: int = 99999,
-             xmin: int = 0, xmax: int = 99999) -> Optional[Node]:
-        """按文本精确查找第一个节点（可限定区域）。"""
-        for n in self.nodes():
+             xmin: int = 0, xmax: int = 99999,
+             timeout: Optional[float] = None) -> Optional[Node]:
+        """按文本精确查找第一个节点（可限定区域）。timeout 透传给 dump，
+        用于关闭广告等场景压低单次 dump 等待（#2）。"""
+        for n in self.nodes(timeout=timeout):
             if n.text == text and ymin <= n.y1 <= ymax and xmin <= n.x1 <= xmax:
                 return n
         return None
@@ -269,9 +285,12 @@ class AdbUI:
         time.sleep(pause)
 
     def swipe_down(self, pause: float = 1.0):
-        """向下滑（看上方内容）。坐标空间 1080x1920 竖屏。"""
+        """向下滑（看上方内容）。坐标空间 1080x1920 竖屏。
+
+        锚点 x 同 swipe_up 用 SWIPE_X（左安全列），避开中列按钮命中区，防滑动误触漂移。
+        """
         self._run("shell", "input", "swipe",
-                  "540", "700", "540", "1500", "400")
+                  str(SWIPE_X), "700", str(SWIPE_X), "1500", "400")
         self._invalidate_cache()
         time.sleep(pause)
 

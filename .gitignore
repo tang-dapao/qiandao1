@@ -30,6 +30,7 @@ node_modules/
 
 # ---- WorkBuddy 内部目录（含项目工作记忆，非源码） ----
 .workbuddy/
+.jssdd/
 
 # ---- 编辑器 / 系统 ----
 .idea/

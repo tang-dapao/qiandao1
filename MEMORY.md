@@ -15,6 +15,9 @@
 - 截图 / OCR / input tap / uiautomator 共用同一 1080×1920 空间。
 - uiautomator 能读出任务中心 WebView 中文文本与真实坐标（滚动后仍可靠）。
 - 任务中心行按钮固定 `X≈879`（各行右侧对齐），按钮中心在标签中心下方约 24px。
+- 滑动锚点 `SWIPE_X=140`（左安全列，避开中列 540 的「签到/问题反馈/banner」命中区）：
+  `swipe_up`/`swipe_down` 起止 x 固定 140，纯纵向滑动由 ScrollView 接管，防 WebView 自绘页
+  把滑动误判为点按按钮而飘到对应页面（2026-09-10 #1 优化，根治任务中心页滑动漂移）。
 
 ### 返回路径（2026-09-09/10 起：一律系统 BACK 键，EXIT_*_ARROW 坐标已弃用）
 - `_exit_taskcenter()`：三层全部改为 `self.ui.back()`（keyevent 4），不再 tap 任何坐标箭头。
@@ -46,6 +49,14 @@
   `每日签到 / 任务中心 / 获取随机 / 收支详情`
 - 子进程超时常量（2026-09-10 看门狗）：`adb_ui.CMD_TIMEOUT=20s`（tap/swipe/back/cat）、
   `adb_ui.DUMP_TIMEOUT=4s`（uiautomator dump，视频期快速失败）、`flow.SHOT_TIMEOUT=15s`（screencap）
+  - **#2 优化（2026-09-10）**：`dump()` 超时即失败、**不再 `range(2)` 重试** —— 视频/动画期每次失败从
+    `4s×2≈8s` 降到 ~4s；`dump(timeout)` 新增形参，`nodes()/find()` 透传。`_close_ad` 关闭广告时传更短
+    `workflow.ad_close_dump_timeout`（默认 **2.5s**，见 config.yaml）。
+  - **A+B 优化（2026-09-11）**：确认路径 `_back_at_taskcenter(timeout)` 也透传 `timeout`，`_close_ad` 各
+    确认处传 `ad_close_dump_timeout`（2.5s）——此前短超时只覆盖「关闭按钮查找」，确认路径 dump 仍 4s
+    （09-11 实测代柯 32s、游迦 21s 的浪费主因）。另加 `workflow.ad_close_settle`（默认 **2.0s**，见
+    config.yaml）：关闭 tap 后沉降等待，让关闭动画/任务中心重载播完再确认，避免动画期撞超时；快路径
+    机器人会多等该秒数，实测变慢可调小到 1.0~0。
 
 ---
 
@@ -394,6 +405,45 @@
 - 是否删掉已废弃的旧框架文件（driver.py/locators.py/ocr_utils.py/robot.py/scheduler.py/
   signin.py/feedback.py/ad_watcher.py）——注意 robot.py 的 RobotManager 还有列表读取逻辑可参考，
   但新 main.py 已不用。
+
+### 2026-09-11 晚：#1 滑动漂移 / #2 dump 超时 / A+B 关闭确认优化（已落地，179/179）
+
+**#1 滑动漂移**（用户 09-10 人工复现：任务中心上下滑会飘进 问题反馈/banner/签到）
+- `adb_ui.SWIPE_X = 140`（左安全列）；`swipe_up`/`swipe_down` 起止 x 由中列 **540 → 140**。
+- 原因：中列 540 正是「签到」按钮 /「问题反馈」/ 顶部 banner 命中区，滑动起止点落中列会被
+  WebView 自绘页误判为点按这些元素而飘页；左列是列表留白/头像区，纯纵向滑动由 ScrollView 接管。
+- 覆盖 `_find_scroll_match` / `_collect_robot_names` / `_scroll_to_top_of_taskcenter` 全部滚动调用。
+
+**#2 dump 超时浪费**（日志 123 次 `uiautomator dump 超时` ≈8.2min/run 的主因）
+- `adb_ui.dump(timeout=None)`：**超时即失败、不再 `range(2)` 重试**（视频/动画期每次失败
+  4s×2≈8s → ~4s）；新增 `timeout` 形参，`nodes()`/`find()` 透传。
+- `flow._find` / `_find_close_node` 透传 `timeout`；`_close_ad` 关闭按钮查找用
+  `ad_close_dump_timeout`（默认 2.5s，config）。
+
+**A+B 关闭确认优化**（09-11 实测代柯关闭 32s，定位到浪费在确认路径）
+- **A**：`_back_at_taskcenter(timeout=None)` 透传 `timeout`，`_close_ad` 全部 7 处确认调用传
+  `ad_close_dump_timeout`(2.5s) —— 此前短超时只覆盖「关闭按钮查找」，确认路径 dump 仍 4s。
+- **B**：`ad_close_settle`（默认 2.0s，config）：关闭 tap 后沉降等待，让关闭动画/任务中心重载
+  播完再确认。权衡：快路径机器人会多等该秒数；实测变慢可调小到 1.0~0。
+
+**效率实测基线**（指标 = 定位关闭按钮 → 确认关闭，不含固定 ad_wait 16-18s；2026-09-11 全天）
+| 时期 | 中位/均值 | 最差 | dump 超时 |
+|---|---|---|---|
+| 改动前（早 11-14，旧逻辑，145 次） | 18.7s / 19.6s | 32.9s | 61 次全 4.0s |
+| #2 后（20:49 签到流，33 次） | 11.3s / 14.7s | 31.7s | 41 次（4.0s×4 + 2.5s×37） |
+| A+B 后（当前循环，23 次） | 11.4s / 15.0s | 27.4s | 35 次全 2.5s |
+
+- 结论：单次关闭中位 **18.7s → 11.3s，提速 ~40%（每次省 ~7.4s）**；A 把确认路径 4.0s 超时清零
+  （B 期还有 4 次 4.0s → C 期 0）。按全天 ~100 次广告估，关闭阶段每天省 **~12 分钟**。
+- 诚实：B→C 中位没再降（11.3→11.4），因沉降给快路径固定 +2s；换来更稳（最差 31.7→27.4s）。
+
+**导航耗时基线**（52 样本）：点进机器人首页 → 任务中心可用 **中位 25.4s**（签到阶段 ~24s 最接近纯
+导航；广告循环阶段名义 ~36s，多算了进任务中心后的配额读取）；列表定位（进入→点到该行）中位 16.0s；
+全程（进入机器人 → 任务中心可用）中位 **50.5s**。主要是多次页面跳转的固定等待累积，非 dump 超时。
+
+**CD 语义澄清**：`广告 CD 60 秒（从关闭起算）` 的起点是 **`t_close`**（flow.py:1565，
+`_watch_ad_once()` 返回 True 后立即取）= 日志「广告已关闭，回到任务中心」那一刻，
+**不是**「定位到关闭按钮」。
 
 ### 单测基线（2026-09-11：179/179 全绿）
 - `py -3.13 -m unittest discover -p "test_*.py"`

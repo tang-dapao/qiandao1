@@ -8,12 +8,16 @@
 5. include_desc=True/False 使用各自独立缓存，互不污染（desc 版不会误用于非 desc）
 6. 紧邻连续 find（如 _back_at_taskcenter 里 `find(A) or find(B)`）只 dump 一次
 7. wait_for 轮询 interval=1.0s > TTL=0.8s ⇒ 每次轮询都重新 dump，绝不读旧缓存
+8. 2026-09-10 看门狗：subprocess.run 全部带超时，超时转 AdbCommandError /
+   dump_fail_streak（防 adb 挂起导致无人值守流程永久卡住）
 
 运行：py -3.13 -m unittest test_adb_cache -v
 """
+import subprocess
 import unittest
 from unittest import mock
 
+import adb_ui as adb_ui_mod
 from adb_ui import AdbUI
 
 # 最小可被 _TEXT_RE/_DESC_RE 匹配的 XML 片段
@@ -207,6 +211,57 @@ class TestFlowPatterns(AdbCacheBase):
         # 文本一直在 → 每轮都重新 dump 确认，最终 False
         self.assertFalse(self.ui.wait_gone("每日签到", retries=3, interval=1.0))
         self.assertEqual(self.dump_calls, 3)
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-10 看门狗：adb 子进程超时
+# ---------------------------------------------------------------------------
+class TestSubprocessTimeout(unittest.TestCase):
+    """adb / 模拟器卡死防护。
+
+    背景：本工具无人值守跑 10 台 × 广告轮转可达 2 小时以上，而原先除
+    is_online 外所有 subprocess.run 都没传 timeout —— adb daemon 一旦挂起，
+    进程会永久阻塞、日志停在原地，第二天才发现整晚没跑完。
+    """
+
+    def test_run_timeout_raises_adb_command_error(self):
+        # _run 是 tap / swipe / back / cat 的通用入口 —— 超时必须转成
+        # AdbCommandError（上层已有 except 分支，可直接走既有恢复逻辑）
+        ui = AdbUI()
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("adb", 20)):
+            with self.assertRaises(adb_ui_mod.AdbCommandError):
+                ui._run("shell", "input", "tap", "10", "10")
+
+    def test_tap_timeout_propagates(self):
+        ui = AdbUI()
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("adb", 20)):
+            with self.assertRaises(adb_ui_mod.AdbCommandError):
+                ui.tap(100, 200)
+
+    def test_dump_timeout_increments_dump_fail_streak(self):
+        # dump 超时 → 内部重试耗尽 → 计数 +1、返回 None。上层据此判断页面
+        # 卡死走恢复；视频广告期的"UI 无法 idle"也靠这条路径快速失败。
+        ui = AdbUI()
+        ui._dump_fail_streak = 0
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("adb", 4)):
+            self.assertIsNone(ui.dump())
+        self.assertEqual(ui.dump_fail_streak, 1)
+
+    def test_dump_timeout_shorter_than_cmd_timeout(self):
+        # dump 必须比普通命令更快失败（视频广告期 UI 不 idle，uiautomator
+        # 会空等 ~12s，这里主动掐短让流程尽快转 OCR 路径）
+        self.assertLess(adb_ui_mod.DUMP_TIMEOUT, adb_ui_mod.CMD_TIMEOUT)
+        ui = AdbUI()
+        ui._dump_fail_streak = 0
+        with mock.patch.object(adb_ui_mod.subprocess, "run") as run:
+            run.return_value.stdout = b"UI hierchary dumped to: /sdcard/ui.xml"
+            run.return_value.returncode = 0
+            ui.dump()
+        self.assertEqual(run.call_args_list[0].kwargs.get("timeout"),
+                         adb_ui_mod.DUMP_TIMEOUT)
 
 
 if __name__ == "__main__":

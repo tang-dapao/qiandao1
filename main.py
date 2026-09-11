@@ -66,15 +66,35 @@ def main():
         sys.exit(1)
     flow = Flow(cfg, ui)
 
+    # 白名单（config workflow.robot_whitelist，用户维护）——需先于自动收集
+    # 读取，供 #1 收集提前终止使用。
+    wl = cfg["workflow"].get("robot_whitelist") or []
+
     # 确定机器人列表
     if args.robots:
         robots = [n.strip() for n in args.robots.split(",") if n.strip()]
         logger.info("使用命令行指定机器人: %s", robots)
     else:
         logger.info("自动抓取机器人列表...")
-        robots = flow._collect_robot_names()
+        # #1（优化 2026-09-09）：白名单模式按名单提前终止滚动收集
+        #（常规 10 台名单在列表前 1~2 屏即可集齐，省滚动 dump 开销 ~40-60s）；
+        # --list 需要完整列表，不做提前终止。
+        stop_when = wl if not args.list else None
+        robots = flow._collect_robot_names(stop_when=stop_when)
         if not robots:
             logger.error("自动抓取机器人列表为空，请先确认已进入 QQ 联系人->机器人 页面")
+            return
+
+    # 白名单过滤：仅对名单内昵称执行签到/反馈/看广告，其余一律跳过 —— 覆盖
+    # 昵称重复、内测中、孤立噪声（如列表里的"1"）等无法操作的机器人。命令行
+    # --robots 指定的名字同样受白名单约束；名单为空/未配置 = 不过滤（旧行为）。
+    if wl:
+        skipped = [r for r in robots if r not in wl]
+        if skipped:
+            logger.info("跳过白名单外机器人 %d 个: %s", len(skipped), skipped)
+        robots = [r for r in robots if r in wl]
+        if not robots:
+            logger.error("白名单过滤后无机器人可处理（白名单 %d 个）", len(wl))
             return
 
     logger.info("最终处理 %d 个机器人: %s", len(robots), robots)
@@ -88,6 +108,13 @@ def main():
     do_signin = not args.no_signin and not args.ad_only
     do_feedback = not args.no_feedback and not args.ad_only
     ad_times = 0 if args.no_ad else args.ad_times
+
+    # #6（QA 记录 LOW）：--no-ad + --ad-only 语义冲突 → 空跑（不签到/不反馈/
+    # 不看广告）。不改行为（既有测试锁定"不抛异常"），但显式告警便于发现
+    # 脚本写错。
+    if args.no_ad and args.ad_only:
+        logger.warning("--no-ad 与 --ad-only 同时指定：不看广告且不签到/反馈，"
+                       "结果为空跑 —— 请检查启动脚本参数是否写错")
 
     logger.info("开始全自动流程: 签到=%s 反馈=%s 看广告次数=%s",
                 do_signin, do_feedback,

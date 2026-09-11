@@ -1,8 +1,38 @@
-# Python
+# ============================================================
+# D:\qiandao —— 自动签到/看广告 工程 .gitignore
+# 策略：仅提交源码 + 配置，排除日志/截图/调试产物/内部目录
+# ============================================================
+
+# ---- Python ----
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Local / IDE
+# ---- 运行产物 / 调试噪声 ----
+logs/
+screenshots/
+*.log
+
+# ---- 调试快照 / UI dump ----
+*.png
+*.jpg
+*.jpeg
+*.gif
+ui_now.xml
+ui_q.xml
+
+# ---- 本地环境 / 密钥 ----
+.env
+.venv/
+venv/
+env/
+node_modules/
+
+# ---- WorkBuddy 内部目录（含项目工作记忆，非源码） ----
+.workbuddy/
+
+# ---- 编辑器 / 系统 ----
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db

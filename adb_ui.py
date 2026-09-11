@@ -22,10 +22,20 @@ logger = logging.getLogger("adbu")
 ADB = "D:/Android/Sdk/platform-tools/adb.exe"
 DEFAULT_DEV = "127.0.0.1:16384"
 
-_TEXT_RE = re.compile(
-    r'text="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
-_DESC_RE = re.compile(
-    r'content-desc="([^"]*)"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+# ---- 子进程超时（2026-09-10 添加，看门狗）----
+# 背景：本工具无人值守跑 10 台 × 广告轮转可达 2 小时以上，此前所有
+# subprocess.run 均未传 timeout（仅 is_online 有 10s）—— 一旦 adb daemon
+# 挂起或模拟器无响应，进程会无限阻塞、日志停在原地，次日才发现没跑完。
+# 取值依据：
+#   - CMD_TIMEOUT  普通命令（tap/swipe/back/cat）实测毫秒级返回，20s 必属异常
+#   - DUMP_TIMEOUT uiautomator dump 在「UI 无法 idle」时（如视频广告播放期）
+#                  会一直空等，实测每次 ~12s 才返回——这里主动设短，快速失败
+#                  后交给上层 OCR 路径（正常静态页 dump 实测 <1.5s，4s 足够）
+CMD_TIMEOUT = 20.0
+DUMP_TIMEOUT = 4.0
+
+_NODE_RE = re.compile(r"<node\b[^>]*>")
+_ATTR_RE = re.compile(r'\b(text|content-desc|selected|checked|bounds)="([^"]*)"')
 
 
 class AdbCommandError(RuntimeError):
@@ -34,18 +44,58 @@ class AdbCommandError(RuntimeError):
 
 class Node:
     """一个带文本的控件节点。"""
-    __slots__ = ("text", "x1", "y1", "x2", "y2")
+    __slots__ = ("text", "x1", "y1", "x2", "y2", "selected")
 
-    def __init__(self, text: str, x1: int, y1: int, x2: int, y2: int):
+    def __init__(self, text: str, x1: int, y1: int, x2: int, y2: int,
+                 selected: bool = False):
         self.text = text
         self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+        self.selected = selected
 
     @property
     def center(self) -> Tuple[int, int]:
         return ((self.x1 + self.x2) // 2, (self.y1 + self.y2) // 2)
 
     def __repr__(self):
-        return f"Node({self.text!r} bounds=({self.x1},{self.y1})-({self.x2},{self.y2}))"
+        return (f"Node({self.text!r} bounds=({self.x1},{self.y1})-"
+                f"({self.x2},{self.y2}) selected={self.selected})")
+
+
+def _parse_xml(xml: str, include_desc: bool) -> List[Node]:
+    """解析 dump XML：返回全部 text 节点（文档序）+ include_desc 时的
+    content-desc 节点（仅当 desc 文字未作为 text 出现；文档序追加）。
+
+    每个 node 同时解析 selected 属性（QQ 底部 tab / 联系人页中部 分类行
+    的文本节点带 selected="true"，供 flow 精确判断激活 tab / 分类 ——
+    机器人列表识别强判据依赖它）。
+    """
+    texts: List[Node] = []
+    descs: List[Node] = []
+    seen_texts = set()
+    for tag in _NODE_RE.findall(xml):
+        attrs = {}
+        for k, v in _ATTR_RE.findall(tag):
+            attrs.setdefault(k, v)          # 属性乱序，只取首次出现
+        b = attrs.get("bounds")
+        if not b:
+            continue
+        m = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+        if not m:
+            continue
+        x1, y1, x2, y2 = map(int, m.groups())
+        if x2 <= x1 and y2 <= y1:
+            continue
+        sel = attrs.get("selected") == "true"
+        t = (attrs.get("text") or "").strip()
+        if t:
+            texts.append(Node(t, x1, y1, x2, y2, selected=sel))
+            seen_texts.add(t)
+        if include_desc:
+            cd = (attrs.get("content-desc") or "").strip()
+            if cd and cd not in seen_texts:
+                descs.append(Node(cd, x1, y1, x2, y2, selected=sel))
+                seen_texts.add(cd)
+    return texts + descs
 
 
 class AdbUI:
@@ -59,11 +109,26 @@ class AdbUI:
         self._nodes_cache: Optional[List[Node]] = None
         self._nodes_include_desc: Optional[bool] = None
         self._nodes_ts: float = 0.0
+        # dump 连续失败计数（页面卡动画/浏览器加载时 uiautomator 无法 idle）。
+        # 单次 dump() 完全失败 +1，成功即清零 → 该值只反映"此刻是否持续 dump 失败"，
+        # 供 flow 导航循环判断页面是否卡死（>=3 时应中止并走恢复，避免空转）。
+        self._dump_fail_streak: int = 0
 
-    def _run(self, *args) -> str:
-        """执行 adb 命令，返回 stdout 字符串。失败抛 AdbCommandError。"""
+    def _run(self, *args, timeout: float = CMD_TIMEOUT) -> str:
+        """执行 adb 命令，返回 stdout 字符串。失败抛 AdbCommandError。
+
+        2026-09-10 加超时看门狗：所有 tap / swipe / back / cat 都走这里，
+        未设超时时 adb daemon 挂起会让整个无人值守流程永久卡住。超时统一
+        抛 AdbCommandError —— 上层（如 dump）已有 except 分支，自动走
+        dump_fail_streak 恢复逻辑，无需额外改动。
+        """
         cmd = [self.adb, "-s", self.device] + list(args)
-        p = subprocess.run(cmd, capture_output=True)
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise AdbCommandError(
+                f"adb {' '.join(args)} 超时未返回 (> {timeout}s)，"
+                f"疑似 adb/设备挂起")
         if p.returncode != 0:
             err = p.stderr.decode("utf-8", errors="replace").strip()
             raise AdbCommandError(
@@ -103,18 +168,36 @@ class AdbUI:
             try:
                 cmd = [self.adb, "-s", self.device, "shell",
                        "uiautomator", "dump", "/sdcard/ui.xml"]
-                p = subprocess.run(cmd, capture_output=True)
+                try:
+                    p = subprocess.run(cmd, capture_output=True,
+                                       timeout=DUMP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    # 视频播放期 UI 无法 idle，uiautomator 会空等到自己超时
+                    # （实测 ~12s）—— 这里主动 4s 掐断，让上层尽快转 OCR 路径。
+                    logger.warning("uiautomator dump 超时 (> %ss)，"
+                                   "页面可能仍在动画/视频中", DUMP_TIMEOUT)
+                    p = None
+                if p is None:
+                    time.sleep(0.3)
+                    continue
                 out = p.stdout.decode("utf-8", errors="replace")
                 if "dumped to" not in out:
                     logger.warning("uiautomator dump 未成功 (rc=%s): %s",
                                    p.returncode, out.strip() or "无输出")
                     time.sleep(1.0)
                     continue
+                self._dump_fail_streak = 0          # 成功：清零失败计数
                 return self._run("shell", "cat", "/sdcard/ui.xml")
             except AdbCommandError as e:
                 logger.warning("uiautomator dump 失败: %s", e)
                 time.sleep(1.0)
+        self._dump_fail_streak += 1                  # 完全失败：累计
         return None
+
+    @property
+    def dump_fail_streak(self) -> int:
+        """连续完全失败的 dump() 调用次数（成功即清零）。供上层判断页面卡死。"""
+        return self._dump_fail_streak
 
     def nodes(self, include_desc: bool = True) -> List[Node]:
         """解析当前屏幕所有带文本/描述节点（0.8s TTL 缓存）。
@@ -131,15 +214,7 @@ class AdbUI:
         xml = self.dump()
         if not xml:
             return []
-        nodes = []
-        for t, x1, y1, x2, y2 in _TEXT_RE.findall(xml):
-            if t.strip() and (x2 > x1 or y2 > y1):
-                nodes.append(Node(t, int(x1), int(y1), int(x2), int(y2)))
-        if include_desc:
-            for t, x1, y1, x2, y2 in _DESC_RE.findall(xml):
-                if (t.strip() and (x2 > x1 or y2 > y1)
-                        and not any(n.text == t for n in nodes)):
-                    nodes.append(Node(t, int(x1), int(y1), int(x2), int(y2)))
+        nodes = _parse_xml(xml, include_desc)
         self._nodes_cache = nodes
         self._nodes_include_desc = include_desc
         self._nodes_ts = now
@@ -171,6 +246,11 @@ class AdbUI:
         self._nodes_cache = None
         self._nodes_include_desc = None
         self._nodes_ts = 0.0
+
+    def refresh(self):
+        """强制下次 nodes() 重新 dump（失效 TTL 缓存）。供点击关键目标前
+        获取「当前真实页面」快照，防缓存/滚动动画中间帧用旧坐标点错。"""
+        self._invalidate_cache()
 
     def tap(self, x: int, y: int, pause: float = 1.2):
         self._run("shell", "input", "tap", str(int(x)), str(int(y)))

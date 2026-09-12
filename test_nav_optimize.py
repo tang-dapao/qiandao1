@@ -105,6 +105,7 @@ class FakeUI:
 
 def make_flow(ui, at_list=False):
     f = Flow.__new__(Flow)
+    f._init_cache_state()   # A2/A3：实例级截图/OCR 缓存（防类级共享字典污染）
     f.ui = ui
     f.t = {"click_min": 1.5, "click_max": 3.0, "page_wait": 2.0,
            "taskcenter_wait": 3.5}
@@ -113,6 +114,136 @@ def make_flow(ui, at_list=False):
     # 注：_tap/_tap_node 由各测试按需 stub（TestExitTaskcenter 需真实 _tap；
     # TestEnterTaskcenter/F9 钳位测试需要 mock 以断言 tap 坐标）
     return f
+
+
+# ----------------------------------------------------------------------
+# A1: _wait_until 事件驱动等待助手
+# ----------------------------------------------------------------------
+class TestWaitUntil(unittest.TestCase):
+    def _flow(self):
+        return make_flow(FakeUI([[]]))
+
+    def test_returns_true_when_predicate_soon_true(self):
+        # 谓词在第 3 次轮询才变 True → _wait_until 应返回 True（不报超时）
+        f = self._flow()
+        state = {"n": 0}
+
+        def pred():
+            state["n"] += 1
+            return state["n"] >= 3
+
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._wait_until(pred, timeout=10.0)
+        self.assertTrue(ok)
+        self.assertEqual(state["n"], 3)      # 命中即停，不多轮询
+
+    def test_returns_false_on_timeout(self):
+        # 谓词恒 False → 到 timeout 返回 False（不抛异常）
+        f = self._flow()
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._wait_until(lambda: False, timeout=0.05, interval=0.01)
+        self.assertFalse(ok)
+
+    def test_predicate_exception_treated_as_not_satisfied(self):
+        # 谓词内部读屏异常（dump 失败）不算满足，持续等直到超时返回 False
+        f = self._flow()
+
+        def pred():
+            raise RuntimeError("dump 异常")
+
+        with mock.patch.object(flow_mod.time, "sleep"), \
+                mock.patch.object(flow_mod.logger, "warning"):
+            ok = f._wait_until(pred, timeout=0.05, interval=0.01)
+        self.assertFalse(ok)
+
+
+# ----------------------------------------------------------------------
+# A1: _nav_robot_list 事件驱动（去掉固定 page_wait 后该提前返回就提前返回）
+# ----------------------------------------------------------------------
+class _FastNavUI(FakeUI):
+    """tap 即推进到下一导航状态（与 ContactsNavUI 等价，模块级便于复用）：
+    消息首页 -> 联系人页(已选 联系人 tab) -> 机器人列表。"""
+
+    def __init__(self):
+        super().__init__([[]])
+        self.stage = "home_msg"
+
+    def nodes(self, timeout=None):
+        if self.stage == "home_msg":
+            return _bottom_tabs("消息") + [nd("某会话", 400)]
+        if self.stage == "contacts_no_cat":
+            return _bottom_tabs("联系人") + [nd("机器人", 500, x1=677)]
+        return _robot_list_page(("黎小姐", 400))
+
+    def tap(self, x, y, pause=1.2):
+        self.taps.append((x, y))
+        if self.stage == "home_msg":
+            tab = nd("联系人", 1880, x1=496)
+            if self._hit(tab, x, y):
+                self.stage = "contacts_no_cat"
+        elif self.stage == "contacts_no_cat":
+            cat = nd("机器人", 500, x1=677)
+            if self._hit(cat, x, y):
+                self.stage = "robot_list"
+
+    @staticmethod
+    def _hit(node, x, y):
+        return node.x1 <= x < node.x2 and node.y1 <= y < node.y2
+
+
+class TestNavEventDriven(unittest.TestCase):
+    def test_full_nav_completes_without_full_fixed_page_wait(self):
+        # 事件驱动：每次 tap 后页面立即到目标状态 → _wait_until 首次轮询即满足，
+        # 导航不依赖完整固定 page_wait（旧实现每次 tap 后必 sleep(page_wait)）。
+        # 冻结 time.sleep 后断言：本快进路径下 sleep 一次都不被调用（无固定
+        # 睡眠残留），且导航成功抵达目标页。
+        ui = _FastNavUI()
+        f = make_flow(ui, at_list=False)
+        with mock.patch.object(flow_mod.time, "sleep") as m_sleep:
+            f._nav_robot_list()
+        self.assertEqual(f._at_robot_list, True)
+        self.assertEqual(ui.stage, "robot_list")
+        # 旧实现：2 次 tap 后各固定 sleep(page_wait)。事件驱动版 0 次 → 证明
+        # 等待已绑定到「目标状态到达」而非固定时长。
+        self.assertEqual(m_sleep.call_count, 0)
+        self.assertEqual(len(ui.taps), 2)      # 联系人tab + 机器人分类
+
+    def test_nav_target_wait_is_at_least_page_wait(self):
+        # A1 安全红线：最坏等待不短于旧固定 page_wait（max 取大）
+        f = make_flow(FakeUI([[]]))
+        f.t["page_wait"] = 2.0
+        f.t["nav_wait"] = 8.0
+        self.assertEqual(f._nav_target_wait(), 8.0)
+        f.t["nav_wait"] = 0.5                   # 配得再小也不能低于 page_wait
+        self.assertEqual(f._nav_target_wait(), 2.0)
+
+
+# ----------------------------------------------------------------------
+# A1: 目标页永不到达 → 导航有界超时 + 不盲点错误元素
+# ----------------------------------------------------------------------
+class TestNavTimeoutSafety(unittest.TestCase):
+    def test_target_never_appears_times_out_safely_no_blind_tap(self):
+        # 页面停在「QQ 主壳 + 机器人分类未选中（且永不变为列表）」：每次迭代
+        # 只 tap 真实找到的「机器人」分类节点（非盲点坐标），等待有界超时后
+        # 继续，最多 4 轮即终止、不强置 _at_robot_list、不悬死。
+        from flow import ROBOT_CAT_X1, ROBOT_CAT_X2
+        page = _bottom_tabs("联系人") + [nd("机器人", 500, x1=677)]
+        ui = FakeUI([page])
+        f = make_flow(ui, at_list=False)
+        # 缩小超时让测试快速走完 4 轮（A1 语义：nav_wait max(此值, page_wait)）
+        f.t["nav_wait"] = 0.01
+        f.t["page_wait"] = 0.01
+        f._diag_shot = mock.Mock()
+        with mock.patch.object(flow_mod.time, "sleep"):
+            f._nav_robot_list()
+        self.assertEqual(f._at_robot_list, False)      # 不把错页误当列表
+        # 每轮只点「机器人」分类节点本身（bounds 内，非盲点固定坐标），共 4 轮
+        cat = nd("机器人", 500, x1=677)
+        self.assertEqual(len(ui.taps), 4)
+        for (x, y) in ui.taps:
+            self.assertTrue(cat.x1 <= x < cat.x2 and cat.y1 <= y < cat.y2,
+                            f"tap 落点 ({x},{y}) 必须落在真实节点 bounds 内")
+        f._diag_shot.assert_called_once_with("nav_not_list")
 
 
 # ----------------------------------------------------------------------
@@ -250,12 +381,24 @@ class TestNavFastPath(unittest.TestCase):
                     return _bottom_tabs("联系人") + [nd("机器人", 500, x1=677)]
                 return _robot_list_page(("黎小姐", 400))
 
-            def tap_node(self, node, pause=1.2):
-                self.taps.append(node.center)
+            def tap(self, x, y, pause=1.2):
+                # C2 后 Flow._tap_node 不再走 tap_node(node) 而直接
+                # ui.tap(抖动后坐标) —— 按"落点是否在目标 bounds 内"切换
+                # stage（与真机行为等价：点到哪儿，页面就切到哪儿）。
+                self.taps.append((x, y))
                 if self.stage == "home_msg":
-                    self.stage = "contacts_no_cat"    # 点了底部 联系人
+                    tab = nd("联系人", 1880, x1=496)
+                    if self._hit(tab, x, y):
+                        self.stage = "contacts_no_cat"    # 点了底部 联系人
                 elif self.stage == "contacts_no_cat":
-                    self.stage = "robot_list"         # 点了 机器人 分类
+                    cat = nd("机器人", 500, x1=677)
+                    if self._hit(cat, x, y):
+                        self.stage = "robot_list"         # 点了 机器人 分类
+
+            @staticmethod
+            def _hit(node, x, y):
+                return (node.x1 <= x < node.x2
+                        and node.y1 <= y < node.y2)
 
         ui = ContactsNavUI()
         f = make_flow(ui, at_list=False)
@@ -265,6 +408,51 @@ class TestNavFastPath(unittest.TestCase):
         self.assertEqual(ui.stage, "robot_list")
         # 依次点过：底部联系人tab → 中部机器人分类
         self.assertEqual(len(ui.taps), 2)
+
+
+# ----------------------------------------------------------------------
+# D1（坑 12）: _looks_like_robot_list 对「多页残影 dump 穿透」的容忍
+# 根因：MuMu 的 uiautomator dump 可能是混合多页残留 —— 一份 nodes() 里同时
+# 含真正的机器人列表文本 + 旧/后台页（如个人名片卡）残留的「发消息」节点。
+# 旧判据"任意位置出现禁止词即否决"被单个残留「发消息」误杀 → 真·列表页被判
+# False → _nav_robot_list 空转 / safe_back 反复物理返回（藤非/裴旖卡 4-5 分钟）。
+# 新判据：先看正信号（QQ 主壳+机器人分类 selected，列表的充分证据），
+# 「发消息」仅在落到底部操作栏(y>=FORBIDDEN_ACTION_Y，真 profile 按钮位置)
+# 才否决；任务中心/每日签到整页特征出现即否决。
+# ----------------------------------------------------------------------
+class TestLooksLikeRobotListResidue(unittest.TestCase):
+    def _residue(self, fy: int):
+        """混合残影页：真机器人列表文本 + 一个 stray「发消息」残留节点。"""
+        return _robot_list_page(("黎小姐", 400)) + [nd("发消息", fy)]
+
+    def test_mixed_dump_stray_msg_tolerated(self):
+        # 坑12 实机症状：正信号齐全（联系人tab+机器人选中）+ 中区残留「发消息」
+        # （残影，y=700 不在底部操作栏）→ 应判为机器人列表（容忍残影）
+        ui = FakeUI([self._residue(700)])
+        f = make_flow(ui, at_list=True)
+        self.assertTrue(f._looks_like_robot_list())
+
+    def test_real_profile_bottom_action_vetoed(self):
+        # 真 profile 聊天页：「发消息」在底部操作栏(y=1700 >=阈值) → False
+        ui = FakeUI([self._residue(1700)])
+        f = make_flow(ui, at_list=True)
+        self.assertFalse(f._looks_like_robot_list())
+
+    def test_task_center_sign_always_vetoed_in_mixed_dump(self):
+        # 混合 dump 里出现「每日签到」（整页任务中心特征）→ 仍必须 False
+        nodes = _robot_list_page(("黎小姐", 400)) + [nd("每日签到", 600)]
+        ui = FakeUI([nodes])
+        f = make_flow(ui, at_list=True)
+        self.assertFalse(f._looks_like_robot_list())
+
+    def test_stray_msg_tolerated_logs_diag(self):
+        # 容忍残影时应发诊断日志（便于真机定位坑12）
+        ui = FakeUI([self._residue(700)])
+        f = make_flow(ui, at_list=True)
+        with mock.patch.object(flow_mod.logger, "warning") as w:
+            self.assertTrue(f._looks_like_robot_list())
+            self.assertTrue(any("发消息" in str(a) for a in
+                                (c.args for c in w.call_args_list)))
 
 
 # ----------------------------------------------------------------------

@@ -22,6 +22,7 @@ from test_nav_optimize import FakeUI, _bottom_tabs, _robot_list_page, nd  # 复�
 
 def make_flow(ui, at_list=False):
     f = Flow.__new__(Flow)
+    f._init_cache_state()   # A2/A3：实例级截图/OCR 缓存（防类级共享字典污染）
     f.ui = ui
     f.t = {"click_min": 1.5, "click_max": 3.0, "page_wait": 2.0,
            "taskcenter_wait": 3.5}

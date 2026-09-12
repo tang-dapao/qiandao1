@@ -121,9 +121,27 @@ ROW_SAFE_Y = 1830
 # tap 落 nav 边缘手势区被 QQ 弹回消息 tab，3/3 失败；上移 31px 到 1740 =
 # TAB_Y-100 留 100px 缓冲。低于此上限的行（如游迦 1684）不受影响）。
 TAP_Y_MAX = TAB_Y - 100       # 1740
+# D1（坑 12）：机器人列表「禁止词」veto 的位置阈值。bot profile/聊天页的
+# 「发消息」按钮固定落在底部操作栏（实测 y≈1500-1900）。MuMu/uiautomator 的
+# dump 可能是**多页残影混合**（穿透 dump）：一份 nodes() 里可同时含机器人列表
+# 文本与旧/后台页残留节点（如个人名片卡上的「发消息」）。旧判据"任意位置出现
+# 禁止词即否决"会被单个残留「发消息」误杀 → _nav_robot_list 空转、safe_back 反复
+# BACK（藤非/裴旖 卡 4-5 分钟）。故「发消息」只有在落到底部操作栏(y>=此阈值)才
+# 视为确凿 profile/聊天页，才否决；中区/随机位置的视为残影容忍。
+FORBIDDEN_ACTION_Y = 1400
 
 
 class Flow:
+    # ---- A2/A3 缓存（2026-09-12）：类级默认，防 __new__ 绕过 __init__ 时缺属性 ----
+    # （单测大量用 Flow.__new__(Flow) 绕过 __init__ 构造对象，实例属性在
+    # _init_cache_state() 里赋值；类级 None/空容器仅作兜底，正常实例化时
+    # __init__ 会覆盖。）
+    _shot_ttl: float = 0.8
+    _shot_cache = None
+    _shot_ts: float = 0.0
+    _ocr_result_ttl: float = 0.5
+    _ocr_result_cache: dict = {}
+
     def __init__(self, config: dict, ui: AdbUI, ocr=None):
         self.cfg = config
         self.ui = ui
@@ -145,6 +163,27 @@ class Flow:
         # 而列表页/联系人页的合法坐标点击（机器人首行 y≈410-500、机器人分类行
         # y≈201-352）必须放行，故用页面状态位限定。不产生任何 adb 开销。
         self._page_tc = False
+        # ---- A2/A3 缓存（2026-09-12）：截图 TTL 缓存 + OCR 结果短缓存 ----
+        # 背景：_ocr_shot 每次都跑一次 screencap subprocess（~0.5-1s），而
+        # _dismiss_badcase 一次连做两张全屏 OCR、_close_ad 确认阶段反复读屏 ——
+        # 同一页面状态内的重复读屏纯属浪费。现给截图加 0.8s TTL 缓存（与
+        # nodes() 的 0.8s TTL 对齐），给 OCR 结果加 0.5s TTL 缓存。
+        # 失效时机（关键，防旧帧误判）：
+        #   1) 任何界面动作后 —— 通过 ui.on_action 回调钩子自动失效；
+        #   2) TTL 到期 —— 同 nodes() 一样按时间自然过期；
+        #   3) ui.refresh()（强制重 dump）语义上意味着"画面不可信"——refresh
+        #      本身不触发 on_action（不是界面动作），故 _reconfirm_click_target
+        #      等调用 refresh() 的路径也依赖 TTL 自然过期兜底；关键点击前均有
+        #      等待器/重确认，风险有界。
+        self._init_cache_state()
+        ui.on_action = self._invalidate_shot_cache
+
+    def _init_cache_state(self):
+        """初始化截图/OCR 结果缓存状态（A2/A3）。独立方法便于 __new__ 绕过
+        __init__ 的单测对象按需补齐（类级默认已兜底，此处正常实例化用）。"""
+        self._shot_cache = None
+        self._shot_ts = 0.0
+        self._ocr_result_cache = {}   # key -> (pos|None, ts)
 
     # ----------------------------------------------------------
     # 基础：uiautomator 定位（带滚动）
@@ -309,8 +348,20 @@ class Flow:
         return None
 
     def _tap_node(self, n: Node, pause: Optional[float] = None):
-        self.ui.tap_node(n, pause or random.uniform(self.t["click_min"],
-                                                    self.t["click_max"]))
+        # C2（2026-09-12）：坐标抖动 —— 每次都点 bounds 正中心是强"机器指纹"
+        # （真人点击落点天然随机）。抖动量取「短边的一半 × 安全系数」，
+        # 保证落点必然仍在节点 bounds 内（F11 安全前提不变：点的是 dump
+        # 里真实存在的节点，只是中心附近偏移，不可能偏到节点外）。
+        w = n.x2 - n.x1
+        h = n.y2 - n.y1
+        margin_x = max(0, int(w * 0.25))
+        margin_y = max(0, int(h * 0.25))
+        jx = random.randint(-margin_x, margin_x) if margin_x else 0
+        jy = random.randint(-margin_y, margin_y) if margin_y else 0
+        x = n.x1 + w // 2 + jx
+        y = n.y1 + h // 2 + jy
+        self.ui.tap(x, y, pause or random.uniform(self.t["click_min"],
+                                                  self.t["click_max"]))
 
     def _tap(self, x: int, y: int, pause: Optional[float] = None,
              trusted: bool = False) -> bool:
@@ -387,18 +438,92 @@ class Flow:
         """强判据：当前确实停留在「机器人列表视图」才返回 True。
 
         = 底部 联系人 tab 存在（QQ 主壳） + 中部 机器人 分类 selected + 无
-        任务中心/聊天页标志文本。
+        确凿的任务中心/聊天页标志文本。
 
         旧判据只看“底部有 联系人 tab + 无任务中心文字” → QQ 主界面【消息】
         首页同样满足，看完广告退出后被误判“已在机器人列表”，随后在消息会话
         列表里滚动/点行（点到会话、进的不是 profile）→ 卡死根源（4-tab 布局
         时误落 频道、你停用频道后 3-tab 布局轮到 消息）。
+
+        D1（坑 12）：正的 QQ 主壳 + 机器人分类 selected 已是列表的充分证据，
+        【先看正信号】再谈 veto —— 因 MuMu 的 dump 常是**多页残影混合**（穿透
+        dump），一份 nodes() 里可能同时含真正的机器人列表文本与旧/后台页残留的
+        「发消息」节点。若像旧判据那样"任意位置出现禁止词即否决"，一个残留的
+        「发消息」就会把真·列表页打成 False → _nav_robot_list 空转、safe_back
+        反复物理返回（藤非/裴旖 卡 4-5 分钟的实机症状）。因此：
+          * 任务中心/每日签到：整页特征，出现即否决（不受位置影响，防把
+            真·任务中心当列表）；
+          * 「发消息」：仅在落到底部操作栏(y>=FORBIDDEN_ACTION_Y，真 profile
+            的按钮位置)才否决；中区/随机位置的残留视为残影**容忍**并记录日志，
+            便于真机诊断。
         """
         cur = self.ui.nodes()
-        texts = {x.text for x in cur}
-        if any(k in texts for k in ("任务中心", "每日签到", "发消息")):
+        # 先看正信号（列表的充分证据）：QQ 主壳 + 机器人分类 selected。
+        # 不在列表（如 QQ 消息/联系人首页未选机器人、或 profile/聊天页）→ False。
+        if not (self._on_qq_main_shell() and self._robot_cat_selected()):
             return False
-        return self._on_qq_main_shell() and self._robot_cat_selected()
+        # 正信号已在 → 仅确凿位置的任务中心/聊天页特征才否决。
+        for x in cur:
+            t = x.text
+            if t in ("任务中心", "每日签到"):
+                return False
+            if t == "发消息" and x.y1 >= FORBIDDEN_ACTION_Y:
+                return False
+        # 未被否决 → 在机器人列表。若存在被位置判据放行的「发消息」残影
+        # （穿透 dump 残留），记录以便诊断。
+        stray = [x.y1 for x in cur if x.text == "发消息"]
+        if stray:
+            logger.warning(
+                "容忍残余「发消息」节点(y=%s)，按机器人列表处理（坑12："
+                "多页残影 dump 穿透）", stray)
+        return True
+
+    def _wait_until(self, pred: Callable[[], bool], timeout: float,
+                    interval: float = 0.5, desc: str = "") -> bool:
+        """事件驱动等待：轮询 pred() 直到 True 或超时（A1）。
+
+        用于把导航里「tap 后固定 sleep(page_wait)」改成「页面真正到达目标状态
+        就立刻继续」—— 页面就绪快时省时间、就绪慢时由 timeout 兜底不早于
+        安全等待。返回是否在 timeout 内满足；超时则记录日志并返回 False，
+        由调用方按原有语义继续（不盲点、不提前 tap 未就绪的页）。
+
+        参数：
+          pred     每次轮询调用的谓词（通常包装 _contacts_tab_active /
+                   _looks_like_robot_list 等 dump 基判据）；
+          timeout  最大等待（秒）。**约定 >= 原固定 page_wait**，保证最坏情况
+                   等待不短于旧行为（只在页面就绪更快时提前返回）；
+          interval 两次轮询间隔（秒）；
+          desc     诊断用途的等待描述，超时会带它打日志。
+        """
+        deadline = time.time() + timeout
+        while True:
+            try:
+                if pred():
+                    return True
+            except Exception as e:  # noqa: BLE001
+                # 谓词内部读屏异常（dump 失败）不算满足，继续等到 timeout
+                logger.warning("_wait_until(%s) 谓词异常: %s", desc or "?", e)
+            if time.time() >= deadline:
+                break
+            time.sleep(interval)
+        logger.warning("_wait_until(%s) 超时(%.1fs)，回退到固定等待语义",
+                       desc or "<无描述>", timeout)
+        return False
+
+    def _nav_target_wait(self) -> float:
+        """A1：导航 tap 后「事件驱动等待」的目标超时（秒）。
+
+        读取 timing.nav_wait（默认 8.0s），并保证其**不小于旧的固定 page_wait**
+        —— 这样即便页面迟迟未切换，最坏等待也不会短于旧行为（只在页面就绪
+        更快时提前返回，这正是省 50s→30s 的来源）。
+
+        说明：tap 后的最小动画起步 floor 由 `_tap_node` 的点击 pause
+        （click_min~click_max，真机 1.5-3.0s）兜底，无需再单独固定睡眠；
+        单元测试冻结 time.sleep 时 floor 亦无副作用。
+        """
+        pw = float(self.t.get("page_wait", 2.0))
+        nw = float(self.t.get("nav_wait", 8.0))
+        return max(nw, pw)
 
     def _safe_back_to_robot_list(self, max_back: int = 6) -> bool:
         """把设备安全带回「机器人列表」（P0 + F1/F4）。
@@ -474,7 +599,12 @@ class Flow:
                     if tab:
                         logger.debug("点底部 联系人 tab @ %s", tab.center)
                         self._tap_node(tab)
-                        time.sleep(self.t.get("page_wait", 2.0))
+                        # A1：固定 sleep(page_wait) → 事件驱动等待「联系人 tab 激活」。
+                        # 页面就绪快则立即继续；超时兜底（timeout>=原 page_wait，
+                        # 最坏等待不短于旧行为）后仍按原有循环语义继续，不盲点。
+                        self._wait_until(self._contacts_tab_active,
+                                         self._nav_target_wait(),
+                                         desc="联系人tab选中")
                 if not self._robot_cat_selected():
                     cat = self._find("机器人",
                                      xmin=ROBOT_CAT_X1[0],
@@ -482,7 +612,11 @@ class Flow:
                     if cat:
                         logger.info("点中部 机器人 分类 @ %s", cat.center)
                         self._tap_node(cat)
-                        time.sleep(self.t.get("page_wait", 2.0))
+                        # A1：事件驱动等待「机器人分类展开为列表」，把等待绑定到
+                        # 真实页面切换而非固定时长；超时兜底后继续原有语义。
+                        self._wait_until(self._looks_like_robot_list,
+                                         self._nav_target_wait(),
+                                         desc="机器人分类展开为列表")
                     if not self._looks_like_robot_list():
                         # 老版 QQ：机器人分组可能折叠在分组头下，点开
                         for hdr_t in ("我添加的机器人", "我创建的机器人"):
@@ -490,7 +624,10 @@ class Flow:
                             if hdr:
                                 logger.info("展开分组头 %s", hdr_t)
                                 self._tap_node(hdr)
-                                time.sleep(self.t.get("page_wait", 2.0))
+                                # A1：事件驱动等待分组头收敛回列表；超时则继续。
+                                self._wait_until(self._looks_like_robot_list,
+                                                 self._nav_target_wait(),
+                                                 desc="分组头展开为列表")
                                 break
             else:
                 logger.debug("不在 QQ 主界面壳，物理返回一层")
@@ -995,12 +1132,50 @@ class Flow:
             return False
         return not self._taskcenter_confirmed_by_ocr()
 
+    def _overlay_scan(self) -> Tuple[bool, bool]:
+        """单次 OCR 同时判定 Badcase 问卷与 AI 好友 H5（A4 2026-09-12）。
+
+        背景：_dismiss_badcase 每次调用要做 2-3 次全屏 OCR（badcase 词表一次、
+        AI 好友词表一次、AI 好友命中后任务中心词表再一次），全屏推理 ~1.5s/次。
+        三组词查的都是**同一帧全屏画面** —— 合并成一次 image_to_data 推理，
+        在同一份词元列表上分别对三组词做整词+跨词元匹配，一次推理出全部结论。
+        判定语义与原来逐个 _ocr_find 完全一致：
+          - bad: 命中 _BADCASE_KEYS 任一词
+          - ai:  命中 _AI_FRIEND_HINTS 任一词 且 未命中 _TC_KEYS_OCR 任一词
+        返回 (bad, ai)。OCR 不可用/截图失败返回 (False, False)（与原逻辑
+        "读不到=不认账"一致）。
+        """
+        if not _HAS_OCR:
+            return False, False
+        img = self._ocr_shot()
+        if img is None:
+            return False, False
+        data = pytesseract.image_to_data(
+            img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
+            output_type=pytesseract.Output.DICT)
+        toks: List[Tuple[str, int, int]] = []
+        n = len(data["text"])
+        for i in range(n):
+            t = (data["text"][i] or "").strip()
+            if t:
+                toks.append((t, data["left"][i] + data["width"][i] // 2,
+                             data["top"][i] + data["height"][i] // 2))
+        bad = self._merged_match(toks, self._BADCASE_KEYS, None) is not None
+        ai_hit = self._merged_match(toks, self._AI_FRIEND_HINTS, None) is not None
+        tc_hit = self._merged_match(toks, self._TC_KEYS_OCR, None) is not None
+        ai = ai_hit and not tc_hit
+        return bad, ai
+
     def _dismiss_badcase(self, max_back: int = 3) -> bool:
         """若 Badcase 问卷或 AI 好友 banner H5 在屏 → 物理 BACK 退出。
         返回是否已清掉（无 overlay 时直接 True，不产生任何 adb 动作）。
+
+        A4（2026-09-12）：检测改走 _overlay_scan —— 单次 OCR 推理同时判
+        Badcase/AI 好友/任务中心三组词（原先 2-3 次推理）。BACK 循环内同样
+        用它复核。开销从 ~2.3s/次（全屏 OCR ×2 + sleep 1s 的 OCR 部分）
+        降到 ~1.5s/次；按每轮广告 + 每台签到前各一次计，10 台全量省 ~15-20s。
         """
-        bad = self._badcase_visible()
-        ai = self._ai_friend_page_visible()
+        bad, ai = self._overlay_scan()
         if not bad and not ai:
             return True
         # F7（2026-09-10）：点名是哪种 overlay 并留现场截图 —— 此前日志只有一句
@@ -1012,7 +1187,7 @@ class Flow:
         for _ in range(max_back):
             self.ui.back(pause=1.2)
             time.sleep(1.0)
-            if not self._badcase_visible() and not self._ai_friend_page_visible():
+            if not any(self._overlay_scan()):
                 logger.info("Badcase/AI 好友页已退出")
                 return True
         logger.warning("连续 %d 次 BACK 后仍在 Badcase / AI 好友页", max_back)
@@ -1021,17 +1196,36 @@ class Flow:
     # ----------------------------------------------------------
     # 广告关闭（OCR 定位「关闭广告」按钮）
     # ----------------------------------------------------------
+    def _invalidate_shot_cache(self):
+        """失效截图/OCR 结果缓存（A2）。任何界面动作后由 ui.on_action 自动调用；
+        画面内容随动作改变，缓存的旧帧不可再用。"""
+        self._shot_cache = None
+        self._shot_ts = 0.0
+        self._ocr_result_cache.clear()
+
     def _ocr_shot(self) -> Optional["Image.Image"]:
         """截图返回 PIL Image（1080x1920），失败返回 None。
 
         2026-09-10 加超时：原先未设 timeout，emulator 卡住时 screencap
         会永久挂起导致整个流程停摆（无人值守场景必须避免）。
+        A2（2026-09-12）：加 0.8s TTL 缓存 —— 短时间内多次 OCR 查询
+        （如 _dismiss_badcase 连查 Badcase/AI 好友两张、_close_ad 确认链）
+        共用同一帧，省掉重复 screencap subprocess（每次 ~0.5-1s）。
+        失效：界面动作（tap/swipe/back，经 ui.on_action 钩子）、TTL 过期、
+        显式 _invalidate_shot_cache()。
         """
+        now = time.time()
+        if (self._shot_cache is not None
+                and now - self._shot_ts < self._shot_ttl):
+            return self._shot_cache
         try:
             out = subprocess.run(
                 [self.ui.adb, "-s", self.ui.device, "exec-out", "screencap", "-p"],
                 capture_output=True, timeout=SHOT_TIMEOUT)
-            return Image.open(io.BytesIO(out.stdout)).convert("RGB")
+            img = Image.open(io.BytesIO(out.stdout)).convert("RGB")
+            self._shot_cache = img
+            self._shot_ts = time.time()
+            return img
         except subprocess.TimeoutExpired:
             logger.warning("截图超时 (> %.0fs)，设备可能无响应", SHOT_TIMEOUT)
             return None
@@ -1059,9 +1253,24 @@ class Flow:
         注：广告页「关闭广告」同理被切成 `关闭`+`广告`，历史上只因关键词表里
         额外带了短词 `关闭` 才勉强命中 —— 这是"关闭能读到、任务中心读不到"的
         根因，两遍匹配后两类页面判定口径统一。
+
+        A3（2026-09-12）：加 OCR 结果短缓存 —— 命中结果 TTL 0.5s、未命中
+        TTL 0.25s（未命中更短：页面可能在变化，"没找到"的时效性要求更高）。
+        同一页面状态内反复查询同一组词（如 _close_ad 快路径连续 2 次
+        _taskcenter_confirmed_by_ocr）直接复用上次结果，省一次全屏 OCR
+        （~1-2s）。界面动作后经 _invalidate_shot_cache 一并清空。
         """
         if not _HAS_OCR:
             return None
+        cache_key = (texts, region, ymax)
+        now = time.time()
+        hit = self._ocr_result_cache.get(cache_key)
+        if hit is not None:
+            pos, ts = hit
+            ttl = self._ocr_result_ttl if pos is not None else min(
+                self._ocr_result_ttl, 0.25)
+            if now - ts < ttl:
+                return pos
         for _ in range(retries):
             img = self._ocr_shot()
             if img is None:
@@ -1087,13 +1296,16 @@ class Flow:
                 if ymax is None or y <= ymax:
                     for k in texts:
                         if k in t:
+                            self._ocr_result_cache[cache_key] = ((x, y), now)
                             return (x, y)
                 toks.append((t, x, y))
             # 第 2 遍：跨词元拼接匹配（仅在第 1 遍全部失配时执行）
             pos = self._merged_match(toks, texts, ymax)
             if pos is not None:
+                self._ocr_result_cache[cache_key] = (pos, now)
                 return pos
             time.sleep(interval)
+        self._ocr_result_cache[cache_key] = (None, now)   # 未命中也缓存（短 TTL）
         return None
 
     @staticmethod

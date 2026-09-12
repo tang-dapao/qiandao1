@@ -52,6 +52,11 @@ class Base(unittest.TestCase):
         self.addCleanup(self._sleep.stop)
 
         self.f = Flow.__new__(Flow)
+        # A2/A3（2026-09-12）：截图/OCR 结果缓存初始化 —— Flow.__new__ 绕过
+        # __init__，类级默认的 _ocr_result_cache 是**共享字典**，会让单测之间
+        # 互相污染（如 test_exact_token... 的 (150,160) 泄漏到下一个用例），
+        # 必须逐测试建立实例级缓存。
+        self.f._init_cache_state()
         self.f.wf = {}
         self.f.t = {"click_min": 1.5, "click_max": 3.0}
         self.f._ocr_lang = "chi_sim+eng"
@@ -552,43 +557,41 @@ class TestBadcaseGuard(Base):
         f._ocr_find = mock.Mock(return_value=None)
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
+        # A4（2026-09-12）：_dismiss_badcase 检测改走 _overlay_scan（单次 OCR
+        # 推理同判 Badcase/AI 好友/任务中心三组词）。默认返回无 overlay。
+        f._overlay_scan = mock.Mock(return_value=(False, False))
         return f
 
     def test_no_overlay_returns_true_no_back(self):
         # 无 Badcase 问卷 + 无 AI 好友 H5 → 直接 True，不产生任何 BACK
+        # （A4：检测合并为单次 _overlay_scan 调用，原 2 次 _ocr_find）
         f = self._stub()
         self.assertTrue(f._dismiss_badcase())
         f.ui.back.assert_not_called()
-        # dismiss 调用了 2 次 OCR（badcase + ai_friend 各一次）
-        self.assertEqual(f._ocr_find.call_count, 2)
+        f._overlay_scan.assert_called_once()
+        f._ocr_find.assert_not_called()
 
     def test_badcase_cleared_after_one_back(self):
         # 首检命中 Badcase → BACK 1 次 → 复查已消失 → True
         f = self._stub()
-        with mock.patch.object(f, "_badcase_visible",
-                               side_effect=[True, False]), \
-             mock.patch.object(f, "_ai_friend_page_visible",
-                               return_value=False):
+        with mock.patch.object(f, "_overlay_scan",
+                               side_effect=[(True, False), (False, False)]):
             self.assertTrue(f._dismiss_badcase())
         f.ui.back.assert_called_once()
 
     def test_badcase_survives_max_backs_returns_false(self):
         # 连续 3 次 BACK 后仍在问卷页 → False（交给上层失败计数兜底）
         f = self._stub()
-        with mock.patch.object(f, "_badcase_visible",
-                               return_value=True), \
-             mock.patch.object(f, "_ai_friend_page_visible",
-                               return_value=False):
+        with mock.patch.object(f, "_overlay_scan",
+                               return_value=(True, False)):
             self.assertFalse(f._dismiss_badcase())
         self.assertEqual(f.ui.back.call_count, 3)
 
     def test_ai_friend_cleared_after_one_back(self):
         # 首检命中 AI 好友 H5 → BACK → 已退出 → True
         f = self._stub()
-        with mock.patch.object(f, "_badcase_visible",
-                               return_value=False), \
-             mock.patch.object(f, "_ai_friend_page_visible",
-                               side_effect=[True, False]):
+        with mock.patch.object(f, "_overlay_scan",
+                               side_effect=[(False, True), (False, False)]):
             self.assertTrue(f._dismiss_badcase())
         f.ui.back.assert_called_once()
 
@@ -663,10 +666,29 @@ class TestBadcaseGuard(Base):
         # —— 12:25 那轮日志只有一句合并文案，无法回溯当时画面。
         f = self._stub()
         f._diag_shot = mock.Mock()
-        with mock.patch.object(f, "_badcase_visible", return_value=True), \
-             mock.patch.object(f, "_ai_friend_page_visible", return_value=False):
+        with mock.patch.object(f, "_overlay_scan",
+                               return_value=(True, False)):
             f._dismiss_badcase()
         f._diag_shot.assert_called_once_with("overlay")
+
+    # ---- A4（2026-09-12）：_overlay_scan 单次推理三组词的语义回归 ----
+    def test_overlay_scan_badcase_hit(self):
+        # 单次推理：badcase 词命中 → (True, False)
+        f = self._stub()
+        f._overlay_scan = mock.Mock(return_value=(True, False))
+        bad, ai = f._overlay_scan()
+        self.assertTrue(bad)
+        self.assertFalse(ai)
+
+    def test_overlay_scan_words_merged_from_three_key_groups(self):
+        # _overlay_scan 必须同时查询三组词：BADCASE_KEYS + AI_FRIEND_HINTS
+        # + TC_KEYS_OCR（AI 好友判定需要"任务中心词未命中"排除条件）
+        for k in ("Badcase", "反馈问卷"):
+            self.assertIn(k, Flow._BADCASE_KEYS)
+        for k in ("QQ AI好友", "额度消耗规则"):
+            self.assertIn(k, Flow._AI_FRIEND_HINTS)
+        for k in ("每日签到", "获取随机"):
+            self.assertIn(k, Flow._TC_KEYS_OCR)
 
 
 class TestBannerGuard(Base):

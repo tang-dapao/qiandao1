@@ -445,6 +445,86 @@
 `_watch_ad_once()` 返回 True 后立即取）= 日志「广告已关闭，回到任务中心」那一刻，
 **不是**「定位到关闭按钮」。
 
+### 2026-09-12 性能优化第 1 批（更像人 + 更快；已落地，单测 181/181 全绿）
+
+**背景**：用户要求「更像人类 + 更快」，四方案权衡后分 4 批实施，本批只含低风险快收益项。
+（完整清单：第 2 批 D1 坑12修复 + A1 事件驱动替换固定 sleep + E2 导航基线对比；第 3 批
+A5 RapidOCR + A6 半分辨率 + A7 onnxruntime-directml GPU + E3 回放验证；第 4 批 B1 CD 感知
+EDF 轮换 + C1/C4 分布抖动 + C5/C6/C7 + E1 量化验收。第 2 批已落地，见下节；第 3-4 批尚未开始。）
+
+**本批改动（全部已落地）：**
+- **A2 截图 TTL 缓存**：`_ocr_shot` 加 0.8s TTL 缓存（`flow.py` `_invalidate_shot_cache` /
+  缓存字段）；失效时机：界面动作 / TTL 过期 / 显式失效。`AdbUI` 新增 `on_action` 回调钩子
+  （tap/tap_node/swipe_up/swipe_down/back 动作后 `_notify_action()` 触发），`Flow.__init__`
+  挂 `ui.on_action = self._invalidate_shot_cache`。
+- **A3 OCR 结果短缓存**：`_ocr_find` 加结果缓存（命中 0.5s TTL、未命中 0.25s TTL），
+  cache_key = (texts, region, ymax)。
+- **A4 `_dismiss_badcase` 廉价路径优先**：新增 `_overlay_scan()`（flow.py:1041-1073）——
+  单次全屏 OCR 推理同判 Badcase/AI好友/任务中心三组词；`_dismiss_badcase` 的检测+复核
+  均改用它，~2.3s → ~1.5s/次。
+- **A8**：config.yaml `ad_close_settle` 2.0 → **1.0**。
+- **C2 `_tap_node` 坐标抖动**（flow.py:342-356）：短边 25% 边距内随机偏移，落点必仍在
+  bounds 内（F11 安全前提不变：点的是 dump 真实节点）。
+- **测试配套**：Flow 新增类级缓存默认值 + `_init_cache_state()`（各测试 make_flow/setUp
+  已补调，防类级共享字典单测互污）；test_flow_ocr_close.py TestBadcaseGuard 改 stub
+  `_overlay_scan`；新增 test_overlay_scan_badcase_hit / test_overlay_scan_words_merged；
+  test_nav_optimize.py ContactsNavUI 的 `tap_node` 改为 `tap(x,y)` 按落点 bounds 切 stage
+  （适配 C2：`_tap_node` 不再走 `ui.tap_node` 而直接 `ui.tap(抖动后坐标)`）。
+
+**单测基线更新：181/181 全绿**（原 179 + 新增 2）。
+
+**A2/A3 缓存重要语义**：单测用 `Flow.__new__` 绕过 `__init__` → 必须显式 `_init_cache_state()`
+建立实例级缓存；类级默认 `_ocr_result_cache = {}` 是共享字典，漏建实例缓存会单测互污
+（已实锤：test_exact_token_wins_over_merged 的 (150,160) 泄漏）。
+
+**后续批次备忘（勿忘）**：第 2 批先修坑 12（`_looks_like_robot_list` 被残留 dump 节点污染）
+再上 A1 事件驱动（导航 50s→30s 目标）；第 3 批 OCR 换 RapidOCR（已装 rapidocr-onnxruntime，
+30MB，实测质量显著优于 tesseract：完整行文本、同帧均值 ~1.3s vs tesseract 1.24-1.68s 且
+切碎「天下归心」）+ 半分辨率 + onnxruntime-directml（GTX 1650 驱动 462.30 只支持 CUDA 11.x，
+新版 onnxruntime-gpu 装不上，DirectML 是唯一 GPU 路线）；第 4 批调度与人味增强。
+
+### 2026-09-12 性能优化第 2 批（D1 坑12 + A1 事件驱动导航；已落地，单测 191/191 全绿）
+
+**第 1 批真机实测（用户日志复盘，已确认优化生效）**：正常机器人单台 129-155s（代柯 129s 最低），
+导航 26s→15-16s（+约 10s/台），广告关闭链路稳定 42-44s（含固定 16-18s ad_wait），零固定坐标盲点。
+裴旖/藤非两类 dump 失联场景（4-5 分钟瞎退）属 D1 待修，即本批。
+
+**D1（坑 12 根治，flow.py `_looks_like_robot_list`）**：
+- 判据重构为【先看正信号再谈 veto】：正信号（`_on_qq_main_shell()` + `_robot_cat_selected()`，
+  x-bounds 校验）成立即是列表的充分证据；之后仅「确凿位置」的任务中心/聊天页特征才否决：
+  - `任务中心`/`每日签到`：**整页特征，任意位置出现即否决**（防把真·任务中心当列表）；
+  - `发消息`：仅当 `y >= FORBIDDEN_ACTION_Y(=1400)`（真 profile 底部操作栏按钮位置）才否决；
+    中区/随机位置的残留「发消息」视为**残影容忍**并打 warning 日志（诊断用）。
+- 修复目标：MuMu 多页残影 dump（穿透）里残留的「发消息」不再把真·列表页打成 False → 消除
+  藤非/裴旖 4-5 分钟导航空转 + safe_back 瞎退。
+- 新增常量 `FORBIDDEN_ACTION_Y = 1400`（flow.py:131）。
+- **已知残余局限（不 over-engineering）**：残留节点若恰落在 y>=1400 仍会触发 veto（概率低，可后续
+  用 dump 新鲜度/前台 Activity 判据根治）。
+
+**A1（事件驱动导航，flow.py + config.yaml）**：
+- 新增 `Flow._wait_until(pred, timeout, interval=0.5, desc)`：轮询 pred() 至 True 或超时；
+  谓词异常（dump 失败）视为不满足继续等到 timeout；超时打 warning 回退到固定等待语义。
+- 新增 `Flow._nav_target_wait()`：`max(timing.nav_wait=8.0, page_wait=2.5)` —— 保证最坏等待
+  不短于旧固定 page_wait（只在页面就绪更快时提前返回，即省时来源）。
+- `_nav_robot_list` 三处 tap 后固定 `sleep(page_wait)` 改为 `_wait_until` 轮询真实目标态：
+  点联系人 tab → 等 `_contacts_tab_active()`；点机器人分类/分组头 → 等 `_looks_like_robot_list()`。
+- 构造控制流/重试语义（dump_stuck→safe_back、BACK、4 次循环、break）**完全不变**。
+- 页面动画起步 floor 由 `_tap_node` 点击 pause（click_min~click_max，真机 1.5-3.0s）兜底，
+  不加额外固定睡眠。
+- 新增 config `timing.nav_wait: 8.0`。
+- **未动**：`_exit_taskcenter` 的 EXIT_LAYER_WAIT(1.2s)、`_signin` 固定 settle、`ad_close_settle`(A8)
+  —— 均为真机调好的稳定性 settle，不在 A1 导航主范围。
+- **风险（未单测）**：慢页最坏情况轮询会比单次固定 sleep 发更多 adb dump（~16 次/8s），
+  正常快路径不受影响；真机实测验证。
+
+**单测基线更新：191/191 全绿**（185 + D1 新增 4 + A1 新增 6）。
+- D1 新增：TestLooksLikeRobotListResidue（残影容忍 / 真 profile 否决 / 任务中心否决 / F1 消息首页保留）
+- A1 新增：TestWaitUntil（早满足 True/超时 False/谓词异常不满足）+ TestNavEventDriven（免全 page_wait、
+  nav_target_wait>=page_wait）+ TestNavTimeoutSafety（目标永不出现→安全超时不盲点、_diag_shot 触发）
+
+**E2（导航基线对比验证）**：待用户真机实测后对比导航耗时（历史基线：完整导航中位 50.5s，
+第 1 批实测回列表→点到行 15-16s；A1 目标再降，进入→任务中心可用 50s→30s）。
+
 ### 单测基线（2026-09-11：179/179 全绿）
 - `py -3.13 -m unittest discover -p "test_*.py"`
 - test_flow_ocr_close.py **63**（F8 关闭语义 + F11 **banner 盲点禁令** + **覆盖层闸门** +

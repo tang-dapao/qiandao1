@@ -107,6 +107,10 @@ class AdbUI:
     def __init__(self, device: str = DEFAULT_DEV, adb: str = ADB):
         self.device = device
         self.adb = adb
+        # 界面动作回调（A2 优化 2026-09-12）：tap/tap_node/swipe/back 执行后触发，
+        # 供上层（Flow）失效其截图/OCR 结果缓存 —— 动作后画面必变，缓存的
+        # 旧帧不可再用。设为 None 即无回调（默认，兼容既有用法/单测）。
+        self.on_action = None
         # nodes() 的 TTL 缓存：dump 一次约 1~3s，短时间重复解析同一页面时
         # 直接复用缓存可显著减少 dump 次数；界面动作(tap/swipe/back)后用
         # _invalidate_cache() 清空，保证下次读到的是新页面。
@@ -268,9 +272,18 @@ class AdbUI:
         获取「当前真实页面」快照，防缓存/滚动动画中间帧用旧坐标点错。"""
         self._invalidate_cache()
 
+    def _notify_action(self):
+        """动作后通知上层（失效截图缓存等）。回调异常不得影响主流程。"""
+        if self.on_action is not None:
+            try:
+                self.on_action()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("on_action 回调异常(忽略): %s", e)
+
     def tap(self, x: int, y: int, pause: float = 1.2):
         self._run("shell", "input", "tap", str(int(x)), str(int(y)))
         self._invalidate_cache()
+        self._notify_action()
         time.sleep(pause)
 
     def tap_node(self, node: Node, pause: float = 1.2):
@@ -282,6 +295,7 @@ class AdbUI:
         self._run("shell", "input", "swipe",
                   "540", "1500", "540", "700", "400")
         self._invalidate_cache()
+        self._notify_action()
         time.sleep(pause)
 
     def swipe_down(self, pause: float = 1.0):
@@ -292,11 +306,13 @@ class AdbUI:
         self._run("shell", "input", "swipe",
                   str(SWIPE_X), "700", str(SWIPE_X), "1500", "400")
         self._invalidate_cache()
+        self._notify_action()
         time.sleep(pause)
 
     def back(self, pause: float = 1.2):
         self._run("shell", "input", "keyevent", "4")
         self._invalidate_cache()
+        self._notify_action()
         time.sleep(pause)
 
     # ----------------------------------------------------------

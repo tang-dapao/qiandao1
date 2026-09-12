@@ -129,6 +129,7 @@ class TestMainWhitelist(unittest.TestCase):
 class FlowAllBase(unittest.TestCase):
     def setUp(self):
         self.f = Flow.__new__(Flow)
+        self.f._init_cache_state()   # A2/A3：实例级缓存（防类级共享字典污染）
         self.f.wf = {"ad_times_per_robot": 10, "ad_cooldown": 0}  # cd=0 避免时间死循环
         self.f.t = {"click_min": 1.5, "click_max": 3.0}
         self.f.run_robot = mock.Mock()
@@ -267,6 +268,7 @@ class TestFirstAdInFirstPass(unittest.TestCase):
 
     def setUp(self):
         self.f = Flow.__new__(Flow)
+        self.f._init_cache_state()   # A2/A3：实例级缓存（防类级共享字典污染）
         self.f.wf = {"ad_times_per_robot": 10, "ad_cooldown": 0}
         self.f.t = {"click_min": 1.5, "click_max": 3.0}
         self._sleep = mock.patch.object(flow_mod.time, "sleep")

@@ -33,6 +33,9 @@ class ThreeBotRotationBase(unittest.TestCase):
         self.f.wf = {"ad_times_per_robot": 10, "ad_cooldown": 0}
         self.f.t = {"click_min": 1.5, "click_max": 3.0}
         self.f._dismiss_badcase = mock.Mock()
+        # D 优化（2026-09-13）：轮转 CD 尾部会真实调用 _find_row 预取行节点，
+        # Flow.__new__ 无 ui 属性，必须 mock（返回 None → watch 走现场查找兜底）。
+        self.f._find_row = mock.Mock(return_value=None)
         self.f._enter_taskcenter = mock.Mock(return_value=True)
         self.f._watch_ad_once = mock.Mock(return_value=True)
         self.f._exit_taskcenter = mock.Mock()
@@ -99,6 +102,20 @@ class TestThreeBotRotationMultiAds(ThreeBotRotationBase):
         self.f.run_all(ROBOTS_3, False, False, 2)
         self.assertEqual(self.f._ad_quota_done.call_count, 3)   # 每台 1 次会话内复核
 
+    def test_prefetched_row_passed_on_subsequent_ads(self):
+        # D 优化（2026-09-13）：每台首轮 watch(row=None) 现场查找；后续各轮
+        # 把 CD 窗口预取的行节点传给 _watch_ad_once，省一次全量 dump。
+        # 3 台 × 2 次 → row 模式应为 None, 预取, None, 预取, None, 预取
+        # （pre_row 一次性使用 + 每台重置，失败路径也会被 watch 前的重置清掉）。
+        sentinel = ("btn", "看广告", (1, 10))
+        self.f._find_row = mock.Mock(return_value=sentinel)
+        self.f.run_all(ROBOTS_3, False, False, 2)
+        calls = self.f._watch_ad_once.call_args_list
+        self.assertEqual(len(calls), 6)
+        expected = [None, sentinel] * 3
+        actual = [c.kwargs.get("row") for c in calls]
+        self.assertEqual(actual, expected)
+
 
 class TestThreeBotRotationFailures(ThreeBotRotationBase):
     """失败隔离：某台异常不影响其后的轮换。"""
@@ -123,7 +140,7 @@ class TestThreeBotRotationFailures(ThreeBotRotationBase):
         # R1 看广告连续 3 次失败 → 退出 → 轮到 R2、R3 正常
         calls = {"n": 0}
 
-        def fake_watch():
+        def fake_watch(*a, **k):    # D 优化后 run_all 会传 row= kwarg，桩须兼容
             calls["n"] += 1
             return calls["n"] > 3        # 前 3 次(R1)失败，之后成功
         self.f._watch_ad_once = mock.Mock(side_effect=fake_watch)

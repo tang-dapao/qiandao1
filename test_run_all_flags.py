@@ -138,6 +138,10 @@ class FlowAllBase(unittest.TestCase):
         self.f._exit_taskcenter = mock.Mock()
         # F10：单会话连看相关辅助（默认未达配额/进入即成功）
         self.f._ad_quota_done = mock.Mock(return_value=False)
+        # D 优化（2026-09-13）：轮转 CD 尾部会真实调用 _dismiss_badcase 与
+        # _find_row 预取行节点，Flow.__new__ 无 ui 属性，必须 mock。
+        self.f._dismiss_badcase = mock.Mock()
+        self.f._find_row = mock.Mock(return_value=None)
         self.f._safe_back_to_robot_list = mock.Mock(return_value=True)
         # 2026-09-10 CD 重叠优化：进台读一次 X/10 基数（默认读不到 → 走屏幕
         # 复核的旧路径，与 _ad_quota_done 的 None 语义一致）

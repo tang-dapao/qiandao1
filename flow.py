@@ -1025,7 +1025,7 @@ class Flow:
         self.ui.back(pause=1.5)
         time.sleep(1.0)
 
-    def _watch_ad_once(self) -> bool:
+    def _watch_ad_once(self, row=None) -> bool:
         logger.info("看一次广告")
         # 2026-09-09 观察确认：任务中心不会自动弹问卷 —— 之前的「Badcase 反馈
         # 问卷」是 _close_ad 盲点 (160,152) 在广告已自动关闭、画面回到任务中心
@@ -1035,10 +1035,17 @@ class Flow:
         #   （2026-09-10 实锤）；② 现为**方案 A**：改由 OCR 负向排除判定
         #   （_taskcenter_confirmed_by_ocr）—— 既不用 dump、又能识别"已回任务
         #   中心"，banner 误触时还有 _dismiss_badcase() 立即 BACK 自愈。
-        row = self._find_row("看广告", alt_labels=("获取随机",))
-        if not row:
-            logger.warning("未找到 看广告/获取随机 行")
-            return False
+        # D 优化（2026-09-13）：轮转阶段可传入 CD 窗口内预取的行节点
+        # （配额复核 dump 的缓存，~5s 龄、期间页面静止无操作），省一次全量
+        # dump——实测 708/708 次点开段 ≥5s 的主因就是这里的现场 dump。
+        # row=None（首轮/兜底）行为与旧版完全一致：现场 dump 查找。
+        if row is None:
+            row = self._find_row("看广告", alt_labels=("获取随机",))
+            if not row:
+                logger.warning("未找到 看广告/获取随机 行")
+                return False
+        else:
+            logger.info("使用 CD 窗口预取的行节点（D 优化，省一次 dump）")
         btn, _label, ratio = row
         # P1 校准：X/10 计数已达 target → 已看满，跳过本台本次广告
         # （run_all 会按"完成"计 1 次，目标未到继续下次轮转；目标到了自然停）
@@ -1822,12 +1829,19 @@ class Flow:
                 logger.info("%s 看广告已达每日配额，本会话直接退出", name)
                 self._exit_taskcenter()
                 continue
+            first_iter = True     # D 优化：首轮 dismiss 在循环顶；后续挪进 CD 窗口
+            pre_row = None        # CD 窗口预取的行节点（一次性使用，用过即弃）
             while done < target and fail < max_fail:
                 # L3：每轮看广告前先巡检 Badcase 问卷并清除 —— 上一轮广告
                 # 关闭后 ~35-40s QQ 可能延迟弹出腾讯问卷 H5，若不清掉，
                 # _watch_ad_once 的 dump 会穿透读到背景任务中心造成误判。
-                self._dismiss_badcase()
-                ok = self._watch_ad_once()
+                # D 优化（2026-09-13）：首轮在此清场；后续各轮的 dismiss 挪进
+                # CD 窗口内（见下方 CD 段），与配额复核/行预取一起吸收进等待期。
+                if first_iter:
+                    self._dismiss_badcase()
+                    first_iter = False
+                ok = self._watch_ad_once(row=pre_row)
+                pre_row = None
                 if not ok:
                     fail += 1
                     logger.warning("%s 看广告失败，累计失败 %d/%d",
@@ -1857,9 +1871,17 @@ class Flow:
                 logger.info("%s 广告 CD %.0f 秒（从关闭起算，留在任务中心）",
                             name, cd)
                 time.sleep(max(0.0, wake - lead - time.time()))
+                # D 优化（2026-09-13）：dismiss/配额复核/行预取全部挪进 CD 窗口
+                # —— 原顺序把 dismiss(OCR ~1.5s) 和 find_row 全量 dump(~5.5s)
+                # 都排在 CD 之后纯串行（实测 708/708 次点开段 ≥5s，均值 7.2s）。
+                # 顺序要求：dismiss 必须在预取之前（BACK 清 overlay 会使预取行失效）。
+                self._dismiss_badcase()
                 # 配额复核（手动/并发补看完成 → 收尾退出；读不到=保守继续）
                 if self._ad_quota_done():
                     break
+                # 行预取：复用配额复核刚写入的 nodes 缓存（TTL 0.8s 内，~0 成本）；
+                # 读不到（dump 超时等）= None → _watch_ad_once 现场重新查找兜底。
+                pre_row = self._find_row("看广告", alt_labels=("获取随机",))
                 time.sleep(max(0.0, wake - time.time()))
             self._exit_taskcenter()
             logger.info("%s 看广告结束（本会话 %d/%d，失败 %d）",

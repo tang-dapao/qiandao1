@@ -538,6 +538,16 @@ class Flow:
                        max_back)
         # F11：离开任务中心语义 → 关闭 banner 禁点区（列表页 y<440 的点击合法）
         self._page_tc = False
+
+        def _dump_failing() -> bool:
+            # dump 连续失败 = 读屏盲区（Mock ui 的 dump_fail_streak 不可 int 转换
+            # → 视为读屏正常，保持旧语义，测试不受影响）
+            try:
+                return int(self.ui.dump_fail_streak) > 0
+            except Exception:
+                return False
+
+        blind = 0
         for i in range(max_back):
             if self._looks_like_robot_list():
                 self._at_robot_list = True
@@ -548,6 +558,18 @@ class Flow:
                 self._at_robot_list = False
                 self._nav_robot_list()
                 return bool(self._at_robot_list and self._looks_like_robot_list())
+            # 盲按熔断（2026-09-13 小麦事故）：dump 连续失败时两道判据全是瞎的，
+            # 继续盲按 BACK 会过度返回（退穿列表顶出资料卡，卡死后续全部机器人）
+            # —— 盲区最多按 3 次就停手上报，把页面留给下一台的自愈路径。
+            if _dump_failing():
+                blind += 1
+                if blind >= 3:
+                    logger.error(
+                        "安全返回中止：dump 持续失败进入盲区，已盲按 %d 次 BACK "
+                        "仍无法读屏——继续盲按有过度返回风险", blind)
+                    return False
+            else:
+                blind = 0
             self.ui.back(pause=1.5)
             time.sleep(1.0)
         self._at_robot_list = False
@@ -586,6 +608,10 @@ class Flow:
                 self._safe_back_to_robot_list()
             self._at_robot_list = self._looks_like_robot_list()
             return
+        # D-修（2026-09-13 小麦事故）：导航前先巡检并清除浮层 —— 资料卡/问卷
+        # 盖顶时 dump 穿透读到背景列表文本，导航 4 次尝试全在假列表里找人名
+        # （实测每台空烧 ~6 分钟、3 台配额丢失）。清完浮层导航即可自愈。
+        self._dismiss_badcase()
         for _ in range(4):
             if self._dump_stuck():
                 logger.warning("导航途中页面持续 dump 失败，转安全返回")
@@ -868,9 +894,16 @@ class Flow:
         # 如机器人首行/分类行）；本方法全程只用物理 BACK，不依赖坐标。
         self._page_tc = False
         # 前提校验：当前必须是任务中心页
+        # 坑（2026-09-13 小麦事故）：重载动画期 dump 连续超时会把"还在任务中心"
+        # 误判成"不在" → 安全返回盲按 BACK 过度返回 → 顶出资料卡浮层卡死后续
+        # 全部机器人。dump 不可用时以 OCR 复核为准（与关闭确认路径同一策略）。
         if not (self._find("每日签到") or self._find("任务中心")):
-            logger.warning("当前不在任务中心页（无 每日签到/任务中心 特征）→ 安全返回兜底")
-            return self._safe_back_to_robot_list()
+            if self._taskcenter_confirmed_by_ocr():
+                logger.info("dump 不可用，OCR 判定仍在任务中心 → 照常三层 BACK")
+            else:
+                logger.warning(
+                    "当前不在任务中心页（无 每日签到/任务中心 特征）→ 安全返回兜底")
+                return self._safe_back_to_robot_list()
         # 1) 第 1 轮：直接三层 BACK（快路径，不做任何滚动）
         for layer in (1, 2, 3):
             self.ui.back(pause=random.uniform(1.2, 1.8))
@@ -1110,6 +1143,10 @@ class Flow:
     # 穿透读到背景任务中心），只能用 OCR 识别。主循环每轮看广告前巡检
     # 一次，命中即物理 BACK 退出（不依赖任何 UI 坐标，避开 banner 区）。
     _BADCASE_KEYS = ("Badcase", "反馈问卷", "开始填写", "感谢大家一直")
+    # 资料卡特征词（2026-09-13 小麦事故）：机器人个人资料卡浮层盖顶时，dump
+    # 穿透读到背景列表文本，导航/安全返回判定全被欺骗（实测卡死 ~1h）。
+    # 「语音通话」「QQ空间」仅出现在资料卡上，列表/任务中心/问卷均无。
+    _PROFILE_KEYS = ("语音通话", "QQ空间", "她的QQ空间", "他的QQ空间")
     # AI 好友 banner H5：方案 A 实施后被观测到的"OCR 漏读任务中心特征词 →
     # 误 tap (160,152) 命中任务中心顶部 banner"事故（2026-09-10 11:43 实锤）。
     # banner H5 全屏显示「QQ AI好友·常见问题答疑」。**不能**仅凭"常见问题答疑"
@@ -1156,24 +1193,25 @@ class Flow:
             return False
         return not self._taskcenter_confirmed_by_ocr()
 
-    def _overlay_scan(self) -> Tuple[bool, bool]:
-        """单次 OCR 同时判定 Badcase 问卷与 AI 好友 H5（A4 2026-09-12）。
+    def _overlay_scan(self) -> Tuple[bool, bool, bool]:
+        """单次 OCR 同时判定 Badcase 问卷 / AI 好友 H5 / 个人资料卡（A4 2026-09-12）。
 
         背景：_dismiss_badcase 每次调用要做 2-3 次全屏 OCR（badcase 词表一次、
         AI 好友词表一次、AI 好友命中后任务中心词表再一次），全屏推理 ~1.5s/次。
-        三组词查的都是**同一帧全屏画面** —— 合并成一次 image_to_data 推理，
-        在同一份词元列表上分别对三组词做整词+跨词元匹配，一次推理出全部结论。
+        各组词查的都是**同一帧全屏画面** —— 合并成一次 image_to_data 推理，
+        在同一份词元列表上分别对各组词做整词+跨词元匹配，一次推理出全部结论。
         判定语义与原来逐个 _ocr_find 完全一致：
           - bad: 命中 _BADCASE_KEYS 任一词
           - ai:  命中 _AI_FRIEND_HINTS 任一词 且 未命中 _TC_KEYS_OCR 任一词
-        返回 (bad, ai)。OCR 不可用/截图失败返回 (False, False)（与原逻辑
-        "读不到=不认账"一致）。
+          - profile: 命中 _PROFILE_KEYS 任一词（2026-09-13 小麦事故新增）
+        返回 (bad, ai, profile)。OCR 不可用/截图失败返回 (False, False, False)
+        （与原逻辑"读不到=不认账"一致）。
         """
         if not _HAS_OCR:
-            return False, False
+            return False, False, False
         img = self._ocr_shot()
         if img is None:
-            return False, False
+            return False, False, False
         data = pytesseract.image_to_data(
             img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
             output_type=pytesseract.Output.DICT)
@@ -1188,7 +1226,8 @@ class Flow:
         ai_hit = self._merged_match(toks, self._AI_FRIEND_HINTS, None) is not None
         tc_hit = self._merged_match(toks, self._TC_KEYS_OCR, None) is not None
         ai = ai_hit and not tc_hit
-        return bad, ai
+        profile = self._merged_match(toks, self._PROFILE_KEYS, None) is not None
+        return bad, ai, profile
 
     def _dismiss_badcase(self, max_back: int = 3) -> bool:
         """若 Badcase 问卷或 AI 好友 banner H5 在屏 → 物理 BACK 退出。
@@ -1199,22 +1238,24 @@ class Flow:
         用它复核。开销从 ~2.3s/次（全屏 OCR ×2 + sleep 1s 的 OCR 部分）
         降到 ~1.5s/次；按每轮广告 + 每台签到前各一次计，10 台全量省 ~15-20s。
         """
-        bad, ai = self._overlay_scan()
-        if not bad and not ai:
+        bad, ai, profile = self._overlay_scan()
+        if not bad and not ai and not profile:
             return True
         # F7（2026-09-10）：点名是哪种 overlay 并留现场截图 —— 此前日志只有一句
         # "检测到 Badcase 问卷 / AI 好友 H5"，真报/误报无法区分（实测 12:25 那轮
         # 反复触发却无法回溯当时画面），排查成本极高。
         logger.warning("检测到 %s，物理 BACK 退出",
-                       "Badcase 问卷" if bad else "AI 好友 H5")
+                       "Badcase 问卷" if bad else
+                       ("个人资料卡" if profile else "AI 好友 H5"))
         self._diag_shot("overlay")
         for _ in range(max_back):
             self.ui.back(pause=1.2)
             time.sleep(1.0)
             if not any(self._overlay_scan()):
-                logger.info("Badcase/AI 好友页已退出")
+                logger.info("Badcase/AI 好友/资料卡页已退出")
                 return True
-        logger.warning("连续 %d 次 BACK 后仍在 Badcase / AI 好友页", max_back)
+        logger.warning("连续 %d 次 BACK 后仍在 Badcase / AI 好友 / 资料卡页",
+                       max_back)
         return False
 
     # ----------------------------------------------------------

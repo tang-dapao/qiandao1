@@ -603,8 +603,9 @@ class TestBadcaseGuard(Base):
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
         # A4（2026-09-12）：_dismiss_badcase 检测改走 _overlay_scan（单次 OCR
-        # 推理同判 Badcase/AI 好友/任务中心三组词）。默认返回无 overlay。
-        f._overlay_scan = mock.Mock(return_value=(False, False))
+        # 推理同判 Badcase/AI 好友/资料卡/任务中心各组词）。默认返回无 overlay。
+        # 2026-09-13：_overlay_scan 扩为三元组 (bad, ai, profile)。
+        f._overlay_scan = mock.Mock(return_value=(False, False, False))
         return f
 
     def test_no_overlay_returns_true_no_back(self):
@@ -620,7 +621,8 @@ class TestBadcaseGuard(Base):
         # 首检命中 Badcase → BACK 1 次 → 复查已消失 → True
         f = self._stub()
         with mock.patch.object(f, "_overlay_scan",
-                               side_effect=[(True, False), (False, False)]):
+                               side_effect=[(True, False, False),
+                                            (False, False, False)]):
             self.assertTrue(f._dismiss_badcase())
         f.ui.back.assert_called_once()
 
@@ -628,7 +630,7 @@ class TestBadcaseGuard(Base):
         # 连续 3 次 BACK 后仍在问卷页 → False（交给上层失败计数兜底）
         f = self._stub()
         with mock.patch.object(f, "_overlay_scan",
-                               return_value=(True, False)):
+                               return_value=(True, False, False)):
             self.assertFalse(f._dismiss_badcase())
         self.assertEqual(f.ui.back.call_count, 3)
 
@@ -636,7 +638,8 @@ class TestBadcaseGuard(Base):
         # 首检命中 AI 好友 H5 → BACK → 已退出 → True
         f = self._stub()
         with mock.patch.object(f, "_overlay_scan",
-                               side_effect=[(False, True), (False, False)]):
+                               side_effect=[(False, True, False),
+                                            (False, False, False)]):
             self.assertTrue(f._dismiss_badcase())
         f.ui.back.assert_called_once()
 
@@ -712,18 +715,19 @@ class TestBadcaseGuard(Base):
         f = self._stub()
         f._diag_shot = mock.Mock()
         with mock.patch.object(f, "_overlay_scan",
-                               return_value=(True, False)):
+                               return_value=(True, False, False)):
             f._dismiss_badcase()
         f._diag_shot.assert_called_once_with("overlay")
 
-    # ---- A4（2026-09-12）：_overlay_scan 单次推理三组词的语义回归 ----
+    # ---- A4（2026-09-12）：_overlay_scan 单次推理多组词的语义回归 ----
     def test_overlay_scan_badcase_hit(self):
-        # 单次推理：badcase 词命中 → (True, False)
+        # 单次推理：badcase 词命中 → (True, False, False)
         f = self._stub()
-        f._overlay_scan = mock.Mock(return_value=(True, False))
-        bad, ai = f._overlay_scan()
+        f._overlay_scan = mock.Mock(return_value=(True, False, False))
+        bad, ai, profile = f._overlay_scan()
         self.assertTrue(bad)
         self.assertFalse(ai)
+        self.assertFalse(profile)
 
     def test_overlay_scan_words_merged_from_three_key_groups(self):
         # _overlay_scan 必须同时查询三组词：BADCASE_KEYS + AI_FRIEND_HINTS
@@ -734,6 +738,30 @@ class TestBadcaseGuard(Base):
             self.assertIn(k, Flow._AI_FRIEND_HINTS)
         for k in ("每日签到", "获取随机"):
             self.assertIn(k, Flow._TC_KEYS_OCR)
+
+    # ---- 2026-09-13 小麦事故：资料卡浮层识别与清除 ----
+    def test_profile_keys_registered_and_disjoint_from_tc(self):
+        # 资料卡特征词必须在册；且不得与任务中心特征词重叠（防 TC 误判成资料卡）
+        for k in ("语音通话", "QQ空间"):
+            self.assertIn(k, Flow._PROFILE_KEYS)
+            self.assertNotIn(k, Flow._TC_KEYS_OCR)
+
+    def test_profile_card_cleared_after_one_back(self):
+        # 首检命中资料卡 → BACK 1 次 → 复查已消失 → True（小麦事故自愈路径）
+        f = self._stub()
+        with mock.patch.object(f, "_overlay_scan",
+                               side_effect=[(False, False, True),
+                                            (False, False, False)]):
+            self.assertTrue(f._dismiss_badcase())
+        f.ui.back.assert_called_once()
+
+    def test_profile_card_survives_max_backs_returns_false(self):
+        # 资料 BACK 3 次仍在 → False（交给上层失败计数兜底）
+        f = self._stub()
+        with mock.patch.object(f, "_overlay_scan",
+                               return_value=(False, False, True)):
+            self.assertFalse(f._dismiss_badcase())
+        self.assertEqual(f.ui.back.call_count, 3)
 
 
 class TestBannerGuard(Base):

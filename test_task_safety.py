@@ -176,48 +176,27 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
         ui, f = self._f()
         f._find_row.return_value = _row("获取随机", label="获取随机", ratio=(2, 10))
         f._close_ad = mock.Mock(return_value=True)
-        # P1（2026-09-12）：观看等待后先做一次任务中心 OCR；本测试模拟
-        # 广告页中，自检返回 False（不在任务中心），让流程继续到 _close_ad。
-        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=False)
+        # B 优化（2026-09-13）：P1 预检已移除，_watch_ad_once 不再调用
+        # _taskcenter_confirmed_by_ocr，直接进 _close_ad（TC 检测由其步骤 0 兜底）。
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._watch_ad_once()
         self.assertTrue(ok)
         self.assertEqual(f._tap_node.call_count, 1)        # 点了获取随机
         f._close_ad.assert_called_once_with(tc_seen=False)
 
-    def test_auto_return_to_taskcenter_requires_counter_growth(self):
+    def test_no_precheck_ocr_before_close_ad(self):
+        # B 优化（2026-09-13）：预检移除——观看等待后不得再调
+        # _taskcenter_confirmed_by_ocr（09-13 实测 97 次全空跑，纯开销）。
         ui, f = self._f()
         f._find_row.return_value = _row("获取随机", label="获取随机", ratio=(2, 10))
-        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=True)
-        f._read_ad_ratio = mock.Mock(return_value=(3, 10))
         f._close_ad = mock.Mock(return_value=True)
+        precheck = mock.Mock()
+        f._taskcenter_confirmed_by_ocr = precheck
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._watch_ad_once()
         self.assertTrue(ok)
-        self.assertEqual(f._tap_node.call_count, 1)
-        f._close_ad.assert_not_called()
-
-    def test_still_at_taskcenter_without_counter_growth_is_failure(self):
-        ui, f = self._f()
-        f._find_row.return_value = _row("获取随机", label="获取随机", ratio=(2, 10))
-        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=True)
-        f._read_ad_ratio = mock.Mock(return_value=(2, 10))
-        f._close_ad = mock.Mock(return_value=True)
-        with mock.patch.object(flow_mod.time, "sleep"):
-            ok = f._watch_ad_once()
-        self.assertFalse(ok)
-        f._close_ad.assert_not_called()
-
-    def test_taskcenter_seen_with_unreadable_counter_reuses_ocr_in_close_ad(self):
-        ui, f = self._f()
-        f._find_row.return_value = _row("获取随机", label="获取随机", ratio=(2, 10))
-        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=True)
-        f._read_ad_ratio = mock.Mock(return_value=None)
-        f._close_ad = mock.Mock(return_value=True)
-        with mock.patch.object(flow_mod.time, "sleep"):
-            ok = f._watch_ad_once()
-        self.assertTrue(ok)
-        f._close_ad.assert_called_once_with(tc_seen=True)
+        precheck.assert_not_called()
+        f._close_ad.assert_called_once_with(tc_seen=False)
 
 
 # ----------------------------------------------------------------------

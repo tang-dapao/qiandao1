@@ -1051,29 +1051,16 @@ class Flow:
         wait = random.uniform(self.wf["ad_wait_min"], self.wf["ad_wait_max"])
         logger.info("广告播放 %.1f 秒", wait)
         time.sleep(wait)
-        # P1（2026-09-12）：观看等待后先做一次任务中心 OCR。若已回任务中心，
-        # 可能是广告自动结束，也可能是 tap 未触发广告；交 _close_ad 复用该结果
-        # 做二次确认。确认成功按广告完成收工，确认失败再由关闭链路兜底。
-        tc_after_tap = self._taskcenter_confirmed_by_ocr()
-        if tc_after_tap:
-            logger.info("点击获取随机后 OCR 已读到任务中心特征，读取计数确认是否生效")
-            after_ratio = self._read_ad_ratio()
-            if ratio and after_ratio:
-                before_count = ratio[0]
-                after_count = after_ratio[0]
-                if after_count > before_count:
-                    logger.info("看广告计数已增长（%d/10 -> %d/10），视为广告完成",
-                                before_count, after_count)
-                    return True
-                logger.warning("点击获取随机后仍在任务中心，且看广告计数未增长"
-                               "（%d/10 -> %d/10），本次判为未触发广告",
-                               before_count, after_count)
-                return False
-            logger.info("任务中心 OCR 命中但计数不可读，交关闭链路复核")
+        # B 优化（2026-09-13 用户确认）：移除观看等待后的任务中心 OCR 预检。
+        # 09-13 全流程 97 次广告预检 0 命中（无自动关闭、无未触发），纯开销
+        # ~3s/次（一轮 174 次 ≈ 9min）。广告自动结束/仍在任务中心的场景由
+        # _close_ad 步骤 0 的双重 OCR 确认兜底（语义等价，且常见路径由原来的
+        # "预检 + _close_ad 复检" 2 次 OCR 降为 1 次）；tap 未触发的极端 case
+        # 靠下次进台读实际计数自然纠偏（实测 0 例）。
         # 关闭广告：关键！广告页 WebView 文字 uiautomator 读不到（会穿透读到
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
-        closed = self._close_ad(tc_seen=tc_after_tap)
+        closed = self._close_ad(tc_seen=False)
         if not closed:
             logger.error("多次尝试后广告仍未关闭")
             return False

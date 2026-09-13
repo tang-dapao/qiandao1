@@ -264,5 +264,73 @@ class TestSubprocessTimeout(unittest.TestCase):
                          adb_ui_mod.DUMP_TIMEOUT)
 
 
+# ---------------------------------------------------------------------------
+# 2026-09-13 自愈：adb server 被后台回收时 is_online 自动重启找回设备
+# ---------------------------------------------------------------------------
+class _Proc:
+    """最小 subprocess.CompletedProcess 替身。"""
+
+    def __init__(self, returncode=0, stdout=b"", stderr=b""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TestIsOnlineSelfHeal(unittest.TestCase):
+    """背景：环境里 adb daemon 会被回收 → `adb devices` 为空，设备明明在线
+    却被判离线。is_online 现在两级探活：常规 3 次失败后重启 adb server 再探
+    2 次，全失败才判真离线（emulator-5554 走 QEMU 底层入口可自动重连）。
+    """
+
+    def setUp(self):
+        self.ui = AdbUI()
+        # sleep 打桩，测试瞬时完成
+        self._s = mock.patch("adb_ui.time.sleep", lambda s: None)
+        self._s.start()
+        self.addCleanup(self._s.stop)
+
+    def test_first_probe_ok_does_not_restart(self):
+        # 成功路径零开销：首次探活成功，绝不触发 kill-server/start-server
+        def fake_run(cmd, capture_output=False, timeout=None):
+            cmd = list(cmd)
+            assert "get-state" in cmd, f"不应执行非探活命令: {cmd}"
+            return _Proc(0, b"device\n")
+
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=fake_run):
+            self.assertTrue(self.ui.is_online())
+
+    def test_self_heal_restarts_adb_and_recovers(self):
+        # adb server 被回收：前 3 次 get-state 全失败 → 重启后恢复在线
+        state = {"restarted": False, "kills": 0}
+
+        def fake_run(cmd, capture_output=False, timeout=None):
+            cmd = list(cmd)
+            if "kill-server" in cmd:
+                state["kills"] += 1
+                return _Proc(0)
+            if "start-server" in cmd:
+                state["restarted"] = True
+                return _Proc(0)
+            # get-state
+            if state["restarted"]:
+                return _Proc(0, b"device\n")
+            return _Proc(1, b"error: device not found\n")
+
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=fake_run):
+            self.assertTrue(self.ui.is_online())
+        self.assertEqual(state["kills"], 1)   # 只重启一次，不无限重试
+
+    def test_offline_after_heal_returns_false(self):
+        # 重启后依然不在线 → 判定真离线（模拟器真没开）
+        def fake_run(cmd, capture_output=False, timeout=None):
+            return _Proc(1, b"error\n")
+
+        with mock.patch.object(adb_ui_mod.subprocess, "run",
+                               side_effect=fake_run):
+            self.assertFalse(self.ui.is_online())
+
+
 if __name__ == "__main__":
     unittest.main()

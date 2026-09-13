@@ -144,22 +144,54 @@ class AdbUI:
                 f"adb {' '.join(args)} 失败 (rc={p.returncode}): {err}")
         return p.stdout.decode("utf-8", errors="replace")
 
-    def is_online(self) -> bool:
-        """探测设备是否在线（adb get-state，重试 3 次）。
+    def _get_state_ok(self) -> bool:
+        """单次 get-state 探活，成功返回 True（异常一律按失败处理）。"""
+        try:
+            p = subprocess.run([self.adb, "-s", self.device, "get-state"],
+                               capture_output=True, timeout=10)
+            return (p.returncode == 0
+                    and p.stdout.decode(errors="replace").strip() == "device")
+        except Exception:  # noqa: BLE001
+            return False
 
-        背景：每次进程启动时 adb daemon 才刚拉起，首次 get-state 可能落在
-        设备状态未稳定的瞬间误报 offline（实测 emulator-5554 首次 rc=1、
-        其后均 device），故重试避免启动探活误杀。
+    def _restart_adb_server(self) -> None:
+        """重启 adb server（自愈，2026-09-13）。
+
+        背景：本环境 adb daemon 会被后台回收，回收后 `adb devices` 为空、
+        get-state 必失败——此时重试多少次都救不回来（MuMu 侧设备其实一直
+        在线，误报"不在线"）。实测 `adb kill-server && adb start-server` 后
+        emulator-5554 会被 QEMU 底层入口自动重新发现（无需 adb connect，
+        16384 网络转发口 daemon 重启必丢，禁用）。仅探活失败分支触发，
+        成功路径零开销，不影响点击效率。
+        """
+        try:
+            subprocess.run([self.adb, "kill-server"],
+                           capture_output=True, timeout=10)
+            subprocess.run([self.adb, "start-server"],
+                           capture_output=True, timeout=15)
+            logger.warning("探活 3 次均失败：adb server 疑似被回收，"
+                           "已重启 adb server 自愈后重试")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("重启 adb server 失败: %s", e)
+
+    def is_online(self) -> bool:
+        """探测设备是否在线（adb get-state）。
+
+        两级探活（2026-09-13 自愈增强）：
+        1. 常规重试 3 次 —— 覆盖进程启动瞬间设备状态未稳定的误报
+          （实测 emulator-5554 首次 rc=1、其后均 device）；
+        2. 仍失败则重启 adb server 后再探 2 次 —— 覆盖 adb daemon 被后台
+           回收、设备列表为空的场景（此时 MuMu 侧设备实际在线）。
+        两级全失败才判定真离线。
         """
         for _ in range(3):
-            try:
-                p = subprocess.run([self.adb, "-s", self.device, "get-state"],
-                                   capture_output=True, timeout=10)
-                if (p.returncode == 0
-                        and p.stdout.decode(errors="replace").strip() == "device"):
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
+            if self._get_state_ok():
+                return True
+            time.sleep(1.0)
+        self._restart_adb_server()
+        for _ in range(2):
+            if self._get_state_ok():
+                return True
             time.sleep(1.0)
         return False
 
@@ -291,9 +323,13 @@ class AdbUI:
         self.tap(x, y, pause)
 
     def swipe_up(self, steps: float = 0.4, pause: float = 1.0):
-        """向上滑（看下方内容）。坐标空间 1080x1920 竖屏。"""
+        """向上滑（看下方内容）。坐标空间 1080x1920 竖屏。
+
+        锚点 x 同 swipe_down 用 SWIPE_X（左安全列）—— #1 修复（09-10）时
+        swipe_down 已改、swipe_up 漏改（同批编辑丢失，2026-09-12 发现），此处补齐。
+        """
         self._run("shell", "input", "swipe",
-                  "540", "1500", "540", "700", "400")
+                  str(SWIPE_X), "1500", str(SWIPE_X), "700", "400")
         self._invalidate_cache()
         self._notify_action()
         time.sleep(pause)

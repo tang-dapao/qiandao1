@@ -812,12 +812,30 @@ class Flow:
             #   由后续任务操作的等待器兜住 —— 行为不变，零影响看广告路径。
             wrong = self._ocr_find("心动卡", "高级模型", "立即续费", retries=1)
             if wrong is not None:
-                logger.warning("进入任务中心后疑似误入心动卡会员页（OCR 命中"
-                               " %s）→ 判定进入失败", wrong)
-                self._diag_shot("enter_wrongpage")
-                return False
-            logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
-                        self.t.get("taskcenter_wait", 3.5))
+                # P-心动卡（2026-09-12）：真机现场截图实锤（fail_enter_wrongpage_*
+                # .png）—— 该页并非陌生 H5，而是任务中心顶部插入了「心动卡促销卡」
+                # （返回箭头/收支详情/banner/电量/聊天特权都在），任务行被整体推到
+                # 折叠区以下，dump 只读可见区所以探测不到 每日签到。促销卡会重复
+                # 出现，旧"判失败→复位重试"会 3 次全撞同一版式（09-12 20:26 实测
+                # 小麦 3 次 ~5min 全废被跳过）。现改为：上滑（#1 安全左列锚点）
+                # 最多 2 次，每次滑完重探任务行；探到即按正常进入继续；仍探不到
+                # 才判失败（保留旧兜底，防真错页）。
+                logger.info("OCR 命中心动卡促销卡（%s）→ 按任务中心促销版式处理，"
+                            "上滑后重探任务行", wrong)
+                for _ in range(2):
+                    self.ui.swipe_up()
+                    if (self._find("每日签到") or self._find("任务中心")
+                            or self._find("获取随机") or self._find("看广告")):
+                        found_tc = True
+                        logger.info("上滑后已探测到任务行 → 按正常任务中心继续")
+                        break
+                if not found_tc:
+                    logger.warning("上滑 2 次后仍未见任务中心特征 → 判定进入失败")
+                    self._diag_shot("enter_wrongpage")
+                    return False
+            else:
+                logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
+                            self.t.get("taskcenter_wait", 3.5))
         # 已进入某机器人的任务中心：清快路径状态（下次 nav 需重新导航）
         self._at_robot_list = False
         # F11：进入任务中心 → 启用 banner 禁点区（此后本页任何 y<440 的坐标点击
@@ -1033,17 +1051,29 @@ class Flow:
         wait = random.uniform(self.wf["ad_wait_min"], self.wf["ad_wait_max"])
         logger.info("广告播放 %.1f 秒", wait)
         time.sleep(wait)
-        # F10+：观看等待后若页面仍在任务中心，说明「获取随机」tap 无效
-        # （按钮 CD 锁定/被拦截/误开其它 H5）—— 不进入 _close_ad，避免其
-        # 在问卷页点 (160,152) 后被穿透判任务中心造成静默假成功。直接判失败。
-        if self._back_at_taskcenter():
-            logger.warning("点击获取随机后页面仍在任务中心（tap 未触发广告）"
-                           "，本次跳过")
-            return False
+        # P1（2026-09-12）：观看等待后先做一次任务中心 OCR。若已回任务中心，
+        # 可能是广告自动结束，也可能是 tap 未触发广告；交 _close_ad 复用该结果
+        # 做二次确认。确认成功按广告完成收工，确认失败再由关闭链路兜底。
+        tc_after_tap = self._taskcenter_confirmed_by_ocr()
+        if tc_after_tap:
+            logger.info("点击获取随机后 OCR 已读到任务中心特征，读取计数确认是否生效")
+            after_ratio = self._read_ad_ratio()
+            if ratio and after_ratio:
+                before_count = ratio[0]
+                after_count = after_ratio[0]
+                if after_count > before_count:
+                    logger.info("看广告计数已增长（%d/10 -> %d/10），视为广告完成",
+                                before_count, after_count)
+                    return True
+                logger.warning("点击获取随机后仍在任务中心，且看广告计数未增长"
+                               "（%d/10 -> %d/10），本次判为未触发广告",
+                               before_count, after_count)
+                return False
+            logger.info("任务中心 OCR 命中但计数不可读，交关闭链路复核")
         # 关闭广告：关键！广告页 WebView 文字 uiautomator 读不到（会穿透读到
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
-        closed = self._close_ad()
+        closed = self._close_ad(tc_seen=tc_after_tap)
         if not closed:
             logger.error("多次尝试后广告仍未关闭")
             return False
@@ -1367,18 +1397,30 @@ class Flow:
             return False
         # 2) dump 二次确认：防全屏 H5 / 问卷页 OCR 误命中导致的静默假成功
         #    （旧版漏洞：问卷页 tap 无效却被判成功，白白空等 22s）
-        if not (self._find("获取随机", timeout=timeout)
-                or self._find("看广告", timeout=timeout)):
-            # dump 不可用（视频期/界面未稳定）＝ 无法排除，此时信任 OCR 正向命中，
-            # 避免因 dump 暂时失效把"已回任务中心"误判成没回去（会白跑一轮关闭）。
+        if not self._find("获取随机", timeout=timeout):
+            # P4（2026-09-12）：第一个 dump 已在动画期超时，第二个同源 dump
+            # （看广告）大概率只会再空等一次；此时沿用原兜底策略，信任 OCR 正向命中。
             if getattr(self.ui, "dump_fail_streak", 0) > 0:
                 logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
                             "以 OCR 判定为准", self.ui.dump_fail_streak)
                 return True
-            return False
-        if not (self._find("每日签到", timeout=timeout)
-                or self._find("任务中心", timeout=timeout)):
-            return False
+            if not self._find("看广告", timeout=timeout):
+                if getattr(self.ui, "dump_fail_streak", 0) > 0:
+                    logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
+                                "以 OCR 判定为准", self.ui.dump_fail_streak)
+                    return True
+                return False
+        if not self._find("每日签到", timeout=timeout):
+            if getattr(self.ui, "dump_fail_streak", 0) > 0:
+                logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
+                            "以 OCR 判定为准", self.ui.dump_fail_streak)
+                return True
+            if not self._find("任务中心", timeout=timeout):
+                if getattr(self.ui, "dump_fail_streak", 0) > 0:
+                    logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
+                                "以 OCR 判定为准", self.ui.dump_fail_streak)
+                    return True
+                return False
         # 关闭按钮消失（仍覆盖 → 广告没关）
         if self._ocr_find("关闭广告", "关闭", "跳过",
                           ymax=400, region=AD_TOP_REGION) is not None:
@@ -1484,16 +1526,33 @@ class Flow:
         视频播放期 dump 有界失败 → 返回 None 交上层转 OCR（#2：超时不再重试，
         单次等待从 4s×2≈8s 降到 timeout 值，默认 2.5s）。
         """
-        n = self._find("关闭广告", timeout=timeout)
-        if n:
-            return n
+        fallback = None
         for cand in self.ui.nodes(timeout=timeout):
             t = cand.text or ""
-            if "跳过" in t or t.startswith("关闭"):
+            if t == "关闭广告":
                 return cand
-        return None
+            if fallback is None and ("跳过" in t or t.startswith("关闭")):
+                fallback = cand
+        return fallback
 
-    def _close_ad(self, max_tries: int = 6) -> bool:
+    def _confirm_direct_close(self, timeout: Optional[float],
+                              retries: int = 0, gap: float = 1.2) -> bool:
+        """直关 tap 后确认已回任务中心；带沉降重试（P5，2026-09-12）。
+
+        首次 `_back_at_taskcenter` 失败大概率是关闭动画/任务中心重载尚未结束
+        （OCR 先验读不到特征词、dump 撞超时），并不代表 tap 没生效 —— 21:00 场
+        33/33 误判实锤。重试时先睡 gap 秒让页面沉降，再确认一次；全部失败才
+        返回 False（此时才值得走 Badcase 巡检 + 兜底）。
+        """
+        if self._back_at_taskcenter(timeout=timeout):
+            return True
+        for _ in range(max(0, retries)):
+            time.sleep(gap)
+            if self._back_at_taskcenter(timeout=timeout):
+                return True
+        return False
+
+    def _close_ad(self, max_tries: int = 6, tc_seen: bool = False) -> bool:
         """主动关闭广告。
 
         **F8（2026-09-10 修复「盲点误点 banner」）**：所有坐标点击一律由
@@ -1536,26 +1595,41 @@ class Flow:
         # 重载期 UI 无法 idle、OCR 读不到特征，立即确认必然撞 dump 超时（代柯 32s 实测）。
         # 沉降后再确认，让动画播完、OCR/首次 dump 直接命中任务中心。
         ad_close_settle = float(self.wf.get("ad_close_settle", 2.0))
+        # P5（2026-09-12 晚）：直关 tap 后的确认重试。21:00 场实测 33/33 次直关
+        # 被误判"未生效"（用户肉眼看广告当场已关）：关闭动画/任务中心重载期
+        # settle=1.0s 后 OCR 先验仍读不到任务中心特征词 → 单次确认立即 False →
+        # 白走 7-12s 兜底。现改为：首次确认失败后等 confirm_gap 秒再重试，
+        # 共 1+retries 次确认，全部失败才宣告"未生效"走巡检+兜底。成功且页面
+        # 沉降快时行为与耗时不变；真失败仅多花 retries×(gap+确认) 秒进兜底。
+        ad_close_confirm_retries = int(self.wf.get("ad_close_confirm_retries", 1))
+        ad_close_confirm_gap = float(self.wf.get("ad_close_confirm_gap", 1.2))
         # 0) 快路径 + 正向直关
-        #   - F1：连续 2 次 OCR 都读到任务中心特征词 → 广告已自动关闭并回任务中心
-        #     → 收工（间隔 0.8s 跨过首屏渲染期，代价 +1.3s；**保留双检**——广告
-        #     创意素材可能含「每日签到」等字样，单检误判会让整条广告白耗）
-        for attempt in range(2):
+        #   - P1（2026-09-12）：复用 _watch_ad_once 在 ad_wait 后的任务中心 OCR。
+        #     若前置 OCR 已读到任务中心特征，这里只做第 2 次确认即可收工；避免
+        #     同一状态连续做 3 次全屏 OCR。仍保留双检语义，防广告素材偶然含
+        #     「每日签到/任务中心」等字样导致单检误判。
+        if tc_seen:
+            time.sleep(0.8)
             if self._taskcenter_confirmed_by_ocr():
-                logger.info("OCR 二次判定：已在任务中心（第 %d/2 次），无需关闭",
-                            attempt + 1)
+                logger.info("OCR 二次判定：已在任务中心（复用前置命中），无需关闭")
                 return True
-            if attempt == 0:
+        else:
+            if self._taskcenter_confirmed_by_ocr():
+                logger.info("OCR 首次判定：已在任务中心，需二次确认")
                 time.sleep(0.8)
+                if self._taskcenter_confirmed_by_ocr():
+                    logger.info("OCR 二次判定：已在任务中心，无需关闭")
+                    return True
         # 1) uiautomator 直关（2026-09-10 对调）：页面 idle 时 1-3s 命中。
         #    直关失败（tap 未生效/页面又变了）→ 巡检一次覆盖层再走 OCR/兜底。
         n = self._find_close_node(timeout=ad_close_dump_timeout)
         if n is not None:
             logger.info("uiautomator 定位到关闭按钮 @ %s（直关，第 1 步）", n.center)
             self._tap_node(n, pause=1.5)
-            time.sleep(1.5)
             time.sleep(ad_close_settle)
-            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
+            if self._confirm_direct_close(ad_close_dump_timeout,
+                                          ad_close_confirm_retries,
+                                          ad_close_confirm_gap):
                 logger.info("广告已关闭（uiautomator 直关路径）")
                 return True
             logger.info("uiautomator 直关未生效，巡检一次 Badcase/AI 好友后走兜底")
@@ -1571,9 +1645,10 @@ class Flow:
             # F11：广告页的关闭按钮由 OCR 正向定位（非盲点）→ 显式 trusted=True
             # 放行任务中心页的盲点禁令。
             self._tap(*pos, pause=1.5, trusted=True)
-            time.sleep(2.0)
             time.sleep(ad_close_settle)
-            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
+            if self._confirm_direct_close(ad_close_dump_timeout,
+                                          ad_close_confirm_retries,
+                                          ad_close_confirm_gap):
                 logger.info("广告已关闭（OCR 直关路径）")
                 return True
             logger.info("OCR 直关未生效（%s），巡检一次 Badcase/AI 好友后走兜底", pos)
@@ -1602,7 +1677,6 @@ class Flow:
                 logger.info("uiautomator 定位到关闭按钮 @ %s (第%d次)",
                             n.center, i + 1)
                 self._tap_node(n, pause=1.5)
-                time.sleep(1.5)
                 time.sleep(ad_close_settle)
                 if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                     logger.info("广告已关闭（uiautomator 路径）")
@@ -1613,7 +1687,6 @@ class Flow:
             if pos:
                 logger.info("OCR 定位到关闭按钮 @ %s (第%d次)", pos, i + 1)
                 self._tap(*pos, pause=1.5, trusted=True)   # F11：OCR 正向定位，非盲点
-                time.sleep(1.5)
                 time.sleep(ad_close_settle)
                 if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
                     logger.info("广告已关闭（OCR 路径）")

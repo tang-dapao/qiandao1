@@ -31,6 +31,7 @@ SS = os.path.join(BASE, "screenshots")
 
 def build_flow(cfg):
     f = Flow.__new__(Flow)
+    f._init_cache_state()
     f._ocr_lang = cfg["ocr"]["lang"]
     f.wf = {}
     f.t = {"click_min": 1.5, "click_max": 3.0}
@@ -87,6 +88,7 @@ def main():
         print("  %s" % title)
         for p in files:
             frame["path"] = p
+            f._invalidate_shot_cache()
             got = f._overlay_visible_in_top()
             ok = (got == expect)
             all_ok = all_ok and ok

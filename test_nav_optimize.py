@@ -537,15 +537,37 @@ class TestEnterTaskcenter(unittest.TestCase):
         return ui, f
 
     def test_wrongpage_ocr_hit_returns_false(self):
-        # A：OCR 命中心动卡会员页标记 → 判定进入失败（不再"版式差异放行"
-        # 后在错页把看广告入口当签到行点 → 弹游戏广告/反馈被挡）
+        # A：OCR 命中心动卡促销卡 → 上滑 2 次重探任务行（P-心动卡），
+        # 仍探不到才判进入失败（交上层复位重试）
         ui, f = self._enter_timeout()
         f._ocr_find.return_value = (540, 300)
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertFalse(ok)
+        self.assertEqual(ui.swipe_up.call_count, 2)
         f._diag_shot.assert_called_once_with("enter_wrongpage")
         self.assertFalse(f._at_robot_list)
+
+    def test_wrongpage_recovered_by_swipe(self):
+        # P-心动卡：促销卡把任务行推到折叠区以下 → 上滑 1 次后 dump 探到
+        # 每日签到 → 按正常任务中心继续（不再整台跳过）
+        ui, f = self._enter_timeout()
+        f._ocr_find.return_value = (540, 300)
+        state = {"swipes": 0}
+        ui.swipe_up.side_effect = lambda *a, **k: state.__setitem__(
+            "swipes", state["swipes"] + 1)
+
+        def fake_find(text, *a, **k):
+            if text == "每日签到" and state["swipes"] >= 1:
+                return nd("每日签到", 300)
+            return None
+        f._find = mock.Mock(side_effect=fake_find)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.swipe_up.call_count, 1)
+        f._diag_shot.assert_not_called()
+        self.assertEqual(f._at_robot_list, False)     # 进入后清快路径状态
 
     def test_wrongpage_ocr_miss_keeps_lenient_continue(self):
         # A：OCR 未命中错页标记（真任务中心 H5 加载慢）→ 维持原"版式差异，

@@ -375,11 +375,22 @@ class TestCloseAd(Base):
         return mock.Mock(side_effect=router)
 
     def test_already_back_at_taskcenter_skips_all_taps(self):
-        # 广告可能在 ad_wait 内已自动关闭、画面已回任务中心 —— OCR 读到任务中心
-        # 特征词 → 直接收工，不点任何坐标。
+        # 广告可能在 ad_wait 内已自动关闭、画面已回任务中心 —— OCR 连续读到
+        # 任务中心特征词 → 直接收工，不点任何坐标。
         f = self._stub()
-        f._ocr_find = self._ocr_router(tc=[(540, 900)])   # 读到「每日签到」
+        f._ocr_find = self._ocr_router(tc=[(540, 900), (540, 900)])
         self.assertTrue(f._close_ad())
+        f._tap.assert_not_called()
+        f._tap_node.assert_not_called()
+        f.ui.tap.assert_not_called()
+
+    def test_tc_seen_reuses_watch_ad_ocr_and_only_confirms_once(self):
+        # P1：_watch_ad_once 已做过一次任务中心 OCR，_close_ad 只补第 2 次
+        # 确认即可收工，避免同一状态连续三次全屏 OCR。
+        f = self._stub()
+        f._ocr_find = self._ocr_router(tc=[(540, 900)])
+        self.assertTrue(f._close_ad(tc_seen=True))
+        self.assertEqual(f._ocr_find.call_count, 1)
         f._tap.assert_not_called()
         f._tap_node.assert_not_called()
         f.ui.tap.assert_not_called()
@@ -434,27 +445,61 @@ class TestCloseAd(Base):
     def test_ocr_close_fail_triggers_selfheal_then_auto_ended(self):
         # 正向直关 tap 后仍未回任务中心 → 先巡检一次 Badcase/AI 好友（F5 自愈）
         # → 下一轮 OCR 读不到按钮但 _back_at_taskcenter 为真（广告已结束）。
+        # P5：确认带 1 次重试，[False, False, True] = 首次+重试均失败（真失败）
+        # → 走巡检 + 兜底，兜底第 1 轮确认成功。
         f = self._stub()
         f._ocr_find = self._ocr_router(close=[(120, 152)])
-        f._back_at_taskcenter = mock.Mock(side_effect=[False, True])
+        f._back_at_taskcenter = mock.Mock(side_effect=[False, False, True])
         self.assertTrue(f._close_ad())
         # F11：广告页关闭按钮由 OCR 正向定位（非盲点），显式 trusted=True 放行
         # 任务中心页的盲点坐标禁令。
         f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
         f._dismiss_badcase.assert_called_once()   # 直关失败 → 巡检一次
 
+    def test_direct_close_confirm_retry_avoids_fallback(self):
+        # 【P5 核心】直关 tap 后首次确认 False（任务中心重载动画期 OCR 先验
+        # 误判），沉降 gap 秒后重试确认 True → 判定直关成功，不再走 7-12s
+        # 兜底（21:00 场 33/33 误判实锤，肉眼看广告当场已关）。
+        f = self._stub()
+        f._ocr_find = self._ocr_router(close=[(120, 152)])
+        f._back_at_taskcenter = mock.Mock(side_effect=[False, True])
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._dismiss_badcase.assert_not_called()    # 重试救回 → 无需自愈巡检
+        self.assertEqual(f._back_at_taskcenter.call_count, 2)  # 首次+重试各一次
+
+    def test_confirm_retries_zero_restores_old_behavior(self):
+        # ad_close_confirm_retries=0 → 与旧单次确认行为一致：首次 False 即宣告
+        # 未生效、走巡检+兜底。
+        f = self._stub()
+        f.wf = {"ad_close_retries": 1, "ad_close_confirm_retries": 0}
+        f._ocr_find = self._ocr_router(close=[(120, 152)])
+        f._back_at_taskcenter = mock.Mock(side_effect=[False, True])
+        self.assertTrue(f._close_ad())
+        f._dismiss_badcase.assert_called_once()   # 无重试 → 直关即判失败
+
     def test_fallback_uiautomator_path(self):
         # OCR 读不到关闭按钮 → uiautomator 找到「关闭广告」节点
         # → tap_node 关闭成功（正向定位路径之一）
         f = self._stub()
         node = Node("关闭广告", 0, 140, 200, 164)
-        f._find = mock.Mock(return_value=node)
+        f.ui.nodes.return_value = [node]
         f._ocr_find = self._ocr_router()
         f._back_at_taskcenter = mock.Mock(side_effect=[False, True])
         self.assertTrue(f._close_ad())
         f._tap_node.assert_called_once_with(node, pause=1.5)
         f._tap.assert_not_called()
         f.ui.back.assert_not_called()
+
+    def test_find_close_node_uses_single_dump_pass(self):
+        # P2：精确「关闭广告」和「跳过/关闭」候选在同一次 nodes dump 内完成，
+        # 避免 _find 一次 + nodes 一次的双 dump 空等。
+        f = self._stub()
+        node = Node("关闭广告", 0, 140, 200, 164)
+        f.ui.nodes.return_value = [node]
+        self.assertIs(f._find_close_node(timeout=2.5), node)
+        f.ui.nodes.assert_called_once_with(timeout=2.5)
+        f._find.assert_not_called()
 
     def test_uiautomator_before_ocr(self):
         # 验证顺序（2026-09-10 对调）：等待结束后 uiautomator 直关先于关闭按钮
@@ -466,17 +511,17 @@ class TestCloseAd(Base):
             side_effect=lambda *a, **k: calls.append("back") or False)
         f._ocr_find = mock.Mock(
             side_effect=lambda *a, **k: calls.append("ocr") or None)
-        f._find = mock.Mock(
-            side_effect=lambda *a, **k: calls.append("ui") or None)
+        f.ui.nodes = mock.Mock(
+            side_effect=lambda *a, **k: calls.append("ui") or [])
         f.wf = {"ad_close_retries": 1}
         f._close_ad()
-        # 步 0：tc OCR #1 → tc OCR #2（F1 二次判定）→ 步 1：uiautomator 直关尝试
-        self.assertEqual(calls[:3], ["ocr", "ocr", "ui"])
-        # 关闭按钮 OCR（#3）在 uiautomator 尝试（ui #1）之后才跑
-        self.assertEqual(calls[3], "ocr")
+        # 步 0：tc OCR 首检 miss → 步 1：uiautomator 直关尝试
+        self.assertEqual(calls[:2], ["ocr", "ui"])
+        # 关闭按钮 OCR 在 uiautomator 尝试之后才跑
+        self.assertEqual(calls[2], "ocr")
         # 兜底循环内：任务中心校验先于 uiautomator（防 dump 残留节点误点），
         # OCR 排在 uiautomator 之后
-        self.assertEqual(calls[4:7], ["back", "ui", "ocr"])
+        self.assertEqual(calls[3:6], ["back", "ui", "ocr"])
 
     def test_uiautomator_direct_close_first(self):
         # 【2026-09-10 对调核心场景】等待结束 → 页面 idle → uiautomator 先命中
@@ -484,14 +529,14 @@ class TestCloseAd(Base):
         # 药丸、uiautomator 一次命中 (141,150)，此路径省 ~9s OCR 空试）。
         f = self._stub()
         node = Node("关闭广告", 0, 140, 200, 164)
-        f._find = mock.Mock(return_value=node)
+        f.ui.nodes.return_value = [node]
         f._ocr_find = self._ocr_router(tc=[])          # 任务中心双检均 miss
         f._back_at_taskcenter = mock.Mock(return_value=True)
         self.assertTrue(f._close_ad())
         f._tap_node.assert_called_once_with(node, pause=1.5)
         f._tap.assert_not_called()                     # 未走 OCR 坐标点击
         f._dismiss_badcase.assert_not_called()         # 直关成功 → 无自愈巡检
-        self.assertEqual(f._ocr_find.call_count, 2)    # 只有步 0 的双检
+        self.assertEqual(f._ocr_find.call_count, 1)    # 步 0 首检 miss 后不再二检
 
     def test_retries_config_wins_over_default(self):
         # ad_close_retries 控制兜底轮数（BACK 未达上限时按轮数退出）

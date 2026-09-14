@@ -1799,6 +1799,8 @@ class Flow:
                     logger.info("广告已关闭（顶条快检直关路径）")
                     return True
                 logger.info("快检直关未生效，巡检一次 Badcase/AI 好友后走兜底")
+                # E3：直关未生效瞬间的现场留痕（小麦 3 号素材事故归因关键）
+                self._log_page_snapshot("快检直关未生效")
                 # 与直关失败同款处置：万一 tap 落点已漂移误开 H5，立即 BACK
                 self._dismiss_badcase()
             # 快检未命中：不消费，交给步骤 0 / 0.5 既有链路
@@ -1842,6 +1844,8 @@ class Flow:
                 logger.info("广告已关闭（预定位直关路径）")
                 return True
             logger.info("预定位直关未生效，巡检一次 Badcase/AI 好友后走兜底")
+            # E3：直关未生效瞬间的现场留痕（同快检路径）
+            self._log_page_snapshot("预定位直关未生效")
             # 与步骤 1/2 直关失败同款处置：万一 tap 落点已漂移误开 H5，立即 BACK
             self._dismiss_badcase()
         # 1) uiautomator 直关（2026-09-10 对调）：页面 idle 时 1-3s 命中。

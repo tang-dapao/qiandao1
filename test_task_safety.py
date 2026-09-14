@@ -198,6 +198,43 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
         precheck.assert_not_called()
         f._close_ad.assert_called_once_with(tc_seen=False)
 
+    def test_find_row_fail_with_stuck_ad_closes_then_recovers(self):
+        # 破死锁（2026-09-14 尔尔插屏事故）：find_row 首次失败 + OCR 读到
+        # 关闭广告（插屏残留盖顶、dump 全局失效）→ 走 _close_ad 清场 →
+        # 复查行成功 → 正常观看。清场 + 正常关闭共 2 次关闭链路调用。
+        ui, f = self._f()
+        row = _row("获取随机", label="获取随机", ratio=(2, 10))
+        f._find_row = mock.Mock(side_effect=[None, row])
+        f._ad_close_pos = mock.Mock(return_value=(99, 152))
+        f._close_ad = mock.Mock(return_value=True)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._watch_ad_once()
+        self.assertTrue(ok)
+        self.assertEqual(f._close_ad.call_count, 2)     # 清场 1 次 + 正常关闭 1 次
+        f._close_ad.assert_called_with(tc_seen=False)   # 末次为正常观看关闭
+        self.assertEqual(f._tap_node.call_count, 1)
+
+    def test_find_row_fail_with_no_ad_stays_failure(self):
+        # find_row 失败且 OCR 读不到关闭广告 → 维持原失败语义，不乱走关闭链路
+        ui, f = self._f()
+        f._find_row = mock.Mock(return_value=None)
+        f._ad_close_pos = mock.Mock(return_value=None)
+        f._close_ad = mock.Mock()
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._watch_ad_once()
+        self.assertFalse(ok)
+        f._close_ad.assert_not_called()
+
+    def test_find_row_fail_close_ad_fails_returns_false(self):
+        # 残留广告清场失败 → False（交给上层失败计数兜底）
+        ui, f = self._f()
+        f._find_row = mock.Mock(return_value=None)
+        f._ad_close_pos = mock.Mock(return_value=(99, 152))
+        f._close_ad = mock.Mock(return_value=False)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._watch_ad_once()
+        self.assertFalse(ok)
+
 
 # ----------------------------------------------------------------------
 # P1 校准: _row_completion X/Y 计数读取

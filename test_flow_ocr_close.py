@@ -519,9 +519,12 @@ class TestCloseAd(Base):
         self.assertEqual(calls[:2], ["ocr", "ui"])
         # 关闭按钮 OCR 在 uiautomator 尝试之后才跑
         self.assertEqual(calls[2], "ocr")
+        # 2026-09-14 尔尔插屏事故：首检 miss 后 2s 复读一次（过渡帧防误判，
+        # 直接判"没广告"走 BACK 兜底会把流程留在插屏上 → dump 全局失效死锁）
+        self.assertEqual(calls[3], "ocr")
         # 兜底循环内：任务中心校验先于 uiautomator（防 dump 残留节点误点），
         # OCR 排在 uiautomator 之后
-        self.assertEqual(calls[3:6], ["back", "ui", "ocr"])
+        self.assertEqual(calls[4:7], ["back", "ui", "ocr"])
 
     def test_uiautomator_direct_close_first(self):
         # 【2026-09-10 对调核心场景】等待结束 → 页面 idle → uiautomator 先命中

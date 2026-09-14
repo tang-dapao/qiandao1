@@ -1075,8 +1075,25 @@ class Flow:
         if row is None:
             row = self._find_row("看广告", alt_labels=("获取随机",))
             if not row:
-                logger.warning("未找到 看广告/获取随机 行")
-                return False
+                # 破死锁（2026-09-14 尔尔插屏事故）：find_row 失败 ≠ 页面异常
+                # ——上一支广告可能还赖在屏幕上（下载型插屏视频常驻 → uiautomator
+                # 永远无法 idle → 全局 dump 4s 超时 → find_row 永远失败 → 而能关
+                # 广告的 _close_ad 又只在本方法后续才执行 → 死循环，实测卡死
+                # 40+ 分钟烧掉后续所有机器人）。先用 OCR 认一下"关闭广告"：
+                # 在屏则走关闭链路清场后重试一次；不在屏维持原失败语义。
+                if self._ad_close_pos() is None:
+                    logger.warning("未找到 看广告/获取随机 行")
+                    return False
+                logger.warning("find_row 失败但 OCR 读到关闭广告（广告页残留）"
+                               "→ 走关闭链路清场后重试")
+                if not self._close_ad():
+                    logger.error("广告残留清场失败")
+                    return False
+                time.sleep(self.t.get("ad_close_wait", 2.0))
+                row = self._find_row("看广告", alt_labels=("获取随机",))
+                if not row:
+                    logger.warning("清场后仍未找到 看广告/获取随机 行")
+                    return False
         else:
             logger.info("使用 CD 窗口预取的行节点（D 优化，省一次 dump）")
         btn, _label, ratio = row
@@ -1672,6 +1689,13 @@ class Flow:
             self._dismiss_badcase()
         # 2) OCR 正向直关（视频播放期 dump 失效时唯一可靠读屏）
         pos = self._ad_close_pos()
+        if pos is None:
+            # 过渡帧防误判（2026-09-14 尔尔插屏事故）：广告页加载/切换期单次 OCR
+            # 可能漏读关闭按钮，直接判"没广告"走 BACK 兜底会把流程留在广告页
+            # （插屏视频常驻 → 全局 dump 失效 → 死锁 40min）。间隔 2s 复读一次
+            # 再决定；两次都读不到才认账。
+            time.sleep(2.0)
+            pos = self._ad_close_pos()
         if pos is None:
             logger.info("OCR 未在顶部条带读到关闭按钮（%s），不盲点固定坐标，"
                         "直接走兜底轮询", AD_TOP_REGION)

@@ -64,11 +64,11 @@ class Base(unittest.TestCase):
         # 0（无 dump 失败），个别测试可覆盖为 >0 验证"拒绝盲点放行"。
         self.f.ui = mock.Mock()
         self.f.ui.dump_fail_streak = 0
-        # E/方案1（2026-09-14）：_back_at_taskcenter 免 dump 快速通道依赖
-        # _top_strip_scan；默认桩返回「顶条仍有关闭按钮」→ 跳过快速通道、
-        # 走旧 dump 严格链 —— 保持既有用例的调用序列语义不变。快速通道
-        # 专属用例（TestTopStripFastPath）里显式覆盖该桩。
-        self.f._top_strip_scan = mock.Mock(return_value=(True, False))
+        # E/E1/E2（2026-09-14）：_back_at_taskcenter 快速通道依赖 _fullscreen_scan；
+        # 默认桩返回「读到了关闭按钮」→ 跳过快速通道、走旧 dump 严格链 ——
+        # 保持既有用例的调用序列语义不变。新通道专属用例里显式覆盖。
+        # （_close_ad 的 E1 顶条快检块仅在预定位缓存存在时触发，Base 不用桩。）
+        self.f._fullscreen_scan = mock.Mock(return_value=(True, True, False))
         # E 优化：预定位缓存逐测试隔离（类级默认是共享值）。
         self.f._prefetch_close = None
         # 注：_stable_in_ad_page 不在 Base 默认 mock —— TestStableInAdPage
@@ -199,7 +199,14 @@ class TestBackAtTaskcenter(Base):
          dump 每次要 4s×2≈8.3s，这是本次提速的关键）
       2. OCR 命中 → 用 uiautomator 严格确认（防全屏 H5/问卷页假成功）
       3. dump 不可用（dump_fail_streak>0）→ 无法排除，信任 OCR 正向命中
+
+    E2（2026-09-14）：本类聚焦**旧严格链**的语义回归 —— 统一关掉
+    tc_confirm_skip_dump 快速通道（新通道语义见 TestTopStripFastPath）。
     """
+
+    def setUp(self):
+        super().setUp()
+        self.f.wf["tc_confirm_skip_dump"] = False
 
     @staticmethod
     def _ocr(tc=None, close=None):
@@ -847,6 +854,8 @@ class TestOverlayGate(Base):
         f = self.f
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
+        # E2：本类聚焦 dump 严格链的 F11 闸门次序，关闭快速通道
+        f.wf["tc_confirm_skip_dump"] = False
         f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=tc)
         f._find = mock.Mock(return_value=Node("每日签到", 0, 0, 100, 100)
                             if rows else None)
@@ -888,86 +897,82 @@ class TestOverlayGate(Base):
         self.assertEqual(f._ocr_find.call_args.kwargs.get("retries"), 1)
 
 
-class TestTopStripScan(Base):
-    """方案1（2026-09-14）：`_top_strip_scan` 单次顶条 OCR 双检。"""
+class TestFullscreenScan(Base):
+    """E2（2026-09-14）：`_fullscreen_scan` 单次全屏 OCR 三合一判定。"""
 
     def setUp(self):
         super().setUp()
-        del self.f._top_strip_scan   # 移除 Base 桩，测真实实现
+        del self.f._fullscreen_scan   # 移除 Base 桩，测真实实现
 
     def _scan_setup(self, words):
-        img = mock.Mock()
-        img.crop.return_value = img
-        self.f._ocr_shot = mock.Mock(return_value=img)
+        self.f._ocr_shot = mock.Mock(return_value=mock.Mock())
         self.fake_pt.image_to_data.return_value = _ocr_data(words)
+
+    def test_taskcenter_clean_returns_true_false_false(self):
+        self._scan_setup([("每日", 300, 250, 40, 24), ("签到", 345, 250, 40, 24)])
+        self.assertEqual(self.f._fullscreen_scan(), (True, False, False))
 
     def test_pill_hit(self):
         self._scan_setup([("关闭广告", 100, 140, 88, 24)])
-        pill, overlay = self.f._top_strip_scan()
-        self.assertTrue(pill)
-        self.assertFalse(overlay)
+        self.assertEqual(self.f._fullscreen_scan(), (False, True, False))
 
-    def test_overlay_hit_includes_profile_keys(self):
+    def test_overlay_profile_hit(self):
         # 资料卡词表纳入扫描（比 dump 链 F11 闸门更严，09-13 卡死教训）
         self._scan_setup([("QQ空间", 100, 140, 60, 24)])
-        pill, overlay = self.f._top_strip_scan()
+        self.assertEqual(self.f._fullscreen_scan(), (False, False, True))
+
+    def test_overlay_badcase_hit(self):
+        self._scan_setup([("反馈问卷", 200, 60, 80, 24)])
+        tc, pill, overlay = self.f._fullscreen_scan()
+        self.assertFalse(tc)
         self.assertFalse(pill)
         self.assertTrue(overlay)
 
-    def test_badcase_overlay_hit(self):
-        self._scan_setup([("反馈问卷", 200, 60, 80, 24)])
-        _pill, overlay = self.f._top_strip_scan()
-        self.assertTrue(overlay)
-
-    def test_clean_top_strip(self):
-        # 任务中心特征词不在 pill/overlay 词表 → 三信号可齐
-        self._scan_setup([("每日", 300, 250, 40, 24), ("签到", 345, 250, 40, 24)])
-        self.assertEqual(self.f._top_strip_scan(), (False, False))
-
-    def test_shot_none_returns_clean_pair(self):
+    def test_shot_none_returns_all_false(self):
         self.f._ocr_shot = mock.Mock(return_value=None)
-        self.assertEqual(self.f._top_strip_scan(), (False, False))
+        self.assertEqual(self.f._fullscreen_scan(), (False, False, False))
 
 
 class TestTopStripFastPath(Base):
-    """方案1（2026-09-14）：`_back_at_taskcenter` 三信号免 dump 快速通道。"""
+    """E2（2026-09-14）：`_back_at_taskcenter` 三信号免 dump 快速通道。"""
 
-    def _stub(self, scan=(False, False), tc=True):
+    def _stub(self, scan=(True, False, False), tc=True):
         f = self.f
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
         f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=tc)
-        f._top_strip_scan = mock.Mock(return_value=scan)
+        f._fullscreen_scan = mock.Mock(return_value=scan)
         f._find = mock.Mock(return_value=Node("每日签到", 0, 0, 100, 100))
         f._ocr_find = mock.Mock(return_value=None)   # 顶部无关闭按钮
         f._overlay_visible_in_top = mock.Mock(return_value=False)
         return f
 
     def test_three_signals_pass_skips_dump(self):
-        f = self._stub(scan=(False, False))
+        f = self._stub(scan=(True, False, False))
         self.assertTrue(f._back_at_taskcenter())
         f._find.assert_not_called()          # 一次 dump 都没付出
 
     def test_pill_present_falls_back_to_dump_chain(self):
-        f = self._stub(scan=(True, False))
+        f = self._stub(scan=(True, True, False))
         self.assertTrue(f._back_at_taskcenter())
         f._find.assert_called()              # 信号②异常 → 落回 dump 严格链
 
     def test_overlay_present_falls_back_to_dump_chain(self):
-        f = self._stub(scan=(False, True))
+        f = self._stub(scan=(True, False, True))
         self.assertTrue(f._back_at_taskcenter())
         f._find.assert_called()
 
-    def test_knob_off_restores_dump_chain(self):
-        f = self._stub(scan=(False, False))
+    def test_knob_off_restores_ocr_first_dump_chain(self):
+        f = self._stub(scan=(True, False, False))
         f.wf["tc_confirm_skip_dump"] = False
         self.assertTrue(f._back_at_taskcenter())
         f._find.assert_called()
+        f._fullscreen_scan.assert_not_called()   # 旧链不走全屏扫描
 
-    def test_ocr_miss_short_circuits_before_scan(self):
-        f = self._stub(tc=False)
+    def test_ocr_miss_short_circuits_before_dump(self):
+        f = self._stub(scan=(False, False, False))
         self.assertFalse(f._back_at_taskcenter())
-        f._top_strip_scan.assert_not_called()
+        f._find.assert_not_called()
 
 
 class TestPrefetchClose(Base):
@@ -1042,6 +1047,61 @@ class TestPrefetchClose(Base):
         f._prefetch_close = ((141, 150), flow_mod.time.time())
         self.assertTrue(f._watch_ad_once())
         self.assertIsNone(f._prefetch_close)
+
+
+class TestQuickCheckDirectClose(Base):
+    """E1（2026-09-14）：预定位路径顶条快检直关（跳过全屏守卫）。"""
+
+    def _stub(self, confirm=True):
+        f = self.f
+        f.ui = mock.Mock()
+        f.ui.dump_fail_streak = 0
+        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=False)
+        f._tap = mock.Mock()
+        f._tap_node = mock.Mock()
+        f._confirm_direct_close = mock.Mock(return_value=confirm)
+        f._find_close_node = mock.Mock(return_value=None)
+        f._ad_close_pos = mock.Mock(return_value=None)
+        f._dismiss_badcase = mock.Mock()
+        f._back_at_taskcenter = mock.Mock(return_value=False)
+        f.wf["ad_close_retries"] = 1
+        return f
+
+    def test_quickcheck_hit_taps_fresh_pos_skips_guard(self):
+        f = self._stub()
+        f._ad_close_pos = mock.Mock(return_value=(120, 152))
+        f._prefetch_close = ((120, 152), flow_mod.time.time())
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._taskcenter_confirmed_by_ocr.assert_not_called()  # 跳过全屏守卫
+        self.assertIsNone(f._prefetch_close)
+
+    def test_quickcheck_hit_confirm_fail_falls_to_full_chain(self):
+        f = self._stub(confirm=False)
+        f._ad_close_pos = mock.Mock(return_value=(120, 152))
+        f._prefetch_close = ((120, 152), flow_mod.time.time())
+        self.assertFalse(f._close_ad())
+        f._dismiss_badcase.assert_called()                  # 巡检自愈
+        f._taskcenter_confirmed_by_ocr.assert_called()      # 落回步骤 0 守卫
+        f._find_close_node.assert_called()                  # 再走既有定位链
+
+    def test_quickcheck_miss_keeps_prefetch_for_step05(self):
+        # 快检漏读（OCR 误漏）→ 预定位缓存保留 → 步骤 0 守卫 + 0.5 消费旧坐标
+        f = self._stub()
+        f._ad_close_pos = mock.Mock(return_value=None)
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(141, 150, pause=1.5, trusted=True)
+        f._taskcenter_confirmed_by_ocr.assert_called()      # 走了全屏守卫
+
+    def test_back_cap_logs_page_snapshot(self):
+        # E3：BACK 封顶放弃点必须有现场留痕（小麦事故无法归因的教训）
+        f = self._stub(confirm=False)
+        f._prefetch_close = None
+        f.wf["ad_close_retries"] = 2
+        f.ui.nodes.return_value = [Node("某文本", 0, 0, 10, 10)]
+        self.assertFalse(f._close_ad())
+        self.assertTrue(f.ui.nodes.called)                  # 快照已尝试读取
 
 
 if __name__ == "__main__":

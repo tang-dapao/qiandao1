@@ -1221,27 +1221,25 @@ class Flow:
         return self._ocr_find(*self._OVERLAY_TOP_KEYS, retries=1,
                               region=AD_TOP_REGION) is not None
 
-    def _top_strip_scan(self) -> Tuple[bool, bool]:
-        """单次顶条 OCR 同时判定「关闭按钮仍在」与「覆盖层特征词」（2026-09-14）。
+    def _fullscreen_scan(self) -> Tuple[bool, bool, bool]:
+        """单次全屏 OCR 同时判定「任务中心 / 关闭按钮 / 覆盖层」（E2 2026-09-14）。
 
-        一次 screencap + 一次 tesseract 替代 `_ad_close_pos` 与
-        `_overlay_visible_in_top` 两次独立调用（省一次截图+识别，~1-1.5s），
-        供 `_back_at_taskcenter` 免 dump 快速通道使用。
+        一次 screencap + 一次 tesseract（全屏）替代原先 `_back_at_taskcenter`
+        确认链里「OCR-first 全屏 + 顶条双检」的两次截图两次识别（~2s/次）。
         覆盖层词表 = Badcase 问卷 + 个人资料卡 —— 有意比 dump 链的 F11 闸门
-        （仅问卷词）更严：快速通道跳过了 dump 严格确认，用更全的顶条词表补强
+        （仅问卷词）更严：快速通道跳过了 dump 严格确认，用更全的词表补强
         （资料卡覆盖 dump 穿透误判、卡死 1h 的 09-13 教训）。
         匹配语义与 `_ocr_find` 一致：整词 → 跨词元拼接（`_merged_match`）。
 
         Returns:
-            (pill, overlay)：pill=True 表示顶条读到关闭按钮（广告未关）；
-            overlay=True 表示顶条命中覆盖层特征词（问卷/资料卡等盖屏）。
+            (tc, pill, overlay)：tc=读到任务中心特征词；pill=读到关闭按钮
+            （广告未关）；overlay=读到覆盖层特征词（问卷/资料卡等盖屏）。
         """
         if not _HAS_OCR:
-            return (False, False)
+            return (False, False, False)
         img = self._ocr_shot()
         if img is None:
-            return (False, False)
-        img = img.crop(AD_TOP_REGION)
+            return (False, False, False)
         data = pytesseract.image_to_data(
             img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
             output_type=pytesseract.Output.DICT)
@@ -1250,8 +1248,8 @@ class Flow:
             t = (data["text"][i] or "").strip()
             if not t:
                 continue
-            x = data["left"][i] + data["width"][i] // 2 + AD_TOP_REGION[0]
-            y = data["top"][i] + data["height"][i] // 2 + AD_TOP_REGION[1]
+            x = data["left"][i] + data["width"][i] // 2
+            y = data["top"][i] + data["height"][i] // 2
             toks.append((t, x, y))
 
         def _hit(keys) -> bool:
@@ -1263,7 +1261,7 @@ class Flow:
 
         pill_keys = ("关闭广告", "关闭", "跳过", "取消")
         overlay_keys = tuple(self._OVERLAY_TOP_KEYS) + tuple(self._PROFILE_KEYS)
-        return (_hit(pill_keys), _hit(overlay_keys))
+        return (_hit(self._TC_KEYS_OCR), _hit(pill_keys), _hit(overlay_keys))
 
     def _ai_friend_page_visible(self) -> bool:
         """OCR 是否显示 AI 好友 banner H5 误开页（已点中 banner 后全屏放大）。
@@ -1510,25 +1508,27 @@ class Flow:
         2.5s）；而任务中心特征词同样能用 OCR 读到（且不受动画影响，~1.3s）。因此
         先用 OCR 排除广告页，只有 OCR 命中时才付出 dump 的代价做严格二次确认。
         """
-        # 1) OCR 先验（快路径）：读不到任务中心特征 → 一定没回任务中心
-        if not self._taskcenter_confirmed_by_ocr():
-            return False
-        # 1.5) 三信号免 dump 快速通道（2026-09-14）：
-        #   信号① OCR 已命中任务中心特征词（上一步）
-        #   信号② 顶条无关闭按钮（广告确已关闭）
-        #   信号③ 顶条无覆盖层特征词（问卷/资料卡未盖屏，词表比 F11 闸门更全）
+        # 1) 单次全屏 OCR 三合一判定（E2 2026-09-14：合并原「OCR 先验」与
+        #    「顶条双检」的两次截图两次识别，~2s/次）：
+        #   信号① 读到任务中心特征词（读不到 → 一定没回任务中心 → False）
+        #   信号② 无关闭按钮（广告确已关闭）
+        #   信号③ 无覆盖层特征词（问卷/资料卡未盖屏，词表比 F11 闸门更全）
         # 三信号齐 → 直接判 True，跳过 dump。安全性依据：
         #   - dump 超时路径现行代码本就「信任 OCR 判 True」（下方 streak>0 分支），
         #     本通道只是把「先白等 2.5s 再得出同一结论」提前；
         #   - dump 严格确认唯一能多拦住的是「OCR 误命中 H5 覆盖页」，而 OCR 截屏
         #     读的是最上层像素、本就不穿透不透明覆盖层（dump 才会穿透），信号③
-        #     的顶条覆盖层词表（问卷+资料卡）已兜住该场景。
+        #     的覆盖层词表（问卷+资料卡）已兜住该场景。
         #   误判兜底：信号②/③任一命中 → 落回下方 dump 严格链，行为与旧版一致。
-        #   设 workflow.tc_confirm_skip_dump: false 可整体回退。
+        #   设 workflow.tc_confirm_skip_dump: false 可整体回退旧两步链。
         if self.wf.get("tc_confirm_skip_dump", True):
-            pill, overlay = self._top_strip_scan()
-            if not pill and not overlay:
+            tc, _pill, _overlay = self._fullscreen_scan()
+            if not tc:
+                return False
+            if not _pill and not _overlay:
                 return True
+        elif not self._taskcenter_confirmed_by_ocr():
+            return False
         # 2) dump 二次确认：防全屏 H5 / 问卷页 OCR 误命中导致的静默假成功
         #    （旧版漏洞：问卷页 tap 无效却被判成功，白白空等 22s）
         if not self._find("获取随机", timeout=timeout):
@@ -1702,6 +1702,28 @@ class Flow:
                 return True
         return False
 
+    def _log_page_snapshot(self, tag: str, timeout: float = 2.5) -> None:
+        """判定失灵时的现场留痕（E3 2026-09-14 小麦事故复盘）。
+
+        背景：16:41 小麦事故里预定位 tap 未生效、3 次 BACK 判定全部失败，
+        但日志里没有任何"当时停在什么页面"的信息，事后无法归因。本方法在
+        放弃关闭等关键节点把当前屏 dump 的可读节点（文本+坐标，最多 15 个）
+        打进日志——只读不点，不产生任何点击副作用；dump 失败也会如实记录。
+        """
+        try:
+            nodes = self.ui.nodes(timeout=timeout)
+            parts = []
+            for n in nodes:
+                t = (n.text or "").strip()
+                if t:
+                    parts.append(f"{t!r}@{n.center}")
+                if len(parts) >= 15:
+                    break
+            logger.warning("页面快照[%s]: dump 可读节点 %d 个: %s",
+                           tag, len(parts), "；".join(parts) or "<无文本>")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("页面快照[%s] 失败: %s", tag, e)
+
     def _close_ad(self, max_tries: int = 6, tc_seen: bool = False) -> bool:
         """主动关闭广告。
 
@@ -1753,6 +1775,33 @@ class Flow:
         # 沉降快时行为与耗时不变；真失败仅多花 retries×(gap+确认) 秒进兜底。
         ad_close_confirm_retries = int(self.wf.get("ad_close_confirm_retries", 1))
         ad_close_confirm_gap = float(self.wf.get("ad_close_confirm_gap", 1.2))
+        # -1) E1 优化（2026-09-14 下午复盘）：预定位路径顶条快检优先。
+        #     等待结束时先用顶条 OCR（~1.5-2s）查关闭按钮——命中即证明画面
+        #     仍是广告页（F8 语义：OCR 正向读到关闭按钮才放行，且 tap 的是
+        #     **本次现读坐标**比预定位坐标更新鲜），直接跳过步骤 0 全屏守卫
+        #     （~3.4s；全场 82 次预定位命中 100% 时它纯属白跑）。快检漏读 →
+        #     预定位缓存保留，落到步骤 0 全屏守卫 + 0.5 预定位消费的既有链路
+        #     （行为与上一版完全一致）。快检命中但确认失败 → 清缓存走既有
+        #     巡检 + 兜底链自愈。
+        pref_early = self._prefetch_close
+        if (pref_early is not None
+                and time.time() - pref_early[1] <= float(
+                    self.wf.get("ad_prefetch_ttl", 20.0))):
+            pos = self._ad_close_pos()
+            if pos is not None:
+                logger.info("顶条快检命中关闭按钮 @ %s（E1，跳过全屏守卫）", pos)
+                self._tap(*pos, pause=1.5, trusted=True)
+                time.sleep(ad_close_settle)
+                self._prefetch_close = None      # 快检路径已消费
+                if self._confirm_direct_close(ad_close_dump_timeout,
+                                              ad_close_confirm_retries,
+                                              ad_close_confirm_gap):
+                    logger.info("广告已关闭（顶条快检直关路径）")
+                    return True
+                logger.info("快检直关未生效，巡检一次 Badcase/AI 好友后走兜底")
+                # 与直关失败同款处置：万一 tap 落点已漂移误开 H5，立即 BACK
+                self._dismiss_badcase()
+            # 快检未命中：不消费，交给步骤 0 / 0.5 既有链路
         # 0) 快路径 + 正向直关
         #   - P1（2026-09-12）：复用 _watch_ad_once 在 ad_wait 后的任务中心 OCR。
         #     若前置 OCR 已读到任务中心特征，这里只做第 2 次确认即可收工；避免
@@ -1886,6 +1935,7 @@ class Flow:
                 return True
             ad_close_backs += 1
             if ad_close_backs > max_backs:
+                self._log_page_snapshot("关闭放弃-BACK封顶")
                 logger.error("未定位到关闭按钮且连续 BACK 已达上限 %d 次"
                              "（判定失灵时再退会退出 QQ），放弃本次关闭",
                              max_backs)
@@ -1898,7 +1948,10 @@ class Flow:
                 logger.info("物理 BACK 后已回到任务中心（广告已结束）")
                 return True
         # 最后一搏：整体确认一次
-        return self._back_at_taskcenter(timeout=ad_close_dump_timeout)
+        ok = self._back_at_taskcenter(timeout=ad_close_dump_timeout)
+        if not ok:
+            self._log_page_snapshot("关闭放弃-最终确认失败")
+        return ok
 
     # ----------------------------------------------------------
     # 编排

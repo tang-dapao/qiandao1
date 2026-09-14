@@ -141,6 +141,11 @@ class Flow:
     _shot_ts: float = 0.0
     _ocr_result_ttl: float = 0.5
     _ocr_result_cache: dict = {}
+    # E 优化（2026-09-14）：广告等待窗口内预定位的关闭按钮缓存 (pos, ts)|None。
+    # 仅在 _watch_ad_once 单次观看周期内有效：设置后由 _close_ad 单次消费（用完
+    # 即弃），观看周期结束（_close_ad 返回后）由 _watch_ad_once 显式清空 —— 防
+    # 旧坐标泄漏到其它调用路径（残留清场等）被当成新广告的关闭按钮误点。
+    _prefetch_close = None
 
     def __init__(self, config: dict, ui: AdbUI, ocr=None):
         self.cfg = config
@@ -1107,7 +1112,21 @@ class Flow:
         self._tap_node(btn)
         wait = random.uniform(self.wf["ad_wait_min"], self.wf["ad_wait_max"])
         logger.info("广告播放 %.1f 秒", wait)
-        time.sleep(wait)
+        # E 优化（2026-09-14）：把「关闭按钮预定位」藏进等待窗口。
+        # 视频播放期 uiautomator dump 必然失败（UI 不 idle），但 OCR 截屏不依赖
+        # idle —— 等待进行到 ad_prefetch_at 秒时用顶条 OCR 预定位「关闭广告」并
+        # 缓存坐标（~1s，纯等待时间内的开销），等待结束后 _close_ad 在步骤 0
+        # 守卫通过的前提下直接用缓存坐标 tap，省掉「dump 2.5s 白等 + OCR 重新
+        # 定位」的串行定位段（实测 ~3.5-4.8s/次）。不提前 tap，tap 时机与原
+        # 行为完全一致；预定位读不到（插屏/加载期版式不同）则不缓存走原链。
+        # 设 workflow.ad_prefetch_pos: false 可整体回退。
+        prefetch_at = float(self.wf.get("ad_prefetch_at", 10.0))
+        if self.wf.get("ad_prefetch_pos", True) and wait > prefetch_at + 2.0:
+            time.sleep(prefetch_at)
+            self._prefetch_ad_close_pos()
+            time.sleep(wait - prefetch_at)
+        else:
+            time.sleep(wait)
         # B 优化（2026-09-13 用户确认）：移除观看等待后的任务中心 OCR 预检。
         # 09-13 全流程 97 次广告预检 0 命中（无自动关闭、无未触发），纯开销
         # ~3s/次（一轮 174 次 ≈ 9min）。广告自动结束/仍在任务中心的场景由
@@ -1118,6 +1137,9 @@ class Flow:
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
         closed = self._close_ad(tc_seen=False)
+        # E 优化：预定位坐标只在本观看周期内有效，无论关闭成败一律作废，
+        # 防旧坐标泄漏到后续其它 _close_ad 调用路径（残留清场等）被误消费。
+        self._prefetch_close = None
         if not closed:
             logger.error("多次尝试后广告仍未关闭")
             return False
@@ -1198,6 +1220,50 @@ class Flow:
         """
         return self._ocr_find(*self._OVERLAY_TOP_KEYS, retries=1,
                               region=AD_TOP_REGION) is not None
+
+    def _top_strip_scan(self) -> Tuple[bool, bool]:
+        """单次顶条 OCR 同时判定「关闭按钮仍在」与「覆盖层特征词」（2026-09-14）。
+
+        一次 screencap + 一次 tesseract 替代 `_ad_close_pos` 与
+        `_overlay_visible_in_top` 两次独立调用（省一次截图+识别，~1-1.5s），
+        供 `_back_at_taskcenter` 免 dump 快速通道使用。
+        覆盖层词表 = Badcase 问卷 + 个人资料卡 —— 有意比 dump 链的 F11 闸门
+        （仅问卷词）更严：快速通道跳过了 dump 严格确认，用更全的顶条词表补强
+        （资料卡覆盖 dump 穿透误判、卡死 1h 的 09-13 教训）。
+        匹配语义与 `_ocr_find` 一致：整词 → 跨词元拼接（`_merged_match`）。
+
+        Returns:
+            (pill, overlay)：pill=True 表示顶条读到关闭按钮（广告未关）；
+            overlay=True 表示顶条命中覆盖层特征词（问卷/资料卡等盖屏）。
+        """
+        if not _HAS_OCR:
+            return (False, False)
+        img = self._ocr_shot()
+        if img is None:
+            return (False, False)
+        img = img.crop(AD_TOP_REGION)
+        data = pytesseract.image_to_data(
+            img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
+            output_type=pytesseract.Output.DICT)
+        toks: List[Tuple[str, int, int]] = []
+        for i in range(len(data["text"])):
+            t = (data["text"][i] or "").strip()
+            if not t:
+                continue
+            x = data["left"][i] + data["width"][i] // 2 + AD_TOP_REGION[0]
+            y = data["top"][i] + data["height"][i] // 2 + AD_TOP_REGION[1]
+            toks.append((t, x, y))
+
+        def _hit(keys) -> bool:
+            for t, _x, _y in toks:
+                for k in keys:
+                    if k in t:
+                        return True
+            return self._merged_match(toks, keys, None) is not None
+
+        pill_keys = ("关闭广告", "关闭", "跳过", "取消")
+        overlay_keys = tuple(self._OVERLAY_TOP_KEYS) + tuple(self._PROFILE_KEYS)
+        return (_hit(pill_keys), _hit(overlay_keys))
 
     def _ai_friend_page_visible(self) -> bool:
         """OCR 是否显示 AI 好友 banner H5 误开页（已点中 banner 后全屏放大）。
@@ -1447,6 +1513,22 @@ class Flow:
         # 1) OCR 先验（快路径）：读不到任务中心特征 → 一定没回任务中心
         if not self._taskcenter_confirmed_by_ocr():
             return False
+        # 1.5) 三信号免 dump 快速通道（2026-09-14）：
+        #   信号① OCR 已命中任务中心特征词（上一步）
+        #   信号② 顶条无关闭按钮（广告确已关闭）
+        #   信号③ 顶条无覆盖层特征词（问卷/资料卡未盖屏，词表比 F11 闸门更全）
+        # 三信号齐 → 直接判 True，跳过 dump。安全性依据：
+        #   - dump 超时路径现行代码本就「信任 OCR 判 True」（下方 streak>0 分支），
+        #     本通道只是把「先白等 2.5s 再得出同一结论」提前；
+        #   - dump 严格确认唯一能多拦住的是「OCR 误命中 H5 覆盖页」，而 OCR 截屏
+        #     读的是最上层像素、本就不穿透不透明覆盖层（dump 才会穿透），信号③
+        #     的顶条覆盖层词表（问卷+资料卡）已兜住该场景。
+        #   误判兜底：信号②/③任一命中 → 落回下方 dump 严格链，行为与旧版一致。
+        #   设 workflow.tc_confirm_skip_dump: false 可整体回退。
+        if self.wf.get("tc_confirm_skip_dump", True):
+            pill, overlay = self._top_strip_scan()
+            if not pill and not overlay:
+                return True
         # 2) dump 二次确认：防全屏 H5 / 问卷页 OCR 误命中导致的静默假成功
         #    （旧版漏洞：问卷页 tap 无效却被判成功，白白空等 22s）
         if not self._find("获取随机", timeout=timeout):
@@ -1569,6 +1651,22 @@ class Flow:
         return self._ocr_find("关闭广告", "关闭", "跳过", "取消",
                               ymax=400, region=AD_TOP_REGION)
 
+    def _prefetch_ad_close_pos(self) -> None:
+        """E 优化（2026-09-14）：广告播放中预定位「关闭广告」按钮。
+
+        视频期 dump 必然失败，但 OCR 截屏不依赖 idle —— 顶条 OCR ~1s 即可在
+        等待窗口内拿到关闭按钮坐标，存入 `self._prefetch_close = (pos, ts)`。
+        命中才缓存；读不到（插屏/加载期版式不同，09-14 尔尔事故同款场景）
+        不缓存、显式置 None，等待结束后 _close_ad 走原链自愈。
+        仅预定位、不点击 —— tap 时机仍由 ad_wait 控制，与原行为一致。
+        """
+        pos = self._ad_close_pos()
+        if pos is not None:
+            self._prefetch_close = (pos, time.time())
+            logger.info("等待窗口内预定位到关闭按钮 @ %s（E 优化）", pos)
+        else:
+            self._prefetch_close = None
+
     def _find_close_node(self, timeout: Optional[float] = None) -> Optional[Node]:
         """uiautomator 定位广告页关闭按钮节点，返回 Node（None = 未命中）。
 
@@ -1672,6 +1770,31 @@ class Flow:
                 if self._taskcenter_confirmed_by_ocr():
                     logger.info("OCR 二次判定：已在任务中心，无需关闭")
                     return True
+        # 0.5) E 优化（2026-09-14）：消费等待窗口内预定位的关闭按钮坐标。
+        #      前提是步骤 0 守卫刚确认「不在任务中心」—— 该守卫是 F8 防线：
+        #      若广告已提前自动结束、页面已切回任务中心，这里绝不消费旧坐标
+        #      （否则 (141,150) 会落到顶部 banner 命中区，复刻误开 AI 好友 H5）。
+        #      守卫通过说明画面仍是广告页，预定位坐标（单次消费 + TTL 双保险）
+        #      可直接 tap（trusted=True，与步骤 2「OCR 正向定位放行」同语义），
+        #      省掉步骤 1 的 dump 2.5s 白等 + 步骤 2 的重新 OCR 定位。
+        #      tap 后与直关同款确认链；确认失败由既有「巡检 + 兜底轮询」自愈。
+        pref = self._prefetch_close
+        self._prefetch_close = None          # 单次消费，用完即弃
+        if (pref is not None
+                and time.time() - pref[1] <= float(
+                    self.wf.get("ad_prefetch_ttl", 20.0))):
+            logger.info("使用等待窗口预定位的关闭按钮 @ %s（E 优化，跳过 dump 定位）",
+                        pref[0])
+            self._tap(*pref[0], pause=1.5, trusted=True)
+            time.sleep(ad_close_settle)
+            if self._confirm_direct_close(ad_close_dump_timeout,
+                                          ad_close_confirm_retries,
+                                          ad_close_confirm_gap):
+                logger.info("广告已关闭（预定位直关路径）")
+                return True
+            logger.info("预定位直关未生效，巡检一次 Badcase/AI 好友后走兜底")
+            # 与步骤 1/2 直关失败同款处置：万一 tap 落点已漂移误开 H5，立即 BACK
+            self._dismiss_badcase()
         # 1) uiautomator 直关（2026-09-10 对调）：页面 idle 时 1-3s 命中。
         #    直关失败（tap 未生效/页面又变了）→ 巡检一次覆盖层再走 OCR/兜底。
         n = self._find_close_node(timeout=ad_close_dump_timeout)

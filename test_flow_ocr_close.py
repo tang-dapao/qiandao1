@@ -64,6 +64,13 @@ class Base(unittest.TestCase):
         # 0（无 dump 失败），个别测试可覆盖为 >0 验证"拒绝盲点放行"。
         self.f.ui = mock.Mock()
         self.f.ui.dump_fail_streak = 0
+        # E/方案1（2026-09-14）：_back_at_taskcenter 免 dump 快速通道依赖
+        # _top_strip_scan；默认桩返回「顶条仍有关闭按钮」→ 跳过快速通道、
+        # 走旧 dump 严格链 —— 保持既有用例的调用序列语义不变。快速通道
+        # 专属用例（TestTopStripFastPath）里显式覆盖该桩。
+        self.f._top_strip_scan = mock.Mock(return_value=(True, False))
+        # E 优化：预定位缓存逐测试隔离（类级默认是共享值）。
+        self.f._prefetch_close = None
         # 注：_stable_in_ad_page 不在 Base 默认 mock —— TestStableInAdPage
         # 需要测试真实实现（内部会调 _back_at_taskcenter）；TestCloseAd 在
         # _stub() 中显式 mock 为 True 以屏蔽内部多次检查对断言的干扰。
@@ -879,6 +886,162 @@ class TestOverlayGate(Base):
         self.assertEqual(f._ocr_find.call_args.kwargs.get("region"),
                          flow_mod.AD_TOP_REGION)
         self.assertEqual(f._ocr_find.call_args.kwargs.get("retries"), 1)
+
+
+class TestTopStripScan(Base):
+    """方案1（2026-09-14）：`_top_strip_scan` 单次顶条 OCR 双检。"""
+
+    def setUp(self):
+        super().setUp()
+        del self.f._top_strip_scan   # 移除 Base 桩，测真实实现
+
+    def _scan_setup(self, words):
+        img = mock.Mock()
+        img.crop.return_value = img
+        self.f._ocr_shot = mock.Mock(return_value=img)
+        self.fake_pt.image_to_data.return_value = _ocr_data(words)
+
+    def test_pill_hit(self):
+        self._scan_setup([("关闭广告", 100, 140, 88, 24)])
+        pill, overlay = self.f._top_strip_scan()
+        self.assertTrue(pill)
+        self.assertFalse(overlay)
+
+    def test_overlay_hit_includes_profile_keys(self):
+        # 资料卡词表纳入扫描（比 dump 链 F11 闸门更严，09-13 卡死教训）
+        self._scan_setup([("QQ空间", 100, 140, 60, 24)])
+        pill, overlay = self.f._top_strip_scan()
+        self.assertFalse(pill)
+        self.assertTrue(overlay)
+
+    def test_badcase_overlay_hit(self):
+        self._scan_setup([("反馈问卷", 200, 60, 80, 24)])
+        _pill, overlay = self.f._top_strip_scan()
+        self.assertTrue(overlay)
+
+    def test_clean_top_strip(self):
+        # 任务中心特征词不在 pill/overlay 词表 → 三信号可齐
+        self._scan_setup([("每日", 300, 250, 40, 24), ("签到", 345, 250, 40, 24)])
+        self.assertEqual(self.f._top_strip_scan(), (False, False))
+
+    def test_shot_none_returns_clean_pair(self):
+        self.f._ocr_shot = mock.Mock(return_value=None)
+        self.assertEqual(self.f._top_strip_scan(), (False, False))
+
+
+class TestTopStripFastPath(Base):
+    """方案1（2026-09-14）：`_back_at_taskcenter` 三信号免 dump 快速通道。"""
+
+    def _stub(self, scan=(False, False), tc=True):
+        f = self.f
+        f.ui = mock.Mock()
+        f.ui.dump_fail_streak = 0
+        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=tc)
+        f._top_strip_scan = mock.Mock(return_value=scan)
+        f._find = mock.Mock(return_value=Node("每日签到", 0, 0, 100, 100))
+        f._ocr_find = mock.Mock(return_value=None)   # 顶部无关闭按钮
+        f._overlay_visible_in_top = mock.Mock(return_value=False)
+        return f
+
+    def test_three_signals_pass_skips_dump(self):
+        f = self._stub(scan=(False, False))
+        self.assertTrue(f._back_at_taskcenter())
+        f._find.assert_not_called()          # 一次 dump 都没付出
+
+    def test_pill_present_falls_back_to_dump_chain(self):
+        f = self._stub(scan=(True, False))
+        self.assertTrue(f._back_at_taskcenter())
+        f._find.assert_called()              # 信号②异常 → 落回 dump 严格链
+
+    def test_overlay_present_falls_back_to_dump_chain(self):
+        f = self._stub(scan=(False, True))
+        self.assertTrue(f._back_at_taskcenter())
+        f._find.assert_called()
+
+    def test_knob_off_restores_dump_chain(self):
+        f = self._stub(scan=(False, False))
+        f.wf["tc_confirm_skip_dump"] = False
+        self.assertTrue(f._back_at_taskcenter())
+        f._find.assert_called()
+
+    def test_ocr_miss_short_circuits_before_scan(self):
+        f = self._stub(tc=False)
+        self.assertFalse(f._back_at_taskcenter())
+        f._top_strip_scan.assert_not_called()
+
+
+class TestPrefetchClose(Base):
+    """E 优化（2026-09-14）：等待窗口预定位关闭按钮 + `_close_ad` 单次消费。"""
+
+    def _stub(self, confirm=True):
+        f = self.f
+        f.ui = mock.Mock()
+        f.ui.dump_fail_streak = 0
+        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=False)
+        f._tap = mock.Mock()
+        f._tap_node = mock.Mock()
+        f._confirm_direct_close = mock.Mock(return_value=confirm)
+        f._find_close_node = mock.Mock(return_value=None)
+        f._ad_close_pos = mock.Mock(return_value=None)
+        f._dismiss_badcase = mock.Mock()
+        f._back_at_taskcenter = mock.Mock(return_value=False)
+        f.wf["ad_close_retries"] = 1         # 兜底 1 轮，封住长尾
+        return f
+
+    def test_prefetch_consumed_single_use(self):
+        f = self._stub()
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(141, 150, pause=1.5, trusted=True)
+        f._find_close_node.assert_not_called()   # 跳过 dump 定位段
+        self.assertIsNone(f._prefetch_close)     # 用完即弃
+
+    def test_prefetch_stale_falls_back_to_dump_locate(self):
+        f = self._stub()
+        f._prefetch_close = ((141, 150), flow_mod.time.time() - 30.0)
+        self.assertFalse(f._close_ad())
+        f._tap.assert_not_called()
+        f._find_close_node.assert_called()       # TTL 过期 → 走原 dump 定位链
+
+    def test_step0_taskcenter_guard_blocks_prefetch(self):
+        # F8 防线：步骤 0 已确认在任务中心 → 绝不消费预定位坐标
+        #（否则 (141,150) 落到顶部 banner 命中区，复刻误开 AI 好友 H5）
+        f = self._stub()
+        f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=True)
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertTrue(f._close_ad())
+        f._tap.assert_not_called()
+        self.assertIsNotNone(f._prefetch_close)  # 留给 _watch_ad_once 收尾清空
+
+    def test_prefetch_confirm_fail_selfheals(self):
+        f = self._stub(confirm=False)
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertFalse(f._close_ad())
+        f._dismiss_badcase.assert_called()       # 与直关失败同款巡检自愈
+
+    def test_prefetch_helper_sets_and_clears_cache(self):
+        f = self.f
+        f._ad_close_pos = mock.Mock(return_value=(141, 150))
+        f._prefetch_ad_close_pos()
+        pos, _ts = f._prefetch_close
+        self.assertEqual(pos, (141, 150))
+        f._ad_close_pos.return_value = None      # 插屏/版式不同读不到
+        f._prefetch_ad_close_pos()
+        self.assertIsNone(f._prefetch_close)
+
+    def test_watch_ad_once_clears_prefetch_after_close(self):
+        # 预定位坐标只在本观看周期内有效：_close_ad 返回后一律作废
+        f = self.f
+        f.ui = mock.Mock()
+        f.wf.update({"ad_wait_min": 0.01, "ad_wait_max": 0.02,
+                     "ad_times_per_robot": 10, "ad_prefetch_pos": False})
+        f._find_row = mock.Mock(
+            return_value=(mock.Mock(), mock.Mock(), (2, 10)))
+        f._tap_node = mock.Mock()
+        f._close_ad = mock.Mock(return_value=True)
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertTrue(f._watch_ad_once())
+        self.assertIsNone(f._prefetch_close)
 
 
 if __name__ == "__main__":

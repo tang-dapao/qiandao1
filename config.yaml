@@ -59,6 +59,21 @@ workflow:
   # 确认；全部失败才走 Badcase 巡检 + 兜底。设 retries=0 可回退旧行为。
   ad_close_confirm_retries: 1
   ad_close_confirm_gap: 1.2
+  # E 优化（2026-09-14）：广告等待窗口内预定位「关闭广告」按钮。
+  # 等待进行到 ad_prefetch_at 秒时用顶条 OCR 预定位并缓存坐标（不点击，tap
+  # 时机不变）；_close_ad 在「步骤 0 任务中心守卫通过」的前提下直接用缓存坐标
+  # tap，省掉 dump 2.5s 白等 + 重新 OCR 定位（~3.5-4.8s/次）。预定位读不到
+  # （插屏/特殊版式）自动走原链。false = 回退旧行为。
+  ad_prefetch_pos: true
+  ad_prefetch_at: 10.0
+  # 预定位坐标的保鲜期（秒）：从预定位到 tap 超过该值即弃用走原链。
+  ad_prefetch_ttl: 20.0
+  # 2026-09-14：_back_at_taskcenter 三信号免 dump 快速通道 —— OCR 命中任务中心
+  # 特征 + 顶条无关闭按钮 + 顶条无覆盖层词（问卷+资料卡）→ 直接判 True 跳过
+  # dump。dump 超时路径旧逻辑本就信任 OCR（streak>0 分支），本开关只是把
+  # 「白等 2.5s 再得出同一结论」提前；误判兜底 = 信号任一异常落回 dump 严格链。
+  # false = 回退严格 dump 确认链。
+  tc_confirm_skip_dump: true
       # 机器人白名单（2026-09-09 用户维护）：仅对名单内昵称执行签到/问题反馈/看广告，
   # 其它一律跳过。QQ 中无法操作的（昵称重复：小麦1/小麦2、孤立“1”、内测中等）
   # 已排除在名单外。后续增删机器人直接编辑此列表；清空 = 不过滤（跑全部）。

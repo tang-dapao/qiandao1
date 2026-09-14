@@ -787,7 +787,10 @@ class Flow:
         有固定下限空等。wait_for 内部 find 失败会轮询，语义等价且更稳。
         """
         logger.info("进入机器人任务中心: %s", name)
+        t_start = time.time()
+        t0 = t_start
         self._nav_robot_list()
+        t0 = self._stage(t0, "进台.1导航列表")
         r = self._find_robot(name)
         if not r:
             logger.warning("列表里没找到机器人 %s；屏文=%s", name,
@@ -798,6 +801,7 @@ class Flow:
         r = self._reconfirm_click_target(name, r)
         if r is None:
             return False
+        t0 = self._stage(t0, "进台.2找行+现场")
         # F9：tap y 上钳到 TAP_Y_MAX，避开底部 nav 边缘手势区
         # （藤非 y=1771 → 1740 上移 31px；游迦 y=1684 不动）。
         cx, cy = r.center
@@ -813,6 +817,7 @@ class Flow:
                          self._at_robot_list)
             self._diag_shot("enter_profile")
             return False
+        t0 = self._stage(t0, "进台.3点行到发消息")
         self._tap_node(n)
         # 聊天页 -> 个人（同样条件等待；"个人"在输入框上方 y>=600）
         n = self.ui.wait_for("个人", retries=8, interval=1.0, ymin=600)
@@ -820,6 +825,7 @@ class Flow:
             logger.error("聊天页没找到 个人；屏文=%s", self._screen_texts(12))
             self._diag_shot("enter_private")
             return False
+        t0 = self._stage(t0, "进台.4发消息到个人")
         self._tap_node(n)
         # F10(#5 优化)：进入任务中心的固定等待改条件等待——任务中心特征
         # （每日签到/任务中心）出现即继续，H5 加载快时不再空等满 3~3.5s。
@@ -867,11 +873,13 @@ class Flow:
             else:
                 logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
                             self.t.get("taskcenter_wait", 3.5))
+        t0 = self._stage(t0, "进台.5TC加载探测")
         # 已进入某机器人的任务中心：清快路径状态（下次 nav 需重新导航）
         self._at_robot_list = False
         # F11：进入任务中心 → 启用 banner 禁点区（此后本页任何 y<440 的坐标点击
         # 都要过守卫，防误触顶部 banner）。
         self._page_tc = True
+        logger.info("[计时] 进台合计 %.1fs", time.time() - t_start)
         return True
 
     def _exit_taskcenter(self) -> bool:
@@ -895,6 +903,7 @@ class Flow:
           （弱判据会把 QQ 主界面【消息】首页误认成机器人列表，是历史卡死根因）。
         """
         logger.info("退出任务中心（系统 BACK 键，三层 × 最多 2 轮）")
+        t_start = time.time()
         # F11：退出任务中心 → 关闭 banner 禁点区（回到列表后 y<440 的点击是合法的，
         # 如机器人首行/分类行）；本方法全程只用物理 BACK，不依赖坐标。
         self._page_tc = False
@@ -909,13 +918,17 @@ class Flow:
                 logger.warning(
                     "当前不在任务中心页（无 每日签到/任务中心 特征）→ 安全返回兜底")
                 return self._safe_back_to_robot_list()
+        t0 = self._stage(t_start, "退台.0前提校验")
         # 1) 第 1 轮：直接三层 BACK（快路径，不做任何滚动）
         for layer in (1, 2, 3):
             self.ui.back(pause=random.uniform(1.2, 1.8))
             time.sleep(EXIT_LAYER_WAIT)
-            if self._looks_like_robot_list():
+            hit = self._looks_like_robot_list()
+            t0 = self._stage(t0, f"退台.第{layer}层")
+            if hit:
                 self._at_robot_list = True
                 logger.info("已回到机器人列表（第%d层返回后）", layer)
+                logger.info("[计时] 退台合计 %.1fs", time.time() - t_start)
                 return True
         # 2) 第 2 轮兜底：仅当"还没退回 QQ 主壳"（说明确实卡在子页）时才补做
         #    坐标时代的"滑到顶再退"。已回主界面却不在列表的情况跳过这一步，
@@ -1723,6 +1736,16 @@ class Flow:
                            tag, len(parts), "；".join(parts) or "<无文本>")
         except Exception as e:  # noqa: BLE001
             logger.warning("页面快照[%s] 失败: %s", tag, e)
+
+    def _stage(self, t0: float, tag: str) -> float:
+        """进/退台分阶段耗时打点（E4 2026-09-14）：打印自上一阶段边界以来的
+        耗时（INFO，前缀 [计时] 便于 grep），返回当前时刻供下一段接力。
+        只读时钟、无副作用；失败路径不强行补打点（异常分支本就有独立日志）。
+        用途：把进台 46s / 退台 29s 精确拆到秒，为后续进退台优化提供实测依据。
+        """
+        now = time.time()
+        logger.info("[计时] %s %.1fs", tag, now - t0)
+        return now
 
     def _close_ad(self, max_tries: int = 6, tc_seen: bool = False) -> bool:
         """主动关闭广告。

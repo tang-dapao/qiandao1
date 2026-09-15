@@ -37,11 +37,12 @@ D:\qiandao\
 ├─ watch_ad.bat             # 启动：仅 看广告，补满每台每日配额（main.py --ad-only）
 ├─ ad_test_all.bat [COUNT]  # 启动：全白名单手动跑广告（默认每台 1 次，全链路快速验证）
 │
-├─ test_flow_ocr_close.py   # mock 单测：广告关闭 + ymax + F8 正向定位不盲点 + **F11 banner 盲点禁令 + 覆盖层闸门** + 跨词元拼接 + BACK 封顶 + 条带高度上限（63 用例）
-├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（18 用例）
+├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限（92 用例）
+├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（21 用例）
 ├─ test_run_all_flags.py    # mock 单测：run_all 各 flag 组合 + 单会话连看 + 首轮广告 + 配额收尾 + 白名单（29 用例）
-├─ test_nav_optimize.py     # mock 单测：导航优化 + 心动卡错页守卫 + 机器人列表滚动收集（37 用例）
-├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数，32 用例）→ 合计 179/179
+├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0)（48 用例）
+├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数，36 用例）
+├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看，10 用例）→ 合计 236/236
 ├─ test_plan_fullflow.md    # 全流程测试计划文档
 │
 ├─ e2e_ad_once.py           # 真机验证：单机器人看一次广告（RESULT: OK/FAIL）
@@ -100,6 +101,24 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 
 启动时会做入口探活（设备不在线直接退出），避免后续静默乱点兜底坐标。
 
+## 可调旋钮（config.yaml，改数字不改代码）
+
+| 旋钮 | 默认 | 说明 |
+|---|---|---|
+| `ad_wait_min/max` | 15 / 17 | 广告等待窗口（覆盖 ≤15s 视频 + 加载延迟） |
+| `ad_cooldown` | 60 | 同机两支广告间隔（平台 CD，从关闭起算） |
+| `ad_close_dump_timeout` | 2.5s | 关闭链路 dump 快失败超时 |
+| `ad_close_settle` | 1.0s | 关闭 tap 后沉降等待 |
+| `ad_prefetch_pos` / `ad_prefetch_at` / `ad_prefetch_ttl` | true / 10s / 20s | E 优化：等待窗口内顶条 OCR 预定位关闭按钮 |
+| `tc_confirm_skip_dump` | true | 方案 1：任务中心确认三信号免 dump 快速通道 |
+| `nav_wait` | 8.0s | A1 事件驱动导航最大等待（就绪即提前返回） |
+| `ad_close_max_backs` | 3 | 关闭兜底物理 BACK 封顶 |
+| `ad_times_per_robot` | 10 | 每台每日广告配额 |
+
+**效率基线（2026-09-15 全量场实测，10 台 × 10 支，2h35m，失败 0）**：
+同机 CD 连看周期中位 **89.2s**（CD 60s 占 67%，平台硬底）；退台中位 **17.2s**；
+进台中位 **26.0s**；全含（含首轮签到/反馈）**93.2s/支**。关闭链路 dump 超时 0 次失败。
+
 ## 定位方式（按优先级）
 
 1. **uiautomator 文本节点**（`adb_ui.nodes()`）：dump 当前 UI 树找目标文字，精确取 bounds。
@@ -140,18 +159,22 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
   置 False —— 保证**列表页机器人首行（y≈410-500）、联系人页『机器人』分类行（y≈201-352）**
   仍可正常点击（否则导航直接瘫痪）。
 
-## 看广告关闭策略（F8 + 17:45 顺序对调：uiautomator 优先 → OCR 正向定位 → BACK 封顶兜底）
+## 看广告关闭策略（E 优化链：等待窗口预定位 → 顶条快检直关 → uiautomator → OCR 正向定位 → BACK 封顶兜底）
 
-等待 `ad_wait_min~ad_wait_max`（当前 `config.yaml` = **16~18s**，覆盖 ≤15s 视频广告 + 加载延迟）后：
+等待 `ad_wait_min~ad_wait_max`（当前 `config.yaml` = **15~17s**，覆盖 ≤15s 视频广告 + 加载延迟）后：
 
 0. **快路径**：`_taskcenter_confirmed_by_ocr()` 连续 2 次读到任务中心特征词
    （`每日签到 / 任务中心 / 获取随机 / 收支详情`）→ 广告已自动结束 → 收工，**不点任何坐标**。
    （**双检刻意保留**：广告创意素材可能含「每日签到」字样，单检误判会让整条广告白耗。）
-1. **uiautomator 直关**（2026-09-10 17:45 与 OCR 对调）：`_find_close_node()` 精确「关闭广告」
-   → 「跳过」/「关闭」候选，命中即点其 bounds 中心（F11 认可的**节点点击**）。等待结束后页面
-   多数已 idle，dump 1-3s 即命中（17:29 实测一次命中 `(141,150)`，省 ~9s OCR 空试）。
+0.5. **E 优化 · 消费预定位坐标**（2026-09-14，`ad_prefetch_pos: true`）：广告等待进行到
+   `ad_prefetch_at`（默认 10s）时用顶条 OCR **预定位**关闭按钮并缓存（`ad_prefetch_ttl` 20s 内
+   有效），`_close_ad` 直接消费缓存坐标跳过 dump/OCR 定位（实测 82/82 命中）。
+1. **E1 顶条快检直关**（2026-09-14）：顶条 OCR 快检命中关闭按钮 → 直接点其坐标
+   （跳过全屏守卫 ~3.4s）。等待结束时页面多数已 idle，快检一次命中 `(99,152)`。
+2. **uiautomator 直关**：`_find_close_node()` 精确「关闭广告」
+   → 「跳过」/「关闭」候选，命中即点其 bounds 中心（F11 认可的**节点点击**）。
    直关失败 → 先巡检一次 Badcase/AI 好友 H5 自愈 → 转 OCR / 兜底。
-2. **OCR 正向直关**：`_ad_close_pos()` 在顶部条带正向定位「关闭广告 / 跳过 / 取消」，
+3. **OCR 正向直关**：`_ad_close_pos()` 在顶部条带正向定位「关闭广告 / 跳过 / 取消」，
    **点它自己读到的坐标**（`_tap(*pos, trusted=True)`，F11 显式放行）→ 2s 后校验。
    - **读不到 → 绝不盲点固定坐标**，打印告警后直接进入兜底轮询。
 
@@ -159,12 +182,18 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 
 1. 已回任务中心（`_back_at_taskcenter()`，广告自动结束）—— **必须先于 uiautomator**：
    防 dump 残留节点在任务中心页被误读误点（该坐标带与顶部 banner 重叠）；
+   **方案 1 免 dump 快速通道**（2026-09-14，`tc_confirm_skip_dump: true`）：确认改用
+   「OCR 判定 + 顶条 + 全屏三信号」，重载动画期不再白等 dump 超时；
 2. uiautomator 定位「关闭广告 / 跳过 / 关闭」→ 点节点中心；
 3. `_ad_close_pos()` OCR 顶部条带正向定位关闭按钮 → 点其坐标；
 4. **无固定坐标盲点**（F8 删除）。改**物理 BACK**（`F6`：连续 BACK 封顶
-   `workflow.ad_close_max_backs`，默认 3）—— 超限直接放弃本次关闭返回 False，
-   交上层失败计数 + `_safe_back_to_robot_list()` 复位。**绝不允许无限 BACK**：
+   `workflow.ad_close_max_backs`，默认 3）—— 超限直接放弃本次关闭返回 False（放弃点调用
+   `_log_page_snapshot()`（E3）落页面快照日志便于归因），交上层失败计数
+   + `_safe_back_to_robot_list()` 复位。**绝不允许无限 BACK**：
    2026-09-10 实测判定失灵时连按 10 次 BACK 把 QQ 一路退到手机桌面。
+
+> **E2 全屏三合一扫描**（2026-09-14）：旧「顶条双检 + 全屏守卫」合并为 `_fullscreen_scan()`
+> —— 单次全屏 OCR 同判「任务中心特征 / 关闭按钮 / 覆盖层词」，确认链 OCR 次数减半。
 
 > **问题反馈 / 静默假成功防线（F11）**：`_back_at_taskcenter()` 在"即将判成功"时，额外用
 > 问卷**独有词**（`Badcase` / `反馈问卷`；任务中心绝不含 —— 任务行只有「问题反馈」4 字）
@@ -240,6 +269,13 @@ y≈0-440 的可点击入口，固定坐标 tap 会误开 Badcase 反馈问卷�
 则跳过补退，防退到桌面）。层间等待用局部常量 `EXIT_LAYER_WAIT=1.2s`（非全局 `page_wait`），
 三层仍各自用 `_looks_like_robot_list()` **强判据**校验。
 
+**P0 强判据单快照化（2026-09-15，实测退台 30.6s → 17.2s 中位）**：`_looks_like_robot_list()`
+原先内部 3 次 `ui.nodes()`（自身 + `_on_qq_main_shell` + `_robot_cat_selected`），而 nodes()
+0.8s TTL 以 **dump 开始时刻**计龄，MuMu 单次 dump 2.4-3.8s > TTL → 3 次调用**必然各自重新
+dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `ui.nodes()` 判正信号 + 否决词
+（逻辑等价，还消除了"三个信号来自三份不同时刻 dump"的过渡期混合状态）。每层校验 1 次 dump，
+退台每层 9.9s → 5.2s。
+
 ## Badcase 问卷 / 推广广告 防线（2026-09-10 新增）
 
 - **L3**：`_badcase_visible()` 全屏 OCR 找 `Badcase/反馈问卷/开始填写/感谢大家一直`，
@@ -251,8 +287,8 @@ y≈0-440 的可点击入口，固定坐标 tap 会误开 Badcase 反馈问卷�
 
 ```bash
 # mock 单测（无需设备 / 无 OCR 依赖，任意环境可跑）
-py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 179/179 通过
-py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety
+py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 236/236 通过
+py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate
 
 # 真机验证（需模拟器在线 + QQ 停在机器人列表）
 py -3.13 e2e_ad_once.py "昵称"              # 看一次广告
@@ -278,7 +314,14 @@ py -3.13 scripts_test/observe_ad.py "昵称"  # 广告页证据采集（不自�
   由 `_enter_taskcenter` 在未见任务中心特征时 OCR 一次识别（命中 `心动卡 / 高级模型 / 立即续费`
   → 判进入失败 + 复位重试）。2026-09-11 00:32 小麦 实测命中并正确判失败。
 - **导航偶发「未确认在机器人列表」（坑 12）**：dump 残留/穿透节点（如同屏混入「发消息」）会让
-  `_looks_like_robot_list()` 误判为"不在列表"→ 导航空转。已记入 `MEMORY.md` 坑 12，**尚未根治**。
+  `_looks_like_robot_list()` 误判为"不在列表"→ 导航空转。**D1（2026-09-12）已修**：改
+  「先看正信号再谈 veto」—— 正信号（QQ 主壳 + 机器人分类 selected）成立即是列表的充分证据，
+  「发消息」仅在 y>=1400（真 profile 底栏位置）才否决，中区残留视为**残影容忍**并打 warning。
+- **TC 卡死家族（偶发，可自愈，已知待治理）**：任务中心重载动画期 dump 连续超时 →
+  前提校验/确认判不出任务中心 → OCR 也未命中 → 走 `_safe_back_to_robot_list()` 过度返回 →
+  落在机器人列表但强判据 False（残影混合）持续数分钟。2026-09-14 小麦、09-15 代柯/黎小姐
+  各中过 1 次；09-15 午间全量场（12 次换台 + 18 次 dump 超时）**0 发作**（全部自愈）。
+  治理方向：前提校验的 dump 超时分支加 OCR 优先复核，抬高安全返回触发门槛（尚未实施）。
 - 请使用**测试账号**，腾讯对模拟器/高频点击有风控。
 
 ## 废弃代码

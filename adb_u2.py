@@ -67,6 +67,14 @@ class U2AdbUI(AdbUI):
                     self._u2 = u2.connect(self.device)
                     logger.info("u2 agent 已连接（%s，第 %d 次尝试）",
                                 self.device, i + 1)
+                    # 预热 + 防冷启动首 dump 不完整：u2_test4 首台实测，
+                    # agent 刚拉起后第一次 dump 层级缺底部 tab 栏 ->
+                    # _looks_like_robot_list 判据失败一条 WARNING（flow 重试
+                    # 自愈，无害但没必要）。connect 后立即空跑一次丢弃。
+                    try:
+                        self._u2.dump_hierarchy()
+                    except Exception:  # noqa: BLE001
+                        pass
                     return self._u2
                 except Exception as e:  # noqa: BLE001
                     last = e

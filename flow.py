@@ -732,64 +732,105 @@ class Flow:
         self._diag_shot("enter_vanished")
         return None
 
+    def _screen_robot_names(self) -> List[str]:
+        """当前屏所有符合昵称识别规则的文本（不去重、不落日志）。
+
+        P1（2026-09-15）从 _collect_robot_names 抽出：「向上滚到顶部收敛」
+        与「向下滚到底收集」两阶段共用同一段过滤逻辑（x1∈[180,195]、
+        y1∈[350,1850]、宽<=230，排除 内测中/我添加/我创建/底部 tab）。
+        """
+        out: List[str] = []
+        for n in self.ui.nodes():
+            if (180 <= n.x1 <= 195 and 350 <= n.y1 <= 1850
+                    and (n.x2 - n.x1) <= 230):
+                t = n.text.strip()
+                if not t:
+                    continue
+                if "内测中" in t:
+                    continue
+                if ("我添加" in t or "我创建" in t or t in ("消息", "频道",
+                                                             "联系人", "动态")):
+                    continue
+                out.append(t)
+        return out
+
     def _collect_robot_names(self, max_scroll: int = 12,
                              stop_when: Optional[List[str]] = None) -> List[str]:
-        """在「我添加的机器人」列表页滚动收集机器人昵称。
+        """在机器人列表页滚动收集机器人昵称（P1 两阶段：先到顶、再滚到底）。
 
         昵称节点特征（1080x1920 实测）：左对齐 x1==183、宽 <=230、
         位于地区域 y1 350~1850（排除顶部 tab / 底部 nav / 账户及设置）。
         按首次出现顺序去重，跳过「内测中」。带编号的重复昵称（小麦/小麦1/
-        小麦2）视为不同条目保留。
+        小麦2）视为不同条目保留。注意：起点在列表中段时 Phase 1 会先向上
+        收集，names 顺序为「起点以下先收、顶部后补」，与屏幕顺序可能不同
+        —— 仅影响处理顺序，不影响收集完整性。
 
-        stop_when（#1 优化 2026-09-09）：白名单已存在时传入目标名单，当前
-        屏收集到名单全部名字即提前停止滚动 —— 常规白名单（10 个）在列表前
-        1~2 屏内即可集齐，省掉滚完剩余页面的一次次 dump+swipe
-        （实测启动收集 ~88s，多为滚动开销）。传 None 保持旧行为（全量收集，
-        main --list 用它看完整列表）。
+        P1 根因（2026-09-15，两次实测实锤：09-14 11:55 / 09-15 14:25）：
+        新进程启动导航后，列表页会**恢复上次的滚动位置**（上次 run 收集
+        结束时停在底部附近），旧写法盲滑 7 次且没有任何"已在顶部"的确认，
+        实测两次都停在列表中段（首屏从 李宥恩 开始），顶部 代柯/尔尔/古禹
+        （及 小麦1/2/3）永远收不到，随后「3 屏无新增」误判到底部提前结束
+        → 自动收集静默漏机器人。
+
+        Phase 1（到顶收敛）：先无差别快滑 4 次（列表实测 2~3 屏，成本与
+        旧盲滑 7 次相当），再反复下滑并对比**本屏名字序列**，连续 2 屏完全
+        相同 → 确认已到顶部。列表中部每次下滑（内容上移）必然露出新行，
+        唯一序列不变的位置就是顶部 —— 判据不依赖任何标记节点（实机 dump
+        确认机器人列表无「我添加的机器人」分组头，无标记可用），列表顺序
+        /内容变化免疫。8 次未收敛则告警并继续（降级为旧行为）。
+        Phase 2（向下收集）：从顶部逐屏下滚，连续 2 屏内容不变判定到底。
+        （旧判据「3 屏 seen 无新增」会被 Phase 1 已收的中段内容干扰：
+        从顶部下滚重访中段时 seen 零新增连续累积 → 提前误判底部漏收。）
+
+        stop_when（#1 优化 2026-09-09）：白名单已存在时传入目标名单，
+        Phase 2 当前屏收集到名单全部名字即提前停止滚动 —— 常规白名单
+        （10 个）在列表前 1~2 屏内即可集齐，省掉滚完剩余页面的一次次
+        dump+swipe。传 None 保持全量收集（main --list 用它看完整列表）。
         """
         logger.info("自动抓取机器人列表")
         self._nav_robot_list()
-        # 无条件反复下滑滚回列表最顶部（导航后滚动位置不固定，列表仅 2~3 屏）
-        for _ in range(7):
-            self.ui.swipe_down(pause=random.uniform(0.5, 0.7))
-        time.sleep(0.5)
         names: List[str] = []
         seen: set = set()
-        no_new = 0
+
+        def _absorb(screen: List[str]) -> None:
+            for t in screen:
+                if t not in seen:
+                    seen.add(t)
+                    names.append(t)
+                    logger.info("  收集到机器人: %s", t)
+
+        # ---- Phase 1：滚回列表最顶部并给出收敛证据（P1 修复 2026-09-15）----
+        for _ in range(4):
+            self.ui.swipe_down(pause=random.uniform(0.5, 0.7))
+        time.sleep(0.5)
+        self.ui.refresh()
+        prev: Optional[List[str]] = None
+        top_ok = False
+        for _ in range(8):
+            cur = self._screen_robot_names()
+            _absorb(cur)
+            if prev is not None and cur == prev:
+                top_ok = True
+                break
+            prev = cur
+            self.ui.swipe_down(pause=random.uniform(0.5, 0.7))
+        if top_ok:
+            logger.info("已收敛到列表顶部（连续 2 屏内容不变）")
+        else:
+            logger.warning("下滑 8 次仍未确认列表顶部，继续收集（顶部可能漏收）")
+
+        # ---- Phase 2：从顶部向下滚动收集到底（#1 优化 2026-09-09）----
+        prev = None
         for _ in range(max_scroll):
-            # 基线必须在「遍历本屏节点之前」取 —— 2026-09-10 修复死代码：
-            # 旧写法把 before 放在 swipe 之前，而 swipe 与比较之间没人修改
-            # seen（seen 只在本轮 for 循环里 add），导致 len(seen)==before
-            # 恒为真 → no_new 每轮必 +1 → 第 3 轮无条件 break → 列表最多只
-            # 向上滚 3 屏，超出的机器人被静默漏收（游迦因此一直抓不到）。
-            before = len(seen)
-            for n in self.ui.nodes():
-                if (180 <= n.x1 <= 195 and 350 <= n.y1 <= 1850
-                        and (n.x2 - n.x1) <= 230):
-                    t = n.text.strip()
-                    if not t:
-                        continue
-                    if "内测中" in t:
-                        continue
-                    if ("我添加" in t or "我创建" in t or t in ("消息", "频道",
-                                                                 "联系人", "动态")):
-                        continue
-                    if t not in seen:
-                        seen.add(t)
-                        names.append(t)
-                        logger.info("  收集到机器人: %s", t)
+            cur = self._screen_robot_names()
+            _absorb(cur)
             if stop_when and all(x in seen for x in stop_when):
                 logger.info("目标名单全部收集到（%d 个），提前停止滚动", len(stop_when))
                 break
-            # 本屏是否有新增 → 连续 3 屏零新增才判定已到列表底部
-            if len(seen) == before:
-                no_new += 1
-                logger.info("本屏无新增机器人（连续 %d 屏无新增）", no_new)
-                if no_new >= 3:
-                    logger.info("连续 %d 屏无新增，判定已滚到列表底部", no_new)
-                    break
-            else:
-                no_new = 0
+            if prev is not None and cur == prev:
+                logger.info("连续 2 屏内容不变，判定已滚到列表底部")
+                break
+            prev = cur
             # 滚动看更多
             self.ui.swipe_up(pause=random.uniform(0.8, 1.2))
         logger.info("共收集到 %d 个机器人: %s", len(names), names)

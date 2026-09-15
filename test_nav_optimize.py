@@ -849,22 +849,61 @@ class TestCollectRobotNamesScroll(unittest.TestCase):
         self.assertEqual(len(names), 14)   # 12 屏窗口共 12+3-1 = 14 个
         self.assertEqual(f.ui.pos, 11)     # 确实滚到了最后一屏
 
-    def test_stops_after_three_screens_without_new(self):
-        # 到底后重复读到同一屏 → 连续 3 屏零新增才停
+    def test_stops_when_screen_content_stops_changing(self):
+        # P1 语义（2026-09-15）：底部判定改为「连续 2 屏内容不变」——
+        # 到底后重复读到同一屏 → 第 2 次读到相同内容即停。
+        # （旧判据「3 屏 seen 零新增」会被 Phase 1 已收的中段内容干扰。）
         same = [_robot_row("机器人A", 0), _robot_row("机器人B", 1),
                 _robot_row("机器人C", 2)]
         f = self._flow([list(same) for _ in range(10)])
         names = f._collect_robot_names(max_scroll=9)
         self.assertEqual(names, ["机器人A", "机器人B", "机器人C"])
-        self.assertEqual(f.ui.pos, 3)      # 第 3 屏零新增后停止
+        self.assertEqual(f.ui.pos, 1)      # 第 2 屏内容不变后停止
 
-    def test_no_new_counter_resets_on_new_name(self):
-        # 中间出现"零新增"屏后再有新名字 → no_new 必须归零，否则会提前误停
-        pages = _rolling_pages(4)
-        pages.insert(2, pages[1])          # 第 3 屏与第 2 屏内容相同（零新增）
+    def test_zero_new_screen_does_not_stop_unfinished_list(self):
+        # 中间出现"零新增"屏（内容仍在变，只是名字已收过）后还有未收内容
+        # → 不得提前误停（P1 后语义：只有内容完全不变才判定到底）。
+        r = lambda i: _robot_row(f"机器人{i}", i % 3)
+        pages = [[r(0), r(1), r(2)],   # R0 R1 R2
+                 [r(1), r(2)],         # R1 R2 —— 内容变了但零新增
+                 [r(2), r(3), r(4)],   # R3 R4 新增
+                 [r(3), r(4), r(5)],   # R5 新增
+                 [r(4), r(5), r(6)]]   # R6 新增
         f = self._flow(pages)
         names = f._collect_robot_names(max_scroll=8)
-        self.assertGreaterEqual(len(names), 5)
+        self.assertEqual(len(names), 7)    # R0~R6 全部收齐
+
+    def test_p1_start_midlist_still_collects_top(self):
+        # P1 回归（2026-09-15 实锤 09-14 11:55 / 09-15 14:25 两次漏收）：
+        # 新进程导航后列表恢复上次滚动位置（中段）→ Phase 1 必须向上收敛
+        # 到顶，把起点上方的机器人也收齐。
+        p0 = [_robot_row("代柯", 0), _robot_row("尔尔", 1), _robot_row("古禹", 2)]
+        p1 = [_robot_row("古禹", 0), _robot_row("李宥恩", 1), _robot_row("黎小姐", 2)]
+        p2 = [_robot_row("黎小姐", 0), _robot_row("裴旖", 1), _robot_row("藤非", 2)]
+        p3 = [_robot_row("藤非", 0), _robot_row("小麦", 1), _robot_row("席恩", 2)]
+        f = self._flow([p0, p1, p2, p3])
+        f.ui.pos = 2                       # 模拟「恢复到列表中段」
+        names = f._collect_robot_names(max_scroll=8)
+        self.assertEqual(
+            set(names),
+            {"代柯", "尔尔", "古禹", "李宥恩", "黎小姐", "裴旖", "藤非",
+             "小麦", "席恩"})
+
+    def test_p1_stop_when_breaks_right_after_top_convergence(self):
+        # 白名单目标全部位于起点上方 → Phase 1 到顶收齐后，Phase 2 首屏
+        # 即满足 stop_when，提前停止（起点下方内容不再滚，符合语义）。
+        # 注意：起点与顶部之间的中间屏被盲滑越过未 dump，其中的非白名单
+        # 名字本就不该收（stop_when 收齐白名单即停，牺牲的是非目标名字）。
+        p0 = [_robot_row("代柯", 0), _robot_row("尔尔", 1), _robot_row("古禹", 2)]
+        p1 = [_robot_row("古禹", 0), _robot_row("李宥恩", 1), _robot_row("黎小姐", 2)]
+        p2 = [_robot_row("黎小姐", 0), _robot_row("裴旖", 1), _robot_row("藤非", 2)]
+        p3 = [_robot_row("藤非", 0), _robot_row("小麦", 1), _robot_row("席恩", 2)]
+        f = self._flow([p0, p1, p2, p3])
+        f.ui.pos = 2
+        names = f._collect_robot_names(
+            max_scroll=8, stop_when=["代柯", "李宥恩"])
+        self.assertEqual(
+            set(names), {"代柯", "尔尔", "古禹", "李宥恩", "黎小姐"})
 
 
 if __name__ == "__main__":

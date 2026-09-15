@@ -58,7 +58,17 @@ def main():
     setup_logging(cfg)
     logger = logging.getLogger("main")
 
-    ui = AdbUI(cfg["device"]["udid"])
+    # 感知层后端选择（阶段2 2026-09-15）：device.backend = adb（默认）| u2
+    # u2 = uiautomator2 3.x 设备端常驻 agent，dump 中位 94ms（adb 路径 4021ms，
+    # 探针 scripts_test/probe_u2.py 实测 42.6x）。两 backend 互斥（u2 agent
+    # 常驻会杀 adb dump），进程退出时 U2AdbUI atexit 自动 stop agent 让出通道。
+    _backend = (cfg["device"].get("backend") or "adb").lower()
+    if _backend == "u2":
+        from adb_u2 import U2AdbUI
+        ui = U2AdbUI(cfg["device"]["udid"])
+        logger.info("感知层: u2 backend（设备端 agent 常驻，dump 毫秒级）")
+    else:
+        ui = AdbUI(cfg["device"]["udid"])
     # 入口探活：设备/adb 不在线时直接退出，避免后续静默乱点兜底坐标
     if not ui.is_online():
         logger.error("设备 %s 不在线（模拟器未启动 / adb 断开），退出",

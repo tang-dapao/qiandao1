@@ -11,6 +11,14 @@ device:
   #   - 127.0.0.1:16384：MuMu 网络 adb 转发端口，需手动 `adb connect`，daemon 重启会丢
   # 实测本机 MuMu（机型模拟小米 12 / cupid）稳定入口为 emulator-5554
   udid: "emulator-5554"
+  # 感知层后端（阶段2 2026-09-15）：
+  #   adb = 原 adb uiautomator dump（默认，2.4-3.8s/次）
+  #   u2  = uiautomator2 3.x 设备端常驻 agent（实测中位 94ms，42.6x 提速）
+  # 互斥警告：u2 agent 常驻时 adb uiautomator dump 100% 被 SIGKILL(rc=137)。
+  # u2 进程退出时自动 stop agent 让出通道；若手动 kill 进程残留 agent，
+  # 执行 `py -3.13 -m uiautomator2 -s emulator-5554 stop` 或重启模拟器。
+  # 阶段1 探针：scripts_test/probe_u2.py；设备端资源安装：`py -3.13 -m uiautomator2 init -s <udid>`
+  backend: "adb"
   platform: "Android"
   platformVersion: "15.0"        # MuMu 12 = Android 15
   noReset: true                  # 不重置应用数据（保持已登录状态）

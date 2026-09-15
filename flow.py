@@ -432,12 +432,17 @@ class Flow:
         顶部 y≈201，普通联系人页 y≈434），x 范围才是稳态锚点（实测 x1=677
         x2=880）。看 selected 属性比看 y 更可靠。
         """
+        return self._robot_cat_on_nodes(self.ui.nodes())
+
+    def _robot_cat_on_nodes(self, cur) -> bool:
+        """`_robot_cat_selected` 的单快照版：在调用方给定的节点列表上判定，
+        不再自己触发 dump（P0 退台减 dump，2026-09-15）。"""
         x1_lo, x1_hi = ROBOT_CAT_X1
         x2_lo, x2_hi = ROBOT_CAT_X2
         return any(x.text in ROBOT_CAT_TEXTS and x.selected
                    and x1_lo <= x.x1 <= x1_hi
                    and x2_lo <= x.x2 <= x2_hi
-                   for x in self.ui.nodes())
+                   for x in cur)
 
     def _looks_like_robot_list(self) -> bool:
         """强判据：当前确实停留在「机器人列表视图」才返回 True。
@@ -461,11 +466,22 @@ class Flow:
           * 「发消息」：仅在落到底部操作栏(y>=FORBIDDEN_ACTION_Y，真 profile
             的按钮位置)才否决；中区/随机位置的残留视为残影**容忍**并记录日志，
             便于真机诊断。
+        P0 退台减 dump（2026-09-15）：本判据原先内部调
+        `_on_qq_main_shell()` / `_robot_cat_selected()` 各自 `ui.nodes()`，
+        加上自身的 `cur` 共 3 次 dump。而 adb_ui.nodes() 的 0.8s TTL 以
+        **dump 开始时刻**计龄，MuMu 单次 dump 实测 2.4-3.8s > TTL → 三个
+        调用**必然各自重新 dump**（实测一层校验 ≈ 7.2s，占第 2/3 层 9.9s
+        的大头）。现改为**单快照**：一次 `ui.nodes()` 取同一时刻的节点列表，
+        正信号与否决词都在同一份上判定 —— 既省 2 次 dump（≈4.8s/层），
+        也消除了"壳信号来自第 1 份 dump、选中态来自第 2 份"的跨时刻混合
+        状态（页面过渡期三个快照可能各不相同）。子判据方法保留，供其它
+        单独使用的调用点；测试经 fake ui.nodes() 驱动，逻辑等价不受影响。
         """
         cur = self.ui.nodes()
         # 先看正信号（列表的充分证据）：QQ 主壳 + 机器人分类 selected。
         # 不在列表（如 QQ 消息/联系人首页未选机器人、或 profile/聊天页）→ False。
-        if not (self._on_qq_main_shell() and self._robot_cat_selected()):
+        if not (any(x.text == CONTACTS_TAB and x.y1 >= TAB_Y for x in cur)
+                and self._robot_cat_on_nodes(cur)):
             return False
         # 正信号已在 → 仅确凿位置的任务中心/聊天页特征才否决。
         for x in cur:

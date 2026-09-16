@@ -182,7 +182,7 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
             ok = f._watch_ad_once()
         self.assertTrue(ok)
         self.assertEqual(f._tap_node.call_count, 1)        # 点了获取随机
-        f._close_ad.assert_called_once_with(tc_seen=False)
+        f._close_ad.assert_called_once_with(tc_seen=False, sheet_ok=False)
 
     def test_no_precheck_ocr_before_close_ad(self):
         # B 优化（2026-09-13）：预检移除——观看等待后不得再调
@@ -196,7 +196,7 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
             ok = f._watch_ad_once()
         self.assertTrue(ok)
         precheck.assert_not_called()
-        f._close_ad.assert_called_once_with(tc_seen=False)
+        f._close_ad.assert_called_once_with(tc_seen=False, sheet_ok=False)
 
     def test_find_row_fail_with_stuck_ad_closes_then_recovers(self):
         # 破死锁（2026-09-14 尔尔插屏事故）：find_row 首次失败 + OCR 读到
@@ -211,7 +211,7 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
             ok = f._watch_ad_once()
         self.assertTrue(ok)
         self.assertEqual(f._close_ad.call_count, 2)     # 清场 1 次 + 正常关闭 1 次
-        f._close_ad.assert_called_with(tc_seen=False)   # 末次为正常观看关闭
+        f._close_ad.assert_called_with(tc_seen=False, sheet_ok=False)   # 末次为正常观看关闭
         self.assertEqual(f._tap_node.call_count, 1)
 
     def test_find_row_fail_with_no_ad_stays_failure(self):

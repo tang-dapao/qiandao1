@@ -384,10 +384,12 @@ class Flow:
 
         根治：**只要不盲点坐标就永远命中不到它** —— banner 不在 dump，故所有基于
         真实 dump 节点的 `_tap_node` 天然安全。于是规定：**任务中心页（`_page_tc`）
-        拒绝一切坐标点击**，除非调用方显式 `trusted=True`。当前合法例外仅两处：
+        拒绝一切坐标点击**，除非调用方显式 `trusted=True`。当前合法例外仅三处：
           1. `_close_ad`：广告页左上角「关闭广告」按钮（OCR 正向定位、非盲点）；
           2. `_signin`：签到浮层内的固定按钮（浮层已由 `wait_for("每日免费领")` /
-             `_find("我知道了")` 确认在屏，且浮层在任务中心页之上、非 banner）。
+             `_find("我知道了")` 确认在屏，且浮层在任务中心页之上、非 banner）；
+          3. `_watch_signin_ad`：签到奖励广告 OCR 兜底（浮层在屏 + OCR 正向读到
+             「看广告」才放行，同 2 同理，2026-09-16）。
 
         返回是否真正执行了本次点击（被守卫拦截返回 False）。
         """
@@ -1081,6 +1083,16 @@ class Flow:
         if self._find("我知道了"):
             self._tap(*SUCCESS_KNOW, trusted=True)
         time.sleep(1.5)
+        # 签到奖励广告（2026-09-16 用户需求）：签到成功后浮层底部出现
+        # 「看广告 +⚡」→ 看一次 15s 广告拿奖励。失败只记日志不阻断；
+        # signin_ad=false 可整体回退。已签到跳过路径不会走到这里（天然 1 次/天）。
+        if self.wf.get("signin_ad", True):
+            try:
+                self._watch_signin_ad()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("签到奖励广告调用异常（不阻断主流程）：%s", e)
+        else:
+            logger.info("signin_ad=false，跳过签到奖励广告")
         # 关闭「每日免费领」浮层 ✕（F11：浮层仍在屏才点 —— 否则该坐标 (996,1143)
         # 可能落在版式漂移后的推广 banner 上。浮层已消失则跳过，不做盲点）
         if self._find("每日免费领") or self._find("恭喜获得"):
@@ -1180,6 +1192,15 @@ class Flow:
                         ratio[0], ratio[1], target)
             return True
         self._tap_node(btn)
+        return self._ad_play_and_close()
+
+    def _ad_play_and_close(self, sheet_ok: bool = False) -> bool:
+        """广告点击后的共用段（2026-09-16 从 _watch_ad_once 原样抽出）：
+        等 ad_wait_min-max 秒（E 预定位藏进等待窗）→ _close_ad → 确认。
+        _watch_ad_once 与签到奖励广告 _watch_signin_ad 复用，行为零变化。
+        sheet_ok：透传 _close_ad —— 签到奖励广告看完回到盖着「每日免费领」
+        浮层的任务中心是合法终态（默认 False，主广告路径行为不变）。
+        返回 True=广告已关闭；False=多次尝试仍未关闭。"""
         wait = random.uniform(self.wf["ad_wait_min"], self.wf["ad_wait_max"])
         logger.info("广告播放 %.1f 秒", wait)
         # E 优化（2026-09-14）：把「关闭按钮预定位」藏进等待窗口。
@@ -1206,7 +1227,7 @@ class Flow:
         # 关闭广告：关键！广告页 WebView 文字 uiautomator 读不到（会穿透读到
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
-        closed = self._close_ad(tc_seen=False)
+        closed = self._close_ad(tc_seen=False, sheet_ok=sheet_ok)
         # E 优化：预定位坐标只在本观看周期内有效，无论关闭成败一律作废，
         # 防旧坐标泄漏到后续其它 _close_ad 调用路径（残留清场等）被误消费。
         self._prefetch_close = None
@@ -1216,6 +1237,51 @@ class Flow:
         logger.info("广告已关闭，回到任务中心")
         time.sleep(self.t.get("ad_close_wait", 2.0))
         return True
+
+    def _watch_signin_ad(self) -> bool:
+        """签到浮层内的「看广告 +⚡」奖励广告（2026-09-16 用户需求）。
+
+        前提：签到成功、「我知道了」已处理、每日免费领浮层在屏。
+        找按钮：① dump 含匹配「看广告」且 y>=1600（浮层底部；y 限制避开
+        dump 穿透读到的背景任务中心行）——实测按钮文本可能带 +⚡ 后缀/拆分，
+        用子串包含而非整词；② OCR 兜底（底部区域），命中坐标点 trusted=True
+        （浮层已确认在屏，同 _signin 现有例外同理）。
+        看完复用 _ad_play_and_close()；回来若浮层仍在则关 ✕。
+        任何异常只记日志不抛出 —— 奖励广告失败不阻断签到返回值与后续
+        反馈/主广告。每台每天至多触发 1 次（挂在"真正签到"分支下）。
+        """
+        try:
+            if not (self._find("每日免费领") or self._find("恭喜获得")):
+                logger.info("签到浮层已不在屏，跳过签到奖励广告")
+                return False
+            cands = [n for n in self.ui.nodes()
+                     if "看广告" in (n.text or "") and n.y1 >= 1600]
+            btn = max(cands, key=lambda n: n.y1) if cands else None
+            if btn is not None:
+                logger.info("签到奖励广告：浮层按钮 @ (%d,%d) 文本=%r",
+                            btn.x1, btn.y1, btn.text)
+                self._tap_node(btn)
+            else:
+                pos = self._ocr_find("看广告", region=(0, 1600, 1080, 1920))
+                if pos is None:
+                    logger.info("签到浮层未找到 看广告 按钮"
+                                "（已看过或版式不同），跳过奖励广告")
+                    return False
+                logger.info("签到奖励广告：dump 未命中，OCR 命中 @ %s", pos)
+                self._tap(*pos, trusted=True)
+            ok = self._ad_play_and_close(sheet_ok=True)
+            # 看完可能回到浮层（而非任务中心）→ 浮层仍在则关 ✕（F11：在屏才点）
+            if self._find("每日免费领") or self._find("恭喜获得"):
+                self._tap(*MODAL_CLOSE, trusted=True)
+                time.sleep(1.5)
+            if ok:
+                logger.info("签到奖励广告完成")
+            else:
+                logger.warning("签到奖励广告未正常关闭（不阻断主流程）")
+            return ok
+        except Exception as e:  # noqa: BLE001
+            logger.warning("签到奖励广告异常（不阻断主流程）：%s", e)
+            return False
 
     def _read_ad_ratio(self) -> Optional[Tuple[int, int]]:
         """读「获取随机」行的 X/Y 计数（与 _ad_quota_done 同口径）。
@@ -1755,20 +1821,39 @@ class Flow:
                 fallback = cand
         return fallback
 
+    def _signin_sheet_visible(self) -> bool:
+        """签到奖励广告关闭后的合法终态：每日免费领浮层仍在屏。
+
+        浮层开着 = 已从广告回到任务中心（浮层盖在 TC 之上），只是浮层未关
+        —— 此时 OCR 读不到被浮层遮住的任务中心特征词，_back_at_taskcenter
+        会误判"未关闭"（2026-09-16 14:18 代柯实测：E1 直关其实已生效，
+        确认链不认浮层 → BACK×3 退穿到联系人列表）。u2 dump 毫秒级，代价可忽略。
+        """
+        try:
+            return bool(self._find("每日免费领") or self._find("恭喜获得"))
+        except Exception:
+            return False
+
     def _confirm_direct_close(self, timeout: Optional[float],
-                              retries: int = 0, gap: float = 1.2) -> bool:
+                              retries: int = 0, gap: float = 1.2,
+                              sheet_ok: bool = False) -> bool:
         """直关 tap 后确认已回任务中心；带沉降重试（P5，2026-09-12）。
 
         首次 `_back_at_taskcenter` 失败大概率是关闭动画/任务中心重载尚未结束
         （OCR 先验读不到特征词、dump 撞超时），并不代表 tap 没生效 —— 21:00 场
         33/33 误判实锤。重试时先睡 gap 秒让页面沉降，再确认一次；全部失败才
         返回 False（此时才值得走 Badcase 巡检 + 兜底）。
+
+        sheet_ok（2026-09-16）：True 时接受「每日免费领浮层在屏」为成功 ——
+        仅签到奖励广告路径使用（看完广告回到盖着浮层的任务中心是合法终态）。
         """
-        if self._back_at_taskcenter(timeout=timeout):
+        if self._back_at_taskcenter(timeout=timeout) or (
+                sheet_ok and self._signin_sheet_visible()):
             return True
         for _ in range(max(0, retries)):
             time.sleep(gap)
-            if self._back_at_taskcenter(timeout=timeout):
+            if self._back_at_taskcenter(timeout=timeout) or (
+                    sheet_ok and self._signin_sheet_visible()):
                 return True
         return False
 
@@ -1804,7 +1889,8 @@ class Flow:
         logger.info("[计时] %s %.1fs", tag, now - t0)
         return now
 
-    def _close_ad(self, max_tries: int = 6, tc_seen: bool = False) -> bool:
+    def _close_ad(self, max_tries: int = 6, tc_seen: bool = False,
+                  sheet_ok: bool = False) -> bool:
         """主动关闭广告。
 
         **F8（2026-09-10 修复「盲点误点 banner」）**：所有坐标点击一律由
@@ -1875,7 +1961,8 @@ class Flow:
                 self._prefetch_close = None      # 快检路径已消费
                 if self._confirm_direct_close(ad_close_dump_timeout,
                                               ad_close_confirm_retries,
-                                              ad_close_confirm_gap):
+                                              ad_close_confirm_gap,
+                                              sheet_ok=sheet_ok):
                     logger.info("广告已关闭（顶条快检直关路径）")
                     return True
                 logger.info("快检直关未生效，巡检一次 Badcase/AI 好友后走兜底")
@@ -1920,7 +2007,8 @@ class Flow:
             time.sleep(ad_close_settle)
             if self._confirm_direct_close(ad_close_dump_timeout,
                                           ad_close_confirm_retries,
-                                          ad_close_confirm_gap):
+                                          ad_close_confirm_gap,
+                                          sheet_ok=sheet_ok):
                 logger.info("广告已关闭（预定位直关路径）")
                 return True
             logger.info("预定位直关未生效，巡检一次 Badcase/AI 好友后走兜底")
@@ -1937,7 +2025,8 @@ class Flow:
             time.sleep(ad_close_settle)
             if self._confirm_direct_close(ad_close_dump_timeout,
                                           ad_close_confirm_retries,
-                                          ad_close_confirm_gap):
+                                          ad_close_confirm_gap,
+                                          sheet_ok=sheet_ok):
                 logger.info("广告已关闭（uiautomator 直关路径）")
                 return True
             logger.info("uiautomator 直关未生效，巡检一次 Badcase/AI 好友后走兜底")
@@ -1963,7 +2052,8 @@ class Flow:
             time.sleep(ad_close_settle)
             if self._confirm_direct_close(ad_close_dump_timeout,
                                           ad_close_confirm_retries,
-                                          ad_close_confirm_gap):
+                                          ad_close_confirm_gap,
+                                          sheet_ok=sheet_ok):
                 logger.info("广告已关闭（OCR 直关路径）")
                 return True
             logger.info("OCR 直关未生效（%s），巡检一次 Badcase/AI 好友后走兜底", pos)

@@ -18,7 +18,7 @@ device:
   # u2 进程退出时自动 stop agent 让出通道；若手动 kill 进程残留 agent，
   # 执行 `py -3.13 -m uiautomator2 -s emulator-5554 stop` 或重启模拟器。
   # 阶段1 探针：scripts_test/probe_u2.py；设备端资源安装：`py -3.13 -m uiautomator2 init -s <udid>`
-  backend: "adb"
+  backend: "u2"
   platform: "Android"
   platformVersion: "15.0"        # MuMu 12 = Android 15
   noReset: true                  # 不重置应用数据（保持已登录状态）
@@ -43,6 +43,17 @@ workflow:
   # 广告观看间隔 CD（秒）（F10：单次任务中心会话内连看广告的原地等待间隔，
   # 与旧“逐次进出”轮转保持相同的观看节奏，防风控）
   ad_cooldown: 60
+  # 广告阶段模式（2026-09-16）：false=同机连看（旧行为，每台进台一次按 CD
+  # 连看 target 支，~89s/支）；true=组制轮询——机器人按 ad_rotate_group
+  # （默认 3）台一组跨台轮换，每台每轮看 1 支，靠切换吸收 CD（u2 实测
+  # ~48-49s/支）。--rotate 命令行可强制开启。默认 false 不改变现有 bat 行为。
+  ad_rotate: false
+  # 组制轮询每组台数（10 台全量推荐 3：3/3/3/1 分组，1 台组自动回落连看）
+  ad_rotate_group: 3
+  # 签到奖励广告（2026-09-16）：签到成功后浮层内「看广告 +⚡」按钮 → 看一次
+  # 15s 广告拿奖励。true=开启（仅当日真正签到时触发，已签到跳过）；失败只记
+  # 日志不阻断签到/反馈/主广告。false=回退旧行为（不看奖励广告）。
+  signin_ad: true
   # 广告关闭重试轮数（广告时长不固定，播完才出现关闭按钮，需轮询）
   ad_close_retries: 12
   # F6（2026-09-10）：第 4 步"盲点超限改物理 BACK"的连续 BACK 次数上限。

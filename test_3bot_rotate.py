@@ -180,6 +180,101 @@ class TestThreeBotRotationQuota(ThreeBotRotationBase):
 # ----------------------------------------------------------------------
 # 额外：验证 3 台轮换在"签到/反馈关闭（--ad-only）"下直入看广告的调用面
 # ----------------------------------------------------------------------
+class TestRotateGroupMode(ThreeBotRotationBase):
+    """组制轮询模式（2026-09-16）：run_all(..., rotate=True, group=3)。
+
+    语义：
+    - 剩余机器人按 group 台一组；组内 R1→R2→R3→R1 循环，每台每轮看 1 支；
+    - 配额满（进程内累计或首访屏幕基数校准）即移出，组动态缩员；
+    - 组内剩 1 台 → 回落 _watch_ads_session 同机连看（CD 等待语义）；
+    - 单台连败 3 次弃权，不影响其他台；
+    - 签到会话内首轮广告成功（run_robot 返回 2）计入 done，不重复看。
+    """
+
+    def test_three_bots_round_robin_two_ads_each(self):
+        # 3 台 × 2 支：pass1 R1,R2,R3 → pass2 R1,R2,R3 → 全部配额满
+        self.f.run_all(ROBOTS_3, False, False, 2, rotate=True, group=3)
+        self.assertEqual(self.f._enter_taskcenter.call_count, 6)
+        self.assertEqual(self.f._watch_ad_once.call_count, 6)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 6)
+        # 跨台交错顺序：R1,R2,R3,R1,R2,R3
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        self.assertEqual(names, ["R1", "R2", "R3", "R1", "R2", "R3"])
+
+    def test_group_partition_and_lone_robot_fallback(self):
+        # 4 台 group=3 → 组1 [R1,R2,R3] 轮换；组2 [R4] 回落连看会话
+        # target=1：组1 各看 1 支即满；R4 走 _watch_ads_session 看 1 支。
+        self.f.run_all(["R1", "R2", "R3", "R4"], False, False, 1,
+                       rotate=True, group=3)
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        self.assertEqual(names, ["R1", "R2", "R3", "R4"])
+        self.assertEqual(self.f._watch_ad_once.call_count, 4)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 4)
+
+    def test_lone_robot_group_uses_session_path(self):
+        # 单台也走组制（1 台组直接回落连看）：target=2 → 会话内连看 2 支
+        self.f.run_all(["R1"], False, False, 2, rotate=True, group=3)
+        self.assertEqual(self.f._enter_taskcenter.call_count, 1)
+        self.assertEqual(self.f._watch_ad_once.call_count, 2)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 1)
+
+    def test_quota_calibration_removes_robot_without_watching(self):
+        # 首访屏幕基数校准：R1 屏幕 10/10 → 基数 10 → 移出，不看；R2/R3 照常
+        calls = {"n": 0}
+
+        def fake_ratio():
+            calls["n"] += 1
+            return (10, 10) if calls["n"] == 1 else None   # 第 1 次读屏=R1 首访
+        self.f._read_ad_ratio = mock.Mock(side_effect=fake_ratio)
+        self.f.run_all(ROBOTS_3, False, False, 1, rotate=True, group=3)
+        # R1 校准后移出（进 1 退 1 不看），R2/R3 各看 1 支
+        self.assertEqual(self.f._watch_ad_once.call_count, 2)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 3)
+
+    def test_three_strikes_drops_robot_others_continue(self):
+        # 全员看广告失败：每轮每人 fail+1，3 轮后全部弃权（3 台 × 3 次 = 9）
+        self.f._watch_ad_once = mock.Mock(return_value=False)
+        self.f.run_all(ROBOTS_3, False, False, 1, rotate=True, group=3)
+        self.assertEqual(self.f._watch_ad_once.call_count, 9)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 9)
+
+    def test_attrition_two_remain_after_one_fills(self):
+        # R1 首访校准屏幕 9/10（target=2）→ 日配额只剩 1 → 看 1 支后移出；
+        # R2/R3 不受限轮换各看 2 支
+        calls = {"n": 0}
+
+        def fake_ratio():
+            calls["n"] += 1
+            return (9, 10) if calls["n"] == 1 else None   # 第 1 次读屏=R1 首访
+        self.f._read_ad_ratio = mock.Mock(side_effect=fake_ratio)
+        self.f.run_all(ROBOTS_3, False, False, 2, rotate=True, group=3)
+        self.assertEqual(self.f._watch_ad_once.call_count, 5)   # R1×1 + R2/R3×2
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        self.assertEqual(names.count("R1"), 1)   # R1 只进台 1 次（看满即移出）
+
+    def test_first_ad_credit_reduces_rotation_target(self):
+        # 签到会话首轮广告成功（run_robot 返回 2）→ 记 1 支，轮换只补 1 支
+        self.f.run_robot = mock.Mock(return_value=2)
+        self.f.run_all(ROBOTS_3, True, True, 2, rotate=True, group=3)
+        self.assertEqual(self.f._watch_ad_once.call_count, 3)   # 每台补 1 支
+        # 首轮失败（返回 1）→ 轮换每台补满 2 支
+        self.f2 = Flow.__new__(Flow)
+        self.f2._init_cache_state()
+        self.f2.wf = {"ad_times_per_robot": 10, "ad_cooldown": 0}
+        self.f2.t = {"click_min": 1.5, "click_max": 3.0}
+        self.f2.run_robot = mock.Mock(return_value=1)
+        self.f2._enter_taskcenter = mock.Mock(return_value=True)
+        self.f2._watch_ad_once = mock.Mock(return_value=True)
+        self.f2._exit_taskcenter = mock.Mock()
+        self.f2._ad_quota_done = mock.Mock(return_value=False)
+        self.f2._dismiss_badcase = mock.Mock()
+        self.f2._find_row = mock.Mock(return_value=None)
+        self.f2._safe_back_to_robot_list = mock.Mock(return_value=True)
+        self.f2._read_ad_ratio = mock.Mock(return_value=None)
+        self.f2.run_all(ROBOTS_3, True, True, 2, rotate=True, group=3)
+        self.assertEqual(self.f2._watch_ad_once.call_count, 6)  # 每台补 2 支
+
+
 class TestThreeBotAdOnlyMapping(ThreeBotRotationBase):
     """--ad-only：不逐台空进出（run_robot 不调用），直接进入 3 台看广告轮询。"""
 

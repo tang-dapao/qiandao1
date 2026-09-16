@@ -7,6 +7,7 @@
   python main.py --no-signin --no-feedback     # 关闭签到/反馈（只看广告）
   python main.py --ad-times 5                  # 每台机器人看广告次数（默认取 config.yaml）
   python main.py --ad-only                     # 只看广告（跳过签到反馈）
+  python main.py --rotate                     # 签到+反馈+组制轮询看广告
   python main.py --no-ad                       # 不看广告（只签到+反馈，等价 --ad-times 0）
 """
 import argparse
@@ -50,6 +51,10 @@ def main():
     parser.add_argument("--ad-only", action="store_true",
                         help="只看广告（跳过签到和反馈）")
     parser.add_argument("--ad-times", type=int, help="每台机器人看广告次数")
+    parser.add_argument("--rotate", action="store_true",
+                        help="看广告改为组制轮询（机器人按组跨台轮换，每组"
+                             " ad_rotate_group 台；覆盖 config workflow."
+                             "ad_rotate）")
     parser.add_argument("--no-ad", action="store_true",
                         help="不看广告（等价 --ad-times 0）")
     args = parser.parse_args()
@@ -126,10 +131,18 @@ def main():
         logger.warning("--no-ad 与 --ad-only 同时指定：不看广告且不签到/反馈，"
                        "结果为空跑 —— 请检查启动脚本参数是否写错")
 
-    logger.info("开始全自动流程: 签到=%s 反馈=%s 看广告次数=%s",
+    # 看广告模式（2026-09-16）：rotate=组制轮询（每组 ad_rotate_group 台跨台
+    # 轮换，每台每轮 1 支，靠切换吸收 CD，u2 实测 ~48-49s/支 vs 连看 ~89s）；
+    # false=同机连看（旧行为）。--rotate 强制开启，否则取 config
+    # workflow.ad_rotate（默认 false，现有 watch_ad.bat 行为零变化）。
+    rotate = args.rotate or bool(cfg["workflow"].get("ad_rotate") or False)
+    group = int(cfg["workflow"].get("ad_rotate_group") or 3)
+    logger.info("开始全自动流程: 签到=%s 反馈=%s 看广告次数=%s 模式=%s",
                 do_signin, do_feedback,
-                ad_times if ad_times is not None else "默认")
-    flow.run_all(robots, do_signin, do_feedback, ad_times)
+                ad_times if ad_times is not None else "默认",
+                ("组制轮询(每组%d台)" % group) if rotate else "同机连看")
+    flow.run_all(robots, do_signin, do_feedback, ad_times,
+                 rotate=rotate, group=group)
     logger.info("全自动流程结束")
 
 

@@ -2048,6 +2048,10 @@ class Flow:
         顺手看 1 次广告，剩余次数交阶段二轮转按配额补足 —— 每台省一次完整任务
         中心进出（实测 70-95s）。失败只记日志不重试（轮转阶段会补看），不影响
         run_robot 的成功返回值。
+
+        返回值（2026-09-16 编码化，rotate 阶段记账用）：0=进台失败（falsy，
+        兼容旧 False）；1=处理完成但首轮广告未看或失败；2=处理完成且首轮
+        广告成功。真值语义与旧 bool 完全兼容（既有 assertTrue 不受影响）。
         """
         logger.info("==== 处理机器人: %s ====", name)
         # F4/F8：进入失败不再直接放弃 —— 失败后 _safe_back_to_robot_list 复位
@@ -2063,7 +2067,7 @@ class Flow:
             self._safe_back_to_robot_list()
         if not entered:
             logger.error("进入任务中心失败 %s（重试 3 次后仍失败），跳过", name)
-            return False
+            return 0
         # A3（2026-09-10）：进入任务中心后先清理可能残留/即将弹出的 Badcase
         # 问卷 —— 00:34 全量验证实锤：_feedback 操作中途 Badcase H5 会弹出
         # （腾讯问卷完整正文），若不清掉，_signin/_feedback 的 dump 穿透误判
@@ -2083,17 +2087,21 @@ class Flow:
         # 首轮广告（2026-09-10）：签到/反馈完成后不退出，同会话先看 1 次。
         # 看前按 A3 同款巡检一次 —— 签到/反馈操作后 QQ 可能推送 Badcase 问卷
         # （坑 8：00:34 实测操作中途弹出），不清掉会让 _find_row 空转计失败。
+        first_ad_ok = False
         if first_ad:
             self._dismiss_badcase()
             if self._watch_ad_once():
+                first_ad_ok = True
                 logger.info("%s 首轮广告完成（剩余次数进入轮转阶段补看）", name)
             else:
                 logger.warning("%s 首轮广告失败（进入轮转阶段补看）", name)
         self._exit_taskcenter()
-        return True
+        # 编码返回（见 docstring）：0=进台失败；1=完成无首轮/首轮失败；2=首轮成功
+        return 2 if first_ad_ok else 1
 
     def run_all(self, robots: List[str], do_signin: bool, do_feedback: bool,
-                ad_times: Optional[int]):
+                ad_times: Optional[int], rotate: bool = False,
+                group: int = 3):
         target = ad_times if ad_times is not None else self.wf.get(
             "ad_times_per_robot", 10)
         cd = self.wf.get("ad_cooldown", 60)
@@ -2103,11 +2111,16 @@ class Flow:
         # 空进出 ~70-95s，4 台广告开跑前先白跑 5-6 分钟），故这里跳过。
         # 首轮广告（2026-09-10 用户优化）：target>0 时每台在签到/反馈的同一
         # 会话里先看 1 次广告，剩余次数由下方轮转阶段补足。
+        # 首轮广告记账（2026-09-16 rotate 用）：run_robot 返回 2 = 签到会话内
+        # 首轮广告已成功看掉 1 支。ad-only 直入时没有首轮，全部记 0。
+        first_done = {name: 0 for name in robots}
         if do_signin or do_feedback:
             for name in robots:
                 try:
-                    self.run_robot(name, do_signin, do_feedback,
-                                   first_ad=target > 0)
+                    r = self.run_robot(name, do_signin, do_feedback,
+                                       first_ad=target > 0)
+                    if r == 2:
+                        first_done[name] = 1
                 except Exception as e:  # noqa: BLE001
                     logger.error("处理 %s 出错: %s", name, e)
         else:
@@ -2117,98 +2130,232 @@ class Flow:
             logger.info("看广告次数为 0，跳过看广告轮转")
             return
 
-        # 看广告（F10 结构优化 2026-09-09）：单次任务中心会话连看多次广告。
-        # 旧实现"每看 1 次广告进出一次任务中心"——实测单次进出 ~68-71s，
-        # 单台 10 次光进出 ~11min，全量(10台×10次)约 3.1h，且已看完的
-        # 机器人还会被反复进出空转 ~110s/次 ×10。现改为：每台进一次任务
-        # 中心，会话内按 ad_cooldown 间隔原地连看，直至目标次数/失败上限
-        # 才退出 —— 进出开销摊薄到整轮（全量预估降至 ~2h）。
-        max_fail = 3
+        if rotate:
+            self._run_rotate_phase(robots, first_done, target, group)
+            return
+
+        # 顺序连看路径（F10 结构优化 2026-09-09，行为不变）：单次任务中心
+        # 会话连看多次广告 —— 旧实现"每看 1 次广告进出一次任务中心"实测
+        # 单次进出 ~68-71s。逻辑抽入 _watch_ads_session（rotate 模式 1 台
+        # 回落复用同一路径），run_all 内只保留调度。
         for name in robots:
-            done, fail = 0, 0
-            # 进入任务中心（最多 3 次尝试，语义同 run_robot 签到/反馈段；
-            # 旧轮转对进入失败仅 fail+1 后轮换，实为跨轮重访，等效）。
-            entered = False
-            for attempt in (1, 2, 3):
-                if self._enter_taskcenter(name):
-                    entered = True
-                    break
-                logger.warning("进入任务中心失败 %s（第 %d/3 次），复位后重试",
-                               name, attempt)
-                self._safe_back_to_robot_list()
-                time.sleep(1.0)
-            if not entered:
-                logger.error("进入任务中心失败 %s（3 次仍失败），跳过其看广告",
-                             name)
-                continue
-            # 会话内首检：X/10 已达配额（跨进程残留/手动已看完）→ 直接退出，
-            # 不再空耗（修掉旧实现会在已完成机器人上空转 ~110s/次×10 的隐患）。
-            # 同一次读屏顺带拿到「进台基数」：后续配额收尾用算术预判，不必
-            # 每次看完都读屏（见循环内注释）。
-            # 首检前先清场（2026-09-10）：问卷 H5 盖屏时行读不到会保守判"未满"，
-            # 导致满额机器人空转三连败（18:22 代柯实测 4m52s 全失败）。
-            self._dismiss_badcase()
-            quota_target = int(self.wf.get("ad_times_per_robot", 10))
-            entry_ratio = self._read_ad_ratio()
-            if entry_ratio and entry_ratio[0] >= quota_target:
-                logger.info("%s 看广告已达每日配额，本会话直接退出", name)
-                self._exit_taskcenter()
-                continue
-            first_iter = True     # D 优化：首轮 dismiss 在循环顶；后续挪进 CD 窗口
-            pre_row = None        # CD 窗口预取的行节点（一次性使用，用过即弃）
-            while done < target and fail < max_fail:
-                # L3：每轮看广告前先巡检 Badcase 问卷并清除 —— 上一轮广告
-                # 关闭后 ~35-40s QQ 可能延迟弹出腾讯问卷 H5，若不清掉，
-                # _watch_ad_once 的 dump 会穿透读到背景任务中心造成误判。
-                # D 优化（2026-09-13）：首轮在此清场；后续各轮的 dismiss 挪进
-                # CD 窗口内（见下方 CD 段），与配额复核/行预取一起吸收进等待期。
-                if first_iter:
-                    self._dismiss_badcase()
-                    first_iter = False
-                ok = self._watch_ad_once(row=pre_row)
-                pre_row = None
-                if not ok:
-                    fail += 1
-                    logger.warning("%s 看广告失败，累计失败 %d/%d",
-                                   name, fail, max_fail)
-                    time.sleep(1.0)
-                    continue
-                t_close = time.time()   # CD 起点：广告关闭时刻（2026-09-10 用户优化）
-                done += 1
-                fail = 0
-                logger.info("%s 本会话已看 %d/%d 次广告", name, done, target)
-                if done >= target:
-                    break
-                # 算术收尾（进台基数 + 本会话已看 >= 每日配额 → 必满）：
-                # 不读屏、不等 CD，直接退出。省掉旧实现"每次看完读屏复核"
-                # 在刚关广告的重载动画期必然 dump 超时的 ~40s 空等（审计 C2，
-                # 18:02 实测两次复核烧 43s 串行加在 CD 前）。
-                if (entry_ratio is not None
-                        and entry_ratio[0] + done >= quota_target):
-                    logger.info("%s 看广告已达每日配额（进台 %d/10 + 本会话 %d 次），"
-                                "提前收尾", name, entry_ratio[0], done)
-                    break
-                # 会话内 CD 从关闭时刻起算：配额复核挪进 CD 窗口末尾
-                # （cd-10s 处，页面已稳定 dump 不再超时）——校验耗时与 CD
-                # 重叠，不再串行累加（用户 2026-09-10 提出）。
-                wake = t_close + cd
-                lead = 10.0
-                logger.info("%s 广告 CD %.0f 秒（从关闭起算，留在任务中心）",
-                            name, cd)
-                time.sleep(max(0.0, wake - lead - time.time()))
-                # D 优化（2026-09-13）：dismiss/配额复核/行预取全部挪进 CD 窗口
-                # —— 原顺序把 dismiss(OCR ~1.5s) 和 find_row 全量 dump(~5.5s)
-                # 都排在 CD 之后纯串行（实测 708/708 次点开段 ≥5s，均值 7.2s）。
-                # 顺序要求：dismiss 必须在预取之前（BACK 清 overlay 会使预取行失效）。
-                self._dismiss_badcase()
-                # 配额复核（手动/并发补看完成 → 收尾退出；读不到=保守继续）
-                if self._ad_quota_done():
-                    break
-                # 行预取：复用配额复核刚写入的 nodes 缓存（TTL 0.8s 内，~0 成本）；
-                # 读不到（dump 超时等）= None → _watch_ad_once 现场重新查找兜底。
-                pre_row = self._find_row("看广告", alt_labels=("获取随机",))
-                time.sleep(max(0.0, wake - time.time()))
-            self._exit_taskcenter()
-            logger.info("%s 看广告结束（本会话 %d/%d，失败 %d）",
-                        name, done, target, fail)
+            self._watch_ads_session(name, target, cd, start_done=0)
         logger.info("所有机器人看广告完成")
+
+    # ----------------------------------------------------------
+    # 组制轮询看广告（2026-09-16 用户需求，rotate 模式）
+    # ----------------------------------------------------------
+    def _quota_left(self, s: dict, target: int, quota_target: int) -> int:
+        """rotate 记账：单台剩余可看支数 = min(本次目标进度, 屏幕日配额)。
+        - 本次目标进度 = target - done（done 含签到首轮广告）；
+        - base=首访屏幕基数校准（r[0]-done，None=未读到）：屏幕口径剩余 =
+          quota_target - base - done（覆盖手动补看/多进程场景）；
+        - 未校准时只用本次目标进度（与顺序模式同口径）。"""
+        left = target - s["done"]
+        if s["base"] is not None:
+            left = min(left, quota_target - s["base"] - s["done"])
+        return max(0, left)
+
+    def _watch_ads_session(self, name: str, target: int, cd: float,
+                           start_done: int = 0) -> int:
+        """单机连看会话（F10 语义）：进一次任务中心（最多 3 次尝试），会话
+        内按 ad_cooldown 间隔原地连看，直至 target 支 / 失败上限 / 达每日
+        配额，最后退一次。
+
+        start_done：进台前进程内已看支数。顺序模式恒 0（行为与旧内联版完全
+        一致）；rotate 1 台回落时传首轮+轮换已看数 —— 算术收尾与 while 边界
+        均按 done-start_done 修正（entry_ratio 是屏幕快照，已含 start_done）。
+        返回本会话新看支数；进台失败返回 0。
+        """
+        max_fail = 3
+        done, fail = start_done, 0
+        # 进入任务中心（最多 3 次尝试，语义同 run_robot 签到/反馈段；
+        # 旧轮转对进入失败仅 fail+1 后轮换，实为跨轮重访，等效）。
+        entered = False
+        for attempt in (1, 2, 3):
+            if self._enter_taskcenter(name):
+                entered = True
+                break
+            logger.warning("进入任务中心失败 %s（第 %d/3 次），复位后重试",
+                           name, attempt)
+            self._safe_back_to_robot_list()
+            time.sleep(1.0)
+        if not entered:
+            logger.error("进入任务中心失败 %s（3 次仍失败），跳过其看广告",
+                         name)
+            return 0
+        # 会话内首检：X/10 已达配额（跨进程残留/手动已看完）→ 直接退出，
+        # 不再空耗（修掉旧实现会在已完成机器人上空转 ~110s/次×10 的隐患）。
+        # 同一次读屏顺带拿到「进台基数」：后续配额收尾用算术预判，不必
+        # 每次看完都读屏（见循环内注释）。
+        # 首检前先清场（2026-09-10）：问卷 H5 盖屏时行读不到会保守判"未满"，
+        # 导致满额机器人空转三连败（18:22 代柯实测 4m52s 全失败）。
+        self._dismiss_badcase()
+        quota_target = int(self.wf.get("ad_times_per_robot", 10))
+        entry_ratio = self._read_ad_ratio()
+        if entry_ratio and entry_ratio[0] >= quota_target:
+            logger.info("%s 看广告已达每日配额，本会话直接退出", name)
+            self._exit_taskcenter()
+            return done - start_done
+        first_iter = True     # D 优化：首轮 dismiss 在循环顶；后续挪进 CD 窗口
+        pre_row = None        # CD 窗口预取的行节点（一次性使用，用过即弃）
+        while done < target and fail < max_fail:
+            # L3：每轮看广告前先巡检 Badcase 问卷并清除 —— 上一轮广告
+            # 关闭后 ~35-40s QQ 可能延迟弹出腾讯问卷 H5，若不清掉，
+            # _watch_ad_once 的 dump 会穿透读到背景任务中心造成误判。
+            # D 优化（2026-09-13）：首轮在此清场；后续各轮的 dismiss 挪进
+            # CD 窗口内（见下方 CD 段），与配额复核/行预取一起吸收进等待期。
+            if first_iter:
+                self._dismiss_badcase()
+                first_iter = False
+            ok = self._watch_ad_once(row=pre_row)
+            pre_row = None
+            if not ok:
+                fail += 1
+                logger.warning("%s 看广告失败，累计失败 %d/%d",
+                               name, fail, max_fail)
+                time.sleep(1.0)
+                continue
+            t_close = time.time()   # CD 起点：广告关闭时刻（2026-09-10 用户优化）
+            done += 1
+            fail = 0
+            logger.info("%s 本会话已看 %d/%d 次广告", name, done, target)
+            if done >= target:
+                break
+            # 算术收尾（进台基数 + 本会话已看 >= 每日配额 → 必满）：
+            # 不读屏、不等 CD，直接退出。省掉旧实现"每次看完读屏复核"
+            # 在刚关广告的重载动画期必然 dump 超时的 ~40s 空等（审计 C2，
+            # 18:02 实测两次复核烧 43s 串行加在 CD 前）。
+            # 注：done 含 start_done 而 entry_ratio 屏幕快照同样含之，
+            # 会话内净看数 = done - start_done，避免重复计数提前收尾。
+            if (entry_ratio is not None
+                    and entry_ratio[0] + done - start_done >= quota_target):
+                logger.info("%s 看广告已达每日配额（进台 %d/10 + 本会话 %d 次），"
+                            "提前收尾", name, entry_ratio[0],
+                            done - start_done)
+                break
+            # 会话内 CD 从关闭时刻起算：配额复核挪进 CD 窗口末尾
+            # （cd-10s 处，页面已稳定 dump 不再超时）——校验耗时与 CD
+            # 重叠，不再串行累加（用户 2026-09-10 提出）。
+            wake = t_close + cd
+            lead = 10.0
+            logger.info("%s 广告 CD %.0f 秒（从关闭起算，留在任务中心）",
+                        name, cd)
+            time.sleep(max(0.0, wake - lead - time.time()))
+            # D 优化（2026-09-13）：dismiss/配额复核/行预取全部挪进 CD 窗口
+            # —— 原顺序把 dismiss(OCR ~1.5s) 和 find_row 全量 dump(~5.5s)
+            # 都排在 CD 之后纯串行（实测 708/708 次点开段 ≥5s，均值 7.2s）。
+            # 顺序要求：dismiss 必须在预取之前（BACK 清 overlay 会使预取行失效）。
+            self._dismiss_badcase()
+            # 配额复核（手动/并发补看完成 → 收尾退出；读不到=保守继续）
+            if self._ad_quota_done():
+                break
+            # 行预取：复用配额复核刚写入的 nodes 缓存（TTL 0.8s 内，~0 成本）；
+            # 读不到（dump 超时等）= None → _watch_ad_once 现场重新查找兜底。
+            pre_row = self._find_row("看广告", alt_labels=("获取随机",))
+            time.sleep(max(0.0, wake - time.time()))
+        self._exit_taskcenter()
+        logger.info("%s 看广告结束（本会话 %d/%d，失败 %d）",
+                    name, done, target, fail)
+        return done - start_done
+
+    def _run_rotate_phase(self, robots: List[str], first_done: dict,
+                          target: int, group: int) -> None:
+        """组制轮询看广告（2026-09-16 用户需求）。
+
+        剩余机器人按 group（默认 3）台一组；组内循环 R1→R2→R3→R1... 每台
+        每轮看 1 支，靠切换吸收 CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）。
+        - 某台配额满（进程内累计或首访屏幕基数校准）即移出循环；
+        - 组内动态缩员：剩 2 台继续轮换，剩 1 台回落 _watch_ads_session 连看；
+        - 单台连续失败 max_fail(3) 次弃权，不影响组内其他机器人；
+        - 首轮广告（签到会话内）成败由 first_done 记账，不重复看。
+        """
+        max_fail = 3
+        quota_target = int(self.wf.get("ad_times_per_robot", 10))
+        cd = self.wf.get("ad_cooldown", 60)
+        st = {n: {"done": int(first_done.get(n) or 0), "fail": 0, "base": None}
+              for n in robots}
+        pending = [n for n in robots
+                   if self._quota_left(st[n], target, quota_target) > 0]
+        if not pending:
+            logger.info("轮换阶段：所有机器人配额已满，无待看广告")
+            return
+        if group <= 0:
+            group = 3
+        groups = [pending[i:i + group] for i in range(0, len(pending), group)]
+        logger.info("轮换阶段：%d 台待看，分 %d 组（每组 %d 台），日配额 %d",
+                    len(pending), len(groups), group, quota_target)
+        total = 0
+        for gi, grp in enumerate(groups, 1):
+            logger.info("===== 广告轮换组 %d/%d（%d 台）：%s =====",
+                        gi, len(groups), len(grp), grp)
+            while True:
+                active = [n for n in grp
+                          if self._quota_left(st[n], target, quota_target) > 0
+                          and st[n]["fail"] < max_fail]
+                if not active:
+                    break
+                if len(active) == 1:
+                    name = active[0]
+                    logger.info("%s 组内仅剩 1 台，回落同机连看（CD 等待语义）",
+                                name)
+                    d = self._watch_ads_session(name, target, cd,
+                                                start_done=st[name]["done"])
+                    st[name]["done"] += d
+                    total += d
+                    break
+                for name in active:
+                    total += self._rotate_watch_once(
+                        name, st, target, quota_target, max_fail)
+        for n in robots:
+            s = st[n]
+            if (s["fail"] >= max_fail
+                    and self._quota_left(s, target, quota_target) > 0):
+                logger.warning("%s 连败 %d 次弃权，剩余 %d 支未看",
+                               n, max_fail,
+                               self._quota_left(s, target, quota_target))
+        logger.info("轮换阶段完成：本进程共看 %d 支广告", total)
+
+    def _rotate_watch_once(self, name: str, st: dict, target: int,
+                           quota_target: int, max_fail: int) -> int:
+        """轮换组内单台看 1 支：进台（3 试）→ 清问卷 → 首访校准基数 →
+        看 1 支 → 退台。返回本次新看支数（0/1）；失败计入 st[name]["fail"]。"""
+        s = st[name]
+        entered = False
+        for attempt in (1, 2, 3):
+            if self._enter_taskcenter(name):
+                entered = True
+                break
+            logger.warning("轮换进台失败 %s（第 %d/3 次），复位后重试",
+                           name, attempt)
+            self._safe_back_to_robot_list()
+            time.sleep(1.0)
+        if not entered:
+            logger.error("轮换：进台失败 %s（3 次），本组弃权", name)
+            s["fail"] = max_fail
+            return 0
+        try:
+            self._dismiss_badcase()
+            # 首访基数校准：屏幕 X/10 已包含本轮进程看过的（含签到首轮广告）
+            if s["base"] is None:
+                r = self._read_ad_ratio()
+                if r:
+                    s["base"] = max(0, r[0] - s["done"])
+                    logger.info("%s 进台基数校准：屏幕 %d/%d（进程内已看 %d）",
+                                name, r[0], r[1], s["done"])
+            if self._quota_left(s, target, quota_target) <= 0:
+                logger.info("%s 已达每日配额，移出轮换", name)
+                return 0
+            if self._watch_ad_once():
+                s["done"] += 1
+                s["fail"] = 0
+                base = s["base"] or 0
+                logger.info("%s 轮换看广告 +1（今日 %d/%d）",
+                            name, base + s["done"], quota_target)
+                return 1
+            s["fail"] += 1
+            logger.warning("%s 轮换看广告失败，累计失败 %d/%d",
+                           name, s["fail"], max_fail)
+            return 0
+        finally:
+            self._exit_taskcenter()

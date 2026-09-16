@@ -1,9 +1,12 @@
 # QQ 机器人自动签到 + 问题反馈 + 看广告工具
 
-在 Windows + **MuMu 12 模拟器**上，通过 **adb + uiautomator（优先）+ OCR 兜底**驱动 QQ 中机器人「任务中心」，
-自动执行 **每日签到 / 问题反馈领取 / 看广告**。
+在 Windows + **MuMu 12 模拟器**上，通过 **uiautomator2 常驻 agent（u2，当前后端）+ adb uiautomator dump（旧后端）+ OCR 兜底**
+驱动 QQ 中机器人「任务中心」，自动执行 **每日签到 / 签到奖励广告 / 问题反馈领取 / 看广告**。
 
-> 技术栈已从旧 Appium 框架迁移为 adb 直连方案（详见「废弃代码」一节）。
+> 技术栈已从旧 Appium 框架迁移为 adb 直连方案（详见「废弃代码」一节）；
+> 2026-09-16 感知层升级为 u2 backend（`device.backend: "u2"`，dump 中位 94ms vs adb 2.4-3.8s = 42.6x）。
+> **感知互斥**：u2 agent 常驻时 adb dump 100% rc=137 —— 后端只能整体切换，禁止混用；
+> u2 进程退出时 atexit 自动 stop agent 让出通道。
 
 ## 环境要求
 
@@ -13,7 +16,7 @@
 | Python 3.13 | 命令用 `py -3.13` |
 | MuMu 12 模拟器 | 机型模拟小米 12（cupid），竖屏 1080×1920；adb 入口见下 |
 | Tesseract OCR | 需安装中文语言包 chi_sim，路径配置在 `config.yaml → ocr.tesseract_cmd` |
-| Python 依赖 | `pip install -r requirements.txt`（PyYAML / Pillow / pytesseract / requests） |
+| Python 依赖 | `pip install -r requirements.txt`（PyYAML / Pillow / pytesseract / requests；u2 后端另需 uiautomator2） |
 
 ### MuMu 的 adb 入口（重要）
 
@@ -29,20 +32,24 @@ MuMu 12 有两个 adb 入口指向**同一个模拟器**：
 ```
 D:\qiandao\
 ├─ main.py                  # CLI 入口（参数调度 + 探活）
-├─ flow.py                  # 核心流程：导航/签到/反馈/看广告/退出
+├─ flow.py                  # 核心流程：导航/签到/签到奖励广告/反馈/看广告/退出
 ├─ adb_ui.py                # adb 驱动：dump 文本节点(带缓存)/点击/滑动/OCR截图
+├─ adb_u2.py                # u2 驱动（U2AdbUI）：uiautomator2 常驻 agent 适配层，与 AdbUI 同接口
 ├─ config.yaml              # 全部配置（设备/流程/OCR/日志）
 ├─ requirements.txt
 ├─ signin_feedback.bat      # 启动：仅 签到+问题反馈（main.py --no-ad）
 ├─ watch_ad.bat             # 启动：仅 看广告，补满每台每日配额（main.py --ad-only）
+├─ rotate_ad.bat            # 启动：签到+反馈+组制轮询看广告（main.py --rotate）
 ├─ ad_test_all.bat [COUNT]  # 启动：全白名单手动跑广告（默认每台 1 次，全链路快速验证）
 │
 ├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限（92 用例）
 ├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（21 用例）
 ├─ test_run_all_flags.py    # mock 单测：run_all 各 flag 组合 + 单会话连看 + 首轮广告 + 配额收尾 + 白名单（29 用例）
-├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0)（48 用例）
+├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0)（50 用例）
 ├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数，36 用例）
-├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看，10 用例）→ 合计 236/236
+├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 10 + 组制轮询 rotate 7，17 用例）
+├─ test_signin_ad.py        # mock 单测：签到奖励广告（签到触发/跳过/配置关闭/异常隔离 + 看广告按钮 dump 命中/OCR 兜底/无按钮/sheet_ok 关闭，9 用例）
+├─ test_u2_backend.py       # mock 单测：u2 backend（Node 解析兼容/dump 三态/TTL/agent 生命周期，13 用例）→ 合计 267/267
 ├─ test_plan_fullflow.md    # 全流程测试计划文档
 │
 ├─ e2e_ad_once.py           # 真机验证：单机器人看一次广告（RESULT: OK/FAIL）
@@ -74,6 +81,7 @@ D:\qiandao\
 ```bash
 signin_feedback.bat        # 签到 + 问题反馈（等价 py -3.13 main.py --no-ad）
 watch_ad.bat               # 只看广告，把每台补满每日配额（等价 py -3.13 main.py --ad-only）
+rotate_ad.bat              # 签到+反馈+组制轮询看广告（等价 py -3.13 main.py --rotate）
 ad_test_all.bat [COUNT]    # 全白名单手动跑广告，默认每台 1 次（全链路快速验证用）
 ```
 
@@ -85,10 +93,11 @@ ad_test_all.bat [COUNT]    # 全白名单手动跑广告，默认每台 1 次（
 
 | 参数 | 说明 |
 |---|---|
-| （无参数） | 自动抓取机器人列表 → 签到+反馈（第一轮同会话顺带看 1 次广告）→ 阶段二单会话连看补足剩余配额 |
+| （无参数） | 自动抓取机器人列表 → 签到+反馈（第一轮同会话顺带看 1 次广告）→ 阶段二补足剩余配额（模式由 `workflow.ad_rotate` 决定：同机连看 / 组制轮询） |
 | `--list` | 仅列出自动抓取的机器人，不执行 |
 | `--robots "昵称A,昵称B"` | 手动指定机器人（覆盖自动抓取；**仍受白名单约束**） |
 | `--ad-only` | 只看广告（跳过签到/反馈） |
+| `--rotate` | 强制开启组制轮询模式（等价 `workflow.ad_rotate: true`） |
 | `--no-ad` | 不看广告（等价 `--ad-times 0`） |
 | `--ad-times N` | 每台机器人看广告次数（默认取 `config.yaml → workflow.ad_times_per_robot`） |
 | `--no-signin` / `--no-feedback` | 跳过签到 / 跳过反馈 |
@@ -114,10 +123,13 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 | `nav_wait` | 8.0s | A1 事件驱动导航最大等待（就绪即提前返回） |
 | `ad_close_max_backs` | 3 | 关闭兜底物理 BACK 封顶 |
 | `ad_times_per_robot` | 10 | 每台每日广告配额 |
+| `ad_rotate` / `ad_rotate_group` | false / 3 | 组制轮询模式（2026-09-16）：true=机器人按 N 台一组跨台轮换，每台每轮看 1 支靠切换吸收 CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）；组内动态缩员，剩 1 台自动回落连看。`--rotate` 命令行可强制开启 |
+| `signin_ad` | true | 签到奖励广告（2026-09-16）：签到成功后浮层「看广告 +⚡」→ 再看一次 15s 广告拿奖励；失败只记日志不阻断主流程 |
 
-**效率基线（2026-09-15 全量场实测，10 台 × 10 支，2h35m，失败 0）**：
-同机 CD 连看周期中位 **89.2s**（CD 60s 占 67%，平台硬底）；退台中位 **17.2s**；
-进台中位 **26.0s**；全含（含首轮签到/反馈）**93.2s/支**。关闭链路 dump 超时 0 次失败。
+**效率基线（2026-09-16 u2 后端组制轮询实测）**：4 台 × 5 轮稳态 **48-49s/支**（0 失败）；
+14:35 全流程场 90 支全含 **49.8s/支**（89.7min，0 WARN/0 Err/0 弃权）。
+旧 adb 后端全量场基线（2026-09-15，10 台 × 10 支，2h35m）：同机 CD 连看中位 89.2s
+（CD 60s 占 67%，平台硬底）；全含 93.2s/支。**u2+轮询对比旧基线提速 ~-48%**。
 
 ## 定位方式（按优先级）
 
@@ -151,9 +163,11 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 基于真实 dump 节点的 `_tap_node` **天然安全**。于是规定：
 
 - `flow._tap(x, y, trusted=False)`：在任务中心页（`_page_tc=True`）**拒绝一切坐标点击**，
-  除非显式 `trusted=True`。合法例外仅 2 处：
+  除非显式 `trusted=True`。合法例外仅 3 处：
   1. `_close_ad`：广告页左上角「关闭广告」按钮（OCR 正向定位、非盲点）；
-  2. `_signin`：签到浮层按钮（浮层已由 `wait_for("每日免费领")` / `_find("我知道了")` 确认在屏）。
+  2. `_signin`：签到浮层按钮（浮层已由 `wait_for("每日免费领")` / `_find("我知道了")` 确认在屏）；
+  3. `_watch_signin_ad`：签到奖励广告「看广告 +⚡」按钮 OCR 兜底（dump 无该按钮时，
+     限定下半屏 region=(0,1600,1080,1920) 正向定位后点其坐标，非盲点）。
 - `_signin` 的关闭 ✕ 改为**浮层仍在屏才点**（该坐标在代柯版式里离 banner 顶仅 7px）。
 - `_page_tc` 状态位：进任务中心置 True；退出 / `_nav_robot_list` / `_safe_back_to_robot_list`
   置 False —— 保证**列表页机器人首行（y≈410-500）、联系人页『机器人』分类行（y≈201-352）**
@@ -258,6 +272,22 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 故统一用 `_find_row("看广告", alt_labels=("获取随机",))` 同轮查找，避免按钮词失配导致的
 28s 空滚（期间易被 ~40s 重弹的问卷盖住）。实测：代柯 10/10 从「4m52s 全失败」→「1m30s 秒退」。
 
+## 组制轮询看广告（--rotate，2026-09-16 新增）
+
+阶段一不变（签到 + 反馈 + 首轮广告同会话）；**阶段二**机器人按 `ad_rotate_group`（默认 3）
+台一组跨台轮换：R1 看 1 支 → 切 R2 → 切 R3 → 循环回 R1，**靠换台吸收 60s CD**
+（换台耗时 ~46s < CD 60s，且 u2 dump 94ms 换台开销已压到最低）。
+
+- **动态缩员**：某台配额满即移出组；组剩 2 台继续两两轮换，剩 1 台自动回落
+  `_watch_ads_session` 同机连看（旧行为路径，逻辑原样抽出复用）。
+- **单台连败 3 次弃权**（交失败计数，不无限重试）。
+- **配额截断**：轮换首访某台时读屏幕 X/10 基数校准，`min(目标剩余, 平台日配额剩余)`，
+  防止跨进程把平台配额（每日 10 支）算超。
+- 开关：`--rotate` 命令行强制，或 `config.yaml → workflow.ad_rotate: true`（默认 false
+  不改变现有 bat 行为）。**依赖 u2 后端收益最大**（adb 后端换台 dump 慢，轮询优势缩水）。
+
+
+
 ## 退出任务中心
 
 一律使用**系统 BACK 键**（`keyevent 4`）连续退出（任务中心 → 聊天页 → profile → 机器人列表），
@@ -287,8 +317,8 @@ dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `
 
 ```bash
 # mock 单测（无需设备 / 无 OCR 依赖，任意环境可跑）
-py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 236/236 通过
-py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate
+py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 267/267 通过
+py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend
 
 # 真机验证（需模拟器在线 + QQ 停在机器人列表）
 py -3.13 e2e_ad_once.py "昵称"              # 看一次广告
@@ -297,10 +327,11 @@ py -3.13 scripts_test/verify_ymax.py "昵称" # 广告页 ymax 过滤专项验�
 py -3.13 scripts_test/observe_ad.py "昵称"  # 广告页证据采集（不自动关闭）
 ```
 
-> 依赖：`pip install -r requirements.txt`（PyYAML / Pillow / pytesseract / requests）。
+> 依赖：`pip install -r requirements.txt`（PyYAML / Pillow / pytesseract / requests；
+> u2 后端另需 `pip install uiautomator2` 且设备端执行过 `py -3.13 -m uiautomator2 init -s <udid>`）。
 > 单测需要能 import `main.py`，故 **PyYAML 必须装**（缺它会导致 main 参数映射类用例报
 > `ModuleNotFoundError: No module named 'yaml'`）。
-> 详细技术档案、坑 1-14、恢复流程见仓库根 **`MEMORY.md`**。
+> 详细技术档案、坑 1-15、恢复流程见仓库根 **`MEMORY.md`**。
 
 ## 已知注意点
 

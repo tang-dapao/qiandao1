@@ -1,6 +1,6 @@
 # 项目记忆 / 进度存档（用于下次接着做）
 
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 > 项目路径：D:\qiandao
 > 运行方式：Windows 上 `py -3.13 xxx.py`，模拟器 MuMu（ADB **emulator-5554**，QEMU 底层入口；
 > 旧的 `127.0.0.1:16384` 是网络转发口，daemon 重启即丢，已弃用）
@@ -598,17 +598,58 @@ EDF 轮换 + C1/C4 分布抖动 + C5/C6/C7 + E1 量化验收。第 2 批已落�
   但每支广告多一次换台、暴露于 TC 卡死家族 —— 建议治理该家族后再全量轮换。
 
 
-### 单测基线（2026-09-15：236/236 全绿）
+### 2026-09-16：u2 感知层 backend（阶段1探针+阶段2落地+4台实测）+ 组制轮询模式（7b2736a）
+
+- **u2 backend（adb_u2.py，阶段1/2 于 09-15 开发）**：`device.backend: "u2"`（config，默认 adb）。
+  探针实测 dump 中位 94ms vs adb 4021ms = 42.6x；4 台实测单支 ~50s（基线 95.6s）。
+  **感知互斥**：u2 agent 常驻时 adb dump 100% rc=137 —— backend 必须整体切换，禁止混用；
+  U2AdbUI atexit 自动 stop agent（硬杀进程需手动 `d.stop_uiautomator()`）。冷启动首 dump
+  缺底栏 → 连接后先暖身 dump 一次（6cdf451）。
+- **多轮轮换实测（4 台 × 5 轮）**：稳态 **48-49s/支**（592s/12支 = 49.3），0 失败 0 WARNING。
+- **组制轮询模式（--rotate / workflow.ad_rotate + ad_rotate_group，默认 false 不改旧行为）**：
+  阶段一不变（签到+反馈+首轮广告同会话，run_robot 返回 0/1/2 编码记账）；
+  阶段二机器人按 3 台一组跨台轮换，每台每轮 1 支靠切换吸收 CD；组内动态缩员（配额满即移出，
+  剩 2 台继续轮换、剩 1 台回落 _watch_ads_session 连看）；单台连败 3 次弃权；
+  首访屏幕基数校准（X/10）截断日配额。顺序连看路径原样抽入 _watch_ads_session，行为不变。
+  4 台真机实测（3台组轮换 + 1台组回落）6m30s 8 支全成功 0 失败；组内单支 ~46s。
+  全量 10 台预估 ~1h23m（旧行为 2h35m，-46%）。
+- 单测 236→**258** 全绿（+13 test_u2_backend、+7 rotate 组制用例）；verify_f11 离线全过。
+- 本地提交未推送：d406456 / b0904ba / b21b02f / 6cdf451 / 7b2736a / 3811a8e；
+  config.yaml（backend:u2 + ad_rotate/signin_ad 旋钮）随文档同步一并准备提交，
+  **等用户连代理并明确通知后再 push**。
+
+- **签到奖励广告（signin_ad / _watch_signin_ad，3811a8e）**：每日签到成功后「每日免费领」
+  浮层内出现「看广告 +⚡」按钮（按钮文案实测为「看广告 」尾随 +，**必须子串匹配**）→
+  看一次 15s 广告拿奖励。实现：`_find("看广告")` dump 节点 y>=1600 取 max y1 → `_tap_node`；
+  dump 无按钮时 OCR 兜底 `region=(0,1600,1080,1920)` trusted 正向定位（F11 第 3 处合法例外）；
+  都读不到 → 跳过不阻断。看完走 `_ad_play_and_close(sheet_ok=True)` —— **sheet_ok 语义**：
+  关闭确认时「每日免费领/恭喜获得」浮层仍在屏视为合法终态（浮层开着=已回任务中心），
+  否则浮层挡屏会让 `_close_ad` 误判"没关"而 BACK 退穿（代柯首测实锤，修复后尔尔 2m17s 全绿）。
+  旋钮 `workflow.signin_ad: true`（false 回退旧行为）；触发条件=当日真正签到（已签到跳过）；
+  外层 try/except 隔离，失败只记日志。真机 8/10 触发（2 台因 e2e 测试期间已签到跳过）；
+  **奖励广告不计入 X/10 日配额**（屏幕基数校准实测确认）。
+- **14:35 全流程场复盘**：89.7min，90 支轮询广告全含 **49.8s/支**，+8 支奖励广告，
+  0 WARN/0 Err/0 弃权。
+- 文档同步（09-16 晚）：README.md（267 基线/rotate/bat/旋钮/u2/F11 三例外/效率基线）、
+  本文件、requirements.txt（补 uiautomator2>=3.0.0）。
+
+
+### 单测基线（2026-09-16：267/267 全绿）
 - `py -3.13 -m unittest discover -p "test_*.py"`
 - test_flow_ocr_close.py **92**（F8/E1 快检/E2 全屏三合一/E3 快照/E 预定位 + F11 盲点禁令
   + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度断言）
   + test_adb_cache.py **21**（+4 超时看门狗）
   + test_run_all_flags.py **29**（单会话连看 + 首轮广告 + 配额收尾/算术退出 + 白名单）
-  + test_nav_optimize.py **48**（A1 事件驱动 + P0 单快照 + 滚动收集）
+  + test_nav_optimize.py **50**（A1 事件驱动 + P0 单快照 + 滚动收集）
   + test_task_safety.py **36**（签到/反馈断言 + 行内 X/Y 计数 + scroll-to-top 省 dump）
-  + test_3bot_rotate.py **10**（多机器人轮转场景）
+  + test_3bot_rotate.py **17**（多机器人轮转场景 10 + 组制轮询 rotate 7）
+  + test_u2_backend.py **13**（u2 backend：解析兼容/dump 三态/TTL/agent 生命周期）
+  + test_signin_ad.py **9**（签到奖励广告：触发/跳过/配置关闭/异常隔离 + dump 命中/OCR 兜底/
+    无按钮/sheet-gone/confirm sheet_ok）
 - **环境注意**：单测要 import `main.py` → **必须装 PyYAML**；否则 main 参数映射/白名单类
   用例会以 `ModuleNotFoundError: No module named 'yaml'` 报错（12 个 error），不是业务失败。
+- **u2 后端环境**：`pip install uiautomator2` + 设备端 `py -3.13 -m uiautomator2 init -s <udid>`；
+  requirements.txt 已补 uiautomator2>=3.0.0（标注仅 u2 后端需要）。
 
 ### 诊断工具（scripts_test/，非生产）
 - `trace_ad.py <机器人> [次数]` —— 包一层 `Flow._ocr_shot`，把每次 OCR 看到的画面存到

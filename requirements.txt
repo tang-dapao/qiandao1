@@ -2,3 +2,5 @@ PyYAML>=6.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
 requests>=2.31.0
+# u2 感知层后端（config.yaml → device.backend: "u2" 时必须；adb 后端不需要）
+uiautomator2>=3.0.0

@@ -260,6 +260,94 @@ class TestBackAtTaskcenter(Base):
         self.assertFalse(self.f._back_at_taskcenter())
 
 
+class TestDumpFallbackForTaskcenter(Base):
+    """2026-09-27：`allow_dump_fallback` —— OCR 判「不在任务中心」时用 dump 复核。
+
+    真机实测动机：OCR 判据只有 4 词，滚动位置 / WebView 重绘 / 视频期读屏失败
+    都会打空（实测**真任务中心页**报 `back_at_tc=False`）。于是 `_close_ad` 的
+    物理 BACK 兜底连退 3 层落到 QQ 联系人页，连看会话则触发全量重新进台
+    （用户反馈的"任务中心页一直刷新"）。dump 在页面 idle 时稳定含任务行节点
+    → 两信号互补，但只在**破坏性动作前**才开（默认关，成功路径零开销）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.f.wf["tc_confirm_skip_dump"] = True
+        self.f._fullscreen_scan = mock.Mock(return_value=(False, False, False))
+        self.f._overlay_scan = mock.Mock(return_value=(False, False, False))
+        self.f.ui = mock.Mock()
+        self.f.ui.dump_fail_streak = 0
+        self.f.ui.nodes.return_value = [Node("看广告", 800, 1700, 920, 1750)]
+
+    def test_dump_fallback_confirms_when_ocr_blind(self):
+        # OCR 读不到任务中心特征，但 dump 有任务行且无覆盖层 → 判仍在任务中心
+        self.assertTrue(self.f._back_at_taskcenter(allow_dump_fallback=True))
+
+    def test_dump_fallback_off_by_default(self):
+        # 默认关闭 → 行为与旧版完全一致（不付 dump 代价）
+        self.assertFalse(self.f._back_at_taskcenter())
+        self.f.ui.nodes.assert_not_called()
+
+    def test_dump_fallback_blocked_by_overlay(self):
+        # OCR 见到覆盖层（资料卡 / 问卷 / AI 好友 H5）→ dump 穿透也不认账（F11）
+        self.f._overlay_scan = mock.Mock(return_value=(False, False, True))
+        self.assertFalse(self.f._back_at_taskcenter(allow_dump_fallback=True))
+
+    def test_dump_fallback_needs_task_rows(self):
+        # dump 没有任务行（如停在聊天页 / 资料卡）→ 不认账
+        self.f.ui.nodes.return_value = [Node("发消息", 100, 1700, 300, 1750)]
+        self.assertFalse(self.f._back_at_taskcenter(allow_dump_fallback=True))
+
+
+class TestBackFallbackRetreatGuard(Base):
+    """2026-09-27：物理 BACK 后退穿到机器人列表 / QQ 主壳 → 立即收手，不再盲退。
+
+    实测：原实现连按 3 次 BACK 会从广告页一路退到 QQ 联系人页（页面快照
+    `'联系人'@(231,133)`），把「1 次关闭失败」放大成整套导航重建。
+    """
+
+    def _stub(self):
+        f = self.f
+        f.wf = {"ad_close_retries": 12, "ad_close_max_backs": 3}
+        f._find = mock.Mock(return_value=None)
+        f.ui = mock.Mock()
+        f.ui.dump_fail_streak = 0
+        f.ui.nodes.return_value = []
+        f._tap = mock.Mock()
+        f._tap_node = mock.Mock()
+        f._dismiss_badcase = mock.Mock(return_value=True)
+        f._ocr_find = mock.Mock(return_value=None)   # 什么都读不到
+        f._back_at_taskcenter = mock.Mock(return_value=False)
+        return f
+
+    def test_back_stops_when_retreated_to_robot_list(self):
+        f = self._stub()
+        f._looks_like_robot_list = mock.Mock(return_value=True)
+        f._on_qq_main_shell = mock.Mock(return_value=False)
+        self.assertFalse(f._close_ad())
+        # 第 1 次 BACK 后即判退穿 → 只按 1 次，绝不继续盲退
+        self.assertEqual(f.ui.back.call_count, 1)
+        f._tap.assert_not_called()                # F8：全程无坐标盲点
+        # 破坏性动作前的判定必须开 dump 复核
+        f._back_at_taskcenter.assert_any_call(timeout=2.5,
+                                             allow_dump_fallback=True)
+
+    def test_back_continues_when_not_retreated(self):
+        f = self._stub()
+        f._looks_like_robot_list = mock.Mock(return_value=False)
+        f._on_qq_main_shell = mock.Mock(return_value=False)
+        self.assertFalse(f._close_ad())
+        self.assertEqual(f.ui.back.call_count, 3)   # 无退穿 → 维持原封顶语义
+
+    def test_retreat_guard_survives_unreadable_page(self):
+        # 读屏异常（Mock/ dump 全失）→ 判据不可信，维持原语义继续 BACK
+        f = self._stub()
+        f._looks_like_robot_list = mock.Mock(side_effect=TypeError("mock"))
+        f._on_qq_main_shell = mock.Mock(return_value=False)
+        self.assertFalse(f._close_ad())
+        self.assertEqual(f.ui.back.call_count, 3)
+
+
 class TestStableInAdPage(Base):
     """B+ 稳定检查：连续 N 次 _back_at_taskcenter=全部 False 才允许盲点。"""
 

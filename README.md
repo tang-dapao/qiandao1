@@ -39,17 +39,23 @@ D:\qiandao\
 ├─ requirements.txt
 ├─ signin_feedback.bat      # 启动：仅 签到+问题反馈（main.py --no-ad）
 ├─ watch_ad.bat             # 启动：仅 看广告，补满每台每日配额（main.py --ad-only）
-├─ rotate_ad.bat            # 启动：签到+反馈+组制轮询看广告（main.py --rotate）
+├─ rotate_ad.bat            # 启动：签到+反馈+滑动窗口轮询看广告（main.py --rotate）
 ├─ ad_test_all.bat [COUNT]  # 启动：全白名单手动跑广告（默认每台 1 次，全链路快速验证）
 │
-├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限（92 用例）
+├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限 + dump 复核补强(dump_fallback) + BACK 退穿保护（99 用例）
 ├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（21 用例）
 ├─ test_run_all_flags.py    # mock 单测：run_all 各 flag 组合 + 单会话连看 + 首轮广告 + 配额收尾 + 白名单（29 用例）
-├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0)（50 用例）
-├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数，36 用例）
-├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 10 + 组制轮询 rotate 7，17 用例）
+├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0) + 进台流程(条件等待/新功能弹窗/心动卡/Y钳位)（61 用例）
+├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数 + 看广告配额跳过，46 用例）
+├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 + 滑动窗口 rotate + 4 台补位/连败弃权 + 进台配额缓存复用 TestEntryQuotaCache，26 用例）
 ├─ test_signin_ad.py        # mock 单测：签到奖励广告（签到触发/跳过/配置关闭/异常隔离 + 看广告按钮 dump 命中/OCR 兜底/无按钮/sheet_ok 关闭，9 用例）
-├─ test_u2_backend.py       # mock 单测：u2 backend（Node 解析兼容/dump 三态/TTL/agent 生命周期，13 用例）→ 合计 267/267
+├─ test_u2_backend.py       # mock 单测：u2 backend（Node 解析兼容/dump 三态/TTL/agent 生命周期，13 用例）
+├─ test_account_switch.py   # mock 单测：多账号切换（切号链路/4 失败分支/顺序漂移按 UIN 定位/
+│                           #   漏号就绪判定/切号落点兜底(资料页/消息页) + 入口复位滑顶/
+│                           #   run_all_accounts 编排/main 模式路由，41 用例）
+├─ test_watch_recover.py    # mock 单测：连看会话失败后复位重进 + 仍在任务中心时原地重试不重建导航（P0 2026-09-27，7 用例）
+├─ test_summary.py          # mock 单测：运行汇总记账（签到/反馈/广告计数 + 汇总文件输出，10 用例）
+│                           # → 合计 362/362（1 个环境依赖 ERROR：test_u2_backend tap 用例 wraps 真实 adb，设备 offline 时必失败，与代码无关）
 ├─ test_plan_fullflow.md    # 全流程测试计划文档
 │
 ├─ e2e_ad_once.py           # 真机验证：单机器人看一次广告（RESULT: OK/FAIL）
@@ -81,26 +87,32 @@ D:\qiandao\
 ```bash
 signin_feedback.bat        # 签到 + 问题反馈（等价 py -3.13 main.py --no-ad）
 watch_ad.bat               # 只看广告，把每台补满每日配额（等价 py -3.13 main.py --ad-only）
-rotate_ad.bat              # 签到+反馈+组制轮询看广告（等价 py -3.13 main.py --rotate）
+rotate_ad.bat              # 签到+反馈+滑动窗口轮询看广告（等价 py -3.13 main.py --rotate）
 ad_test_all.bat [COUNT]    # 全白名单手动跑广告，默认每台 1 次（全链路快速验证用）
 ```
 
 > 仅对 `config.yaml → workflow.robot_whitelist` 名单内的昵称执行签到/反馈/看广告；
 > 名单为空或未配置 = 不过滤（跑全部）。命令行 `--robots` 指定的名字**同样受白名单约束**（防绕过）。
 > 需要临时跑名单外的机器人，先改 `config.yaml` 里的 `robot_whitelist`。
+>
+> **多账号（2026-09-24）**：`config.yaml → accounts.enabled: true` 时，无参主流程与
+> `--rotate` 会按 `accounts.list` **逐账号自动切号**跑完（详见「多账号自动切换」一节）；
+> `--ad-only` / `--no-ad` / `--robots` 仍是单账号。
 
 ## main.py 命令参数
 
 | 参数 | 说明 |
 |---|---|
-| （无参数） | 自动抓取机器人列表 → 签到+反馈（第一轮同会话顺带看 1 次广告）→ 阶段二补足剩余配额（模式由 `workflow.ad_rotate` 决定：同机连看 / 组制轮询） |
+| （无参数） | 自动抓取机器人列表 → 签到+反馈（第一轮同会话顺带看 1 次广告）→ 阶段二补足剩余配额（模式由 `workflow.ad_rotate` 决定：同机连看 / 滑动窗口轮询） |
 | `--list` | 仅列出自动抓取的机器人，不执行 |
 | `--robots "昵称A,昵称B"` | 手动指定机器人（覆盖自动抓取；**仍受白名单约束**） |
 | `--ad-only` | 只看广告（跳过签到/反馈） |
-| `--rotate` | 强制开启组制轮询模式（等价 `workflow.ad_rotate: true`） |
+| `--rotate` | 强制开启滑动窗口轮询模式（等价 `workflow.ad_rotate: true`） |
 | `--no-ad` | 不看广告（等价 `--ad-times 0`） |
 | `--ad-times N` | 每台机器人看广告次数（默认取 `config.yaml → workflow.ad_times_per_robot`） |
 | `--no-signin` / `--no-feedback` | 跳过签到 / 跳过反馈 |
+| `--accounts` | 强制启用多账号模式（覆盖 `config accounts.enabled`；**仅完整主流程生效**） |
+| `--only-switch` | 调试：只按 `config accounts.list` 逐个切号并校验昵称，不跑主流程 |
 
 示例：
 
@@ -123,7 +135,7 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 | `nav_wait` | 8.0s | A1 事件驱动导航最大等待（就绪即提前返回） |
 | `ad_close_max_backs` | 3 | 关闭兜底物理 BACK 封顶 |
 | `ad_times_per_robot` | 10 | 每台每日广告配额 |
-| `ad_rotate` / `ad_rotate_group` | false / 3 | 组制轮询模式（2026-09-16）：true=机器人按 N 台一组跨台轮换，每台每轮看 1 支靠切换吸收 CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）；组内动态缩员，剩 1 台自动回落连看。`--rotate` 命令行可强制开启 |
+| `ad_rotate` / `ad_rotate_group` | false / 3 | 滑动窗口轮询模式（2026-09-16 组制轮询 → 2026-09-26 滑动窗口）：true=固定 N 台窗口 + 补位队列，某台出窗（配额满/连败 3 次）立即补位，窗口常满员；仅剩 1 台且无待补时回落同机连看。靠换台吸收 60s CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）。`--rotate` 命令行可强制开启 |
 | `signin_ad` | true | 签到奖励广告（2026-09-16）：签到成功后浮层「看广告 +⚡」→ 再看一次 15s 广告拿奖励；失败只记日志不阻断主流程 |
 
 **效率基线（2026-09-16 u2 后端组制轮询实测）**：4 台 × 5 轮稳态 **48-49s/支**（0 失败）；
@@ -265,28 +277,81 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 每次看完立即读屏复核，正撞重载动画期 dump 超时，两次复核烧 ~43s 加在 60s CD 之前）。
 进台时 `_read_ad_ratio()` 读一次 X/10 基数，`基数 + 本会话已看 >= 配额` → **算术收尾**
 （不读屏、不等 CD 直接退出）；基数读不到（行被覆盖）则回退 CD 窗口内的屏幕复核。
+**进台配额缓存（2026-09-28 方案 A）**：`_enter_taskcenter` 成功返回前读一次配额存入
+`self._tc_entry_ratio`（进台开始清空），轮换/连看的基数校准与首检**优先复用缓存**、
+None 才原地读屏——进台一次读屏全流程复用，免二次滚动查找（修复前读不到行会
+上下各滚 6 次狂找）。
 
 **满额直退（2026-09-10 18:55，真机验证通过）**：X/Y 计数在 dump 里可能被拆成多个节点
 （`'10'` `'/'` `'10'` 三个独立节点），`_row_completion()` 第 2 遍把行内节点按 x 序拼接后
-`search(r"(\d+)\s*/\s*(\d+)")` 提取；满额后按钮文案「获取随机」→「已完成」而**行标题「看广告」不变**，
-故统一用 `_find_row("看广告", alt_labels=("获取随机",))` 同轮查找，避免按钮词失配导致的
-28s 空滚（期间易被 ~40s 重弹的问卷盖住）。实测：代柯 10/10 从「4m52s 全失败」→「1m30s 秒退」。
+`search(r"(\d+)\s*/\s*(\d+)")` 提取。
+**行定位统一走 `AD_ROW_LABELS` 常量**（flow.py 顶部）：`(主label, *alt_labels)` 一次
+同轮查找。2026-09-28 官方文案改版——广告行标题「看广告」→「**看视频赚电量**」
+（原节点不复存在，按钮「获取随机」仍在、满额后变「已完成」）——旧锚点匹配失败导致
+`_find_scroll_any` 上下各滚 6 次狂找（用户观察「进任务中心后一直下滑」、滚动中偶触
+签到/反馈行），已修：常量收口 + 进台配额缓存（方案 A）。**X/Y 计数才是稳定判据，
+行标题随时可能再改——文案再改只改 `AD_ROW_LABELS` 一处。**
+实测：代柯 10/10 从「4m52s 全失败」→「1m30s 秒退」。
 
-## 组制轮询看广告（--rotate，2026-09-16 新增）
+## 滑动窗口轮询看广告（--rotate，2026-09-16 组制轮询 → 2026-09-26 演进）
 
-阶段一不变（签到 + 反馈 + 首轮广告同会话）；**阶段二**机器人按 `ad_rotate_group`（默认 3）
-台一组跨台轮换：R1 看 1 支 → 切 R2 → 切 R3 → 循环回 R1，**靠换台吸收 60s CD**
-（换台耗时 ~46s < CD 60s，且 u2 dump 94ms 换台开销已压到最低）。
+阶段一不变（签到 + 反馈 + 首轮广告同会话）；**阶段二**采用**滑动窗口**：固定
+`ad_rotate_group`（默认 3）台窗口 + 补位队列，某台出窗（配额满 / 单台连败 3 次）
+**立即从队列取一台补位进窗（排窗口尾部）**，窗口保持满员直至机器人耗尽。
 
-- **动态缩员**：某台配额满即移出组；组剩 2 台继续两两轮换，剩 1 台自动回落
-  `_watch_ads_session` 同机连看（旧行为路径，逻辑原样抽出复用）。
-- **单台连败 3 次弃权**（交失败计数，不无限重试）。
+- **窗口常满员**：与旧组制轮询的关键差异 —— 旧版组内缩员**不补人**，组剩 2 台/1 台时
+  CD 吸收效率退化；滑动窗口始终 3 台，直到「待补 0」才自然缩到 2 台、1 台。
+- **回落连看**：窗口仅剩 1 台且无待补 → 回落 `_watch_ads_session` 同机连看
+  （旧行为路径，逻辑原样抽出复用）。
+- **靠换台吸收 60s CD**：换台耗时 ~46s < CD 60s，u2 dump 94ms 换台开销已压到最低。
 - **配额截断**：轮换首访某台时读屏幕 X/10 基数校准，`min(目标剩余, 平台日配额剩余)`，
   防止跨进程把平台配额（每日 10 支）算超。
 - 开关：`--rotate` 命令行强制，或 `config.yaml → workflow.ad_rotate: true`（默认 false
   不改变现有 bat 行为）。**依赖 u2 后端收益最大**（adb 后端换台 dump 慢，轮询优势缩水）。
+- 典型日志：`轮换阶段：N 台待看，滑动窗口 3 台，日配额 10` /
+  `代柯 （配额满）出窗，李宥恩 补位进窗（窗口 3 台 [...]，待补 6）`。
 
 
+
+## 多账号自动切换（2026-09-24）
+
+一台模拟器里 QQ 登了 4 个账号（QQ 自带多账号列表）。主流程支持**跑完一个账号
+自动切到下一个继续跑**，日常命令不变：`py -3.13 main.py --rotate`。
+
+**实测（2026-09-24 真机 dump + 截图，非臆测）**
+
+| 事实 | 证据 / 说明 |
+|---|---|
+| 切号路径 | 联系人页左上角「账户及设置」→ 侧栏「切换账号」→ 账号列表弹窗 → 点目标账号行 |
+| 免密快切 | 单次 **~8.5s**，无密码/验证码（实测 4/4 成功；`--only-switch` 再验 4/4） |
+| 账号标识 | 列表每项 = 「昵称 + UIN」两行 dump 节点，**UIN 唯一稳定**（昵称可能重复/改动） |
+| ⚠️ 列表顺序会变 | 当前登录账号置顶 → UIN 节点 y 实测从 653 漂到 1340 ⇒ **按 UIN 文本定位，禁止记坐标** |
+| ⚠️ 各账号机器人不同 | 唐灵 12 / 王 11 / 觅夏 13 ⇒ 白名单沿用**全局一份**，该账号没有的名字自动跳过 |
+| ⚠️ 切号后首次收集漏号 | 唐灵 7 vs 12、觅夏 10 vs 13（数据加载期 Phase1 判顶部误判）⇒ 连续 2 次收集一致才采纳 |
+
+**配置（`config.yaml → accounts`）**
+
+```yaml
+accounts:
+  enabled: true          # false = 一行回退单账号旧行为
+  settle: 2.0            # 切号成功后基础沉降（秒）
+  max_retry: 2           # 单次切号失败重试次数
+  ready_stable: 2        # 数据就绪：连续 N 次收集结果一致才采纳
+  ready_timeout: 120.0   # 就绪判定最长等待（秒）
+  list:                  # 顺序即执行顺序；nick 用于切后校验，uin 用于定位
+    - {nick: "唐灵",   uin: "2593292352", enabled: true}
+    - {nick: "觅夏",   uin: "2774054368", enabled: true}
+    - {nick: "王",     uin: "1766775822", enabled: true}
+    - {nick: "唐六爻", uin: "3462182422", enabled: true}
+```
+
+**生效范围**：仅**完整主流程**（`main.py` 无参 / `--rotate`）。`--ad-only`、
+`--no-ad`、`--robots` 手动指定、`--list` 一律保持单账号旧行为；`--accounts`
+可强制开启，`--only-switch` 只切号不跑（调试用）。每账号**独立记账**，各自
+落一份 `logs/summary_*_<账号>.txt`。
+
+> 实现全部走 **dump 节点定位，零盲点坐标**（与 F11 铁律一致）；`_wait_for_text`
+> 每次落空后强制刷帧，防两次查询命中同一坏帧而误触发 `_safe_back_to_robot_list`。
 
 ## 退出任务中心
 
@@ -317,10 +382,11 @@ dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `
 
 ```bash
 # mock 单测（无需设备 / 无 OCR 依赖，任意环境可跑）
-py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 267/267 通过
-py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend
+py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 362 用例（1 个环境依赖 ERROR：test_u2_backend tap 用例需真机 adb，设备 offline 时必失败，与代码无关）
+py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend test_account_switch test_watch_recover
 
 # 真机验证（需模拟器在线 + QQ 停在机器人列表）
+py -3.13 main.py --only-switch              # 多账号切号链路验证（逐个切号 + 校验昵称）
 py -3.13 e2e_ad_once.py "昵称"              # 看一次广告
 py -3.13 e2e_robot_once.py "昵称"           # 签到+问题反馈
 py -3.13 scripts_test/verify_ymax.py "昵称" # 广告页 ymax 过滤专项验证
@@ -331,7 +397,7 @@ py -3.13 scripts_test/observe_ad.py "昵称"  # 广告页证据采集（不自�
 > u2 后端另需 `pip install uiautomator2` 且设备端执行过 `py -3.13 -m uiautomator2 init -s <udid>`）。
 > 单测需要能 import `main.py`，故 **PyYAML 必须装**（缺它会导致 main 参数映射类用例报
 > `ModuleNotFoundError: No module named 'yaml'`）。
-> 详细技术档案、坑 1-15、恢复流程见仓库根 **`MEMORY.md`**。
+> 详细技术档案、坑 1-25、恢复流程见仓库根 **`MEMORY.md`**。
 
 ## 已知注意点
 

@@ -9,6 +9,7 @@
 """
 import io
 import logging
+import os
 import random
 import re
 import subprocess
@@ -26,8 +27,22 @@ except Exception:  # noqa: BLE001
 
 logger = logging.getLogger("flow")
 
-# 任务中心各行「去完成/去反馈/获取随机/看广告」按钮固定 X（1080x1920，右侧对齐）
+# 任务中心各行「去完成/去反馈/获取随机/已完成」按钮固定 X（1080x1920，右侧对齐）
+# （2026-09-28 文案改版：广告行标题「看广告」→「看视频赚电量」，见 AD_ROW_LABELS）
 TASK_BTN_X = 879
+# 广告任务行的「行标题」备选词（2026-09-28 官方文案改版实测）。
+# 历史：行标题「看广告」+ 按钮「获取随机」；满额后按钮变「已完成」。
+# 2026-09-28 真机 dump 实测（尔尔/席恩）：行标题已改为「看视频赚电量」
+# （原「看广告」节点不复存在），按钮「获取随机」仍在 → 旧 _find_row("看广告")
+# 匹配失败会 _find_scroll_any 上下各滚 6 次狂找（用户观察「进任务中心后一直
+# 上下滑动」，滚动中偶触签到/反馈行）。现将标题备选词集中于此，统一传给
+# _find_row：index 0 为主 label，其余为 alt_labels（见 AD_ROW_LABELS[1:]）。
+# 文案再改只需改这一处。
+AD_ROW_LABELS = ("看广告", "获取随机", "看视频赚电量")
+# 2026-09-29 P1b：进台三处点击的 pause 旧行为均值（= timing.click_min/click_max
+# 默认 1.5~3.0 的中点）。仅用于把 pause 收窄的秒数折成额外 wait_for 轮询次数，
+# 保证 tap 后**总窗口**不短于旧行为（慢页最坏等待不缩短）。
+ENTER_TAP_PAUSE_REF = 2.25
 # 签到浮层「每日免费领」（1080x1920，实测）
 MODAL_SIGNIN = (301, 1800)     # 左下角【签到】按钮
 MODAL_CLOSE = (996, 1143)      # 右上角 ✕
@@ -117,6 +132,13 @@ ROW_X1 = (180, 195)
 ROW_WIDTH_MAX = 230
 ROW_Y = (350, 1850)
 ROW_SAFE_Y = 1830
+# 机器人行距（实测 09-17：代柯 1226 → 尔尔 1388 → 古禹 1550，等距 162px）。
+# 用于幽灵行防御：目标行与吸顶分类栏下缘的间距 < 一个行距 → 该槽位实为
+# 「我添加的机器人」分组头的回收残影区（坑 15），不可直接点击。
+ROW_PITCH = 162
+# 分类栏「吸顶态」判定阈值：吸顶时 机器人 分类节点 y1≈201；未吸顶（页面
+# 滚动到顶）时 y1≈688。取中间值 450 区分两种状态。
+CAT_BAR_PINNED_Y = 450
 # F9: tap 机器人行的安全 y 上限（实测 藤非 行中心 y=1771 离底部 nav 太近，
 # tap 落 nav 边缘手势区被 QQ 弹回消息 tab，3/3 失败；上移 31px 到 1740 =
 # TAB_Y-100 留 100px 缓冲。低于此上限的行（如游迦 1684）不受影响）。
@@ -129,6 +151,16 @@ TAP_Y_MAX = TAB_Y - 100       # 1740
 # BACK（藤非/裴旖 卡 4-5 分钟）。故「发消息」只有在落到底部操作栏(y>=此阈值)才
 # 视为确凿 profile/聊天页，才否决；中区/随机位置的视为残影容忍。
 FORBIDDEN_ACTION_Y = 1400
+
+# ---- 多账号切换（2026-09-24 真机实测）----
+# QQ 自带多账号列表的切换链路：联系人页左上角「账户及设置」→ 侧栏「切换账号」
+# → 账号列表弹窗 → 点目标账号行。实测免密秒切（~8.5s，4/4 成功）。
+# 账号列表每项 = 「昵称 + UIN」两行 dump 节点：**UIN 唯一稳定，昵称可能重复/改动**。
+# ⚠️ 列表顺序会变（当前登录账号置顶）→ 只能按 UIN 文本定位，**禁止记坐标**。
+ACCOUNT_ENTRY_TEXT = "账户及设置"   # 联系人页左上角入口（实测 y 66-201）
+SWITCH_ACCOUNT_TEXT = "切换账号"    # 侧栏内切号入口
+# 切号完成判据：回到联系人页（「新朋友」是联系人页首屏稳定元素，y≈363-514）
+CONTACT_PAGE_HINT = "新朋友"
 
 
 class Flow:
@@ -146,6 +178,11 @@ class Flow:
     # 即弃），观看周期结束（_close_ad 返回后）由 _watch_ad_once 显式清空 —— 防
     # 旧坐标泄漏到其它调用路径（残留清场等）被当成新广告的关闭按钮误点。
     _prefetch_close = None
+    # 多账号配置（2026-09-24）：类级默认空 dict，防 __new__ 绕过 __init__ 时缺属性。
+    acc: dict = {}
+    # 反馈内容已用集合（2026-09-26 用户方案：5 位随机数 + 持久化防重）。
+    # 类级默认 None（懒加载标记），防 __new__ 绕过 __init__ 时缺属性。
+    _fb_used = None
 
     def __init__(self, config: dict, ui: AdbUI, ocr=None):
         self.cfg = config
@@ -153,6 +190,8 @@ class Flow:
         self.ocr = ocr          # 可空，仅 OCR 兜底用
         self.t = config["timing"]
         self.wf = config["workflow"]
+        # 多账号配置（2026-09-24）：主流程逐账号切号跑。缺省 {} = 不启用。
+        self.acc = config.get("accounts") or {}
         if _HAS_OCR:
             _cmd = config.get("ocr", {}).get("tesseract_cmd")
             if _cmd:
@@ -168,6 +207,33 @@ class Flow:
         # 而列表页/联系人页的合法坐标点击（机器人首行 y≈410-500、机器人分类行
         # y≈201-352）必须放行，故用页面状态位限定。不产生任何 adb 开销。
         self._page_tc = False
+        # 方案 A（2026-09-28 用户需求）：进台即读广告配额缓存。_enter_taskcenter
+        # 成功返回前读一次「看广告/获取随机」行 X/Y 暂存于此，供后续
+        # _rotate_watch_once / _watch_ads_session 的 base 校准直接复用 ——
+        # 免去它们进台后再次滚动查找该行（原实现读不到会 swipe 上下反复找，
+        # 即用户观察到的"进任务中心后一直下滑刷新"）。
+        # 语义：None=未读到/未进台（消费端回退到原地读屏，行为与旧版一致）；
+        #       (X, Y)=进台瞬间屏幕进度（消费端算 base = X - done）。
+        self._tc_entry_ratio = None
+        # 电量统计（2026-09-29 用户需求）：账号级「本流程获得电量」。
+        # _energy_start = 本账号第一台机器人首次进台后读的「当前电量」；
+        # _energy_end = 广告阶段全部结束后补一次进台读的终值；差值即本地
+        # 流程获得电量。读不到为 None（不阻断主流程，汇总标注失败）。
+        self._energy_start: Optional[int] = None
+        self._energy_end: Optional[int] = None
+        # 起始读数「已尝试」标志：读失败（覆盖层/版式差异）也只试一次 ——
+        # 否则每次进台重读，失败场景 90 支 × 2-4s 纯浪费。中途补读的值也
+        # 不是真「起始」，单次尝试是诚实语义。
+        self._energy_start_done = False
+        # 运行汇总记账（2026-09-22 用户需求）：每台机器人 签到/反馈结果 +
+        # 本次进程看广告支数。全部复用现有分支顺手记账，零额外读屏开销；
+        # 流程结束由 _log_summary() 统一输出（日志 + logs/summary_*.txt）。
+        self.stats = {}
+        # 反馈防重记录文件（2026-09-26 用户方案）：每次生成反馈内容前排除历史
+        # 已用、生成后追加记录（跨进程防重复 —— 官方按「账号+内容」去重且窗口
+        # 未知，宁可永久不用）。相对路径与 _diag_shot 的 screenshots/ 风格一致；
+        # 单测里置 None 可完全跳过文件 IO。
+        self._fb_used_path = "logs/feedback_used.txt"
         # ---- A2/A3 缓存（2026-09-12）：截图 TTL 缓存 + OCR 结果短缓存 ----
         # 背景：_ocr_shot 每次都跑一次 screencap subprocess（~0.5-1s），而
         # _dismiss_badcase 一次连做两张全屏 OCR、_close_ad 确认阶段反复读屏 ——
@@ -189,6 +255,15 @@ class Flow:
         self._shot_cache = None
         self._shot_ts = 0.0
         self._ocr_result_cache = {}   # key -> (pos|None, ts)
+        # 方案 A（2026-09-29 游迦 9/10 实锤）：本次 _close_ad 是否「可疑」——
+        # 全程未点到任何关闭按钮、仅凭 OCR 判定已在任务中心就返回成功。
+        # 该路径无法区分「广告已自动播完（官方已计入）」与「tap 从未触发/
+        # 广告页从未打开（未计入）」→ _watch_ads_session 收尾据此决定是否
+        # 读屏复核配额（详见 _verify_session_quota）。
+        self._ad_close_suspicious = False
+        # 反馈内容已用集合（2026-09-26）：None=未从记录文件懒加载；单测可预设
+        # 空 set 跳过文件 IO。防重细节见 _new_feedback_text。
+        self._fb_used = None
 
     # ----------------------------------------------------------
     # 基础：uiautomator 定位（带滚动）
@@ -206,11 +281,17 @@ class Flow:
     # 任务中心行定位 + 完成度判定（2026-09-09 校准点）
     # ----------------------------------------------------------
     # 任务中心行内含 "X/Y" 计数：1/1=今日已签到/已反馈/已完成；X/10=已看广告 X 次。
-    # 实测截图证据：每日签到 1/1 +「连签2天」按钮；问题反馈 1/1 +「去反馈」按钮；
-    # 看广告 2/10 +「获取随机」按钮；**满额（10/10）后按钮文案变「已完成」**
-    # （2026-09-10 代柯 dump 实锤，行标题「看广告」不变）。注意 X/Y 计数在 dump
-    # 里可能被拆成多个节点（'10' '/' '10'），解析见 _row_completion 第 2 遍。
-    _ROW_RATIO_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+    # 实测截图证据（2026-09-10）：每日签到 1/1 +「连签2天」；问题反馈 1/1 +「去反馈」；
+    # 广告行 2/10 +「获取随机」按钮；**满额（10/10）后按钮文案变「已完成」**
+    # （代柯 dump 实锤）。注意 X/Y 计数在 dump 里可能被拆成多个节点（'10' '/' '10'），
+    # 解析见 _row_completion 第 2 遍。
+    # ⚠️ 行标题**会**随官方改版变化（2026-09-28 实锤：「看广告」→「看视频赚电量」，
+    # 原「看广告」节点不复存在）——不要用"行标题不变"做任何设计假设，行定位统一走
+    # AD_ROW_LABELS 常量（本文件顶部），X/Y 计数才是稳定判据。
+    # 分子/分母均限 2 位（2026-09-30 修 /1000 串扰）：本 app 任务行配额恒为
+    # 1（签到/反馈 1/1）或 X/10（广告），2 位足矣；限位可避免把邻近数字
+    # （电量等）拼进分母（实测偶发把 "…2/10" 读成 (2,1000)）。
+    _ROW_RATIO_RE = re.compile(r"^\s*(\d{1,2})\s*/\s*(\d{1,2})\s*$")
 
     def _row_completion(self, label_node: Node) -> Optional[Tuple[int, int]]:
         """读 label 行内的 X/Y 计数（仅同 y 范围 ±30px 的节点，避免误命中其他行）。
@@ -233,7 +314,7 @@ class Flow:
         # 第 2 遍：拆分节点按 x 序拼接后 search
         band.sort(key=lambda nd_: nd_.x1)
         joined = "".join(nd_.text for nd_ in band)
-        m = re.search(r"(\d+)\s*/\s*(\d+)", joined)
+        m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})", joined)
         if m:
             return int(m.group(1)), int(m.group(2))
         return None
@@ -246,7 +327,10 @@ class Flow:
 
         alt_labels（2026-09-10）：同轮滚动里同时匹配的备选词 —— 满额后按钮
         文案变化（获取随机 → 已完成，代柯 10/10 实测），用「行标题 + 按钮词」
-        同轮查找一次命中，避免两轮各 28s 空滚（期间易被重弹问卷盖住）。"""
+        同轮查找一次命中，避免两轮各 28s 空滚（期间易被重弹问卷盖住）。
+        2026-09-28：行标题亦会改版（「看广告」→「看视频赚电量」），广告行调用方
+        统一传 AD_ROW_LABELS[0] / AD_ROW_LABELS[1:]（本文件顶部常量），
+        文案再改只改一处。"""
         if alt_labels:
             n = self._find_scroll_any((label,) + tuple(alt_labels),
                                       max_scroll=max_scroll)
@@ -303,9 +387,10 @@ class Flow:
                          ok: Optional[Callable[[Node], bool]] = None) -> Optional[Node]:
         """_find_scroll 的多文本版：同轮滚动里任一 label 命中即返回（2026-09-10）。
 
-        用途：任务中心行定位 —— 满额后按钮文案变化（获取随机 → 已完成），
-        行标题「看广告」不变；两个词同轮查找，避免先 28s 空找按钮词再重滚
-        找标题（期间可能被 ~40s 重弹的 Badcase 问卷盖住，18:35 实测）。"""
+        用途：任务中心行定位 —— 满额后按钮文案变化（获取随机 → 已完成）；
+        行标题也可能改版（2026-09-28「看广告」→「看视频赚电量」，见 AD_ROW_LABELS）；
+        多词同轮查找，避免先 28s 空找按钮词再重滚找标题（期间可能被 ~40s 重弹的
+        Badcase 问卷盖住，18:35 实测）。"""
         return self._find_scroll_match(lambda x: x.text in labels, max_scroll,
                                        down_first, ok)
 
@@ -446,6 +531,29 @@ class Flow:
                    and x2_lo <= x.x2 <= x2_hi
                    for x in cur)
 
+    def _cat_bar_node(self, cur) -> Optional[Node]:
+        """单快照版：返回中部「机器人」分类节点（selected 且 x 在实测范围），
+        不在则 None。供折叠态判定 / 幽灵行防御取栏体 y 边界用（坑 15）。"""
+        x1_lo, x1_hi = ROBOT_CAT_X1
+        x2_lo, x2_hi = ROBOT_CAT_X2
+        for x in cur:
+            if (x.text in ROBOT_CAT_TEXTS and x.selected
+                    and x1_lo <= x.x1 <= x1_hi
+                    and x2_lo <= x.x2 <= x2_hi):
+                return x
+        return None
+
+    def _collapsed_groups_on_nodes(self, cur) -> bool:
+        """单快照版：当前是否处于「分组折叠态」—— QQ 主壳 + 机器人分类
+        selected 都在，但屏上没有任何平铺机器人行（坑 15：10:56 实测，
+        此态 dump 读不到分组头节点、_looks_like_robot_list 旧判据会误判
+        True → 导航快路径/安全返回全部短路、4 台连环弃权）。"""
+        if not any(x.text == CONTACTS_TAB and x.y1 >= TAB_Y for x in cur):
+            return False
+        if self._cat_bar_node(cur) is None:
+            return False
+        return not any(self._is_robot_row(x) for x in cur)
+
     def _looks_like_robot_list(self) -> bool:
         """强判据：当前确实停留在「机器人列表视图」才返回 True。
 
@@ -499,6 +607,15 @@ class Flow:
             logger.warning(
                 "容忍残余「发消息」节点(y=%s)，按机器人列表处理（坑12："
                 "多页残影 dump 穿透）", stray)
+        # 坑 15（2026-09-17）：折叠态防御。联系人>机器人 分类选中但分组被
+        # 折叠时，壳信号 + 分类 selected 仍满足、也无否决词 —— 旧判据在此
+        # 误判 True → 导航快路径 0.0s 跳过、安全返回 0 次 BACK，折叠页上
+        # 永远找不到行（实测 4 台 × 3 次 = 12 连败弃权）。列表展开态必然
+        # 有 ≥1 个行节点（x1≈183 列），缺失即折叠态 → False，交 nav 完整
+        # 导航走 OCR 展开兜底。
+        if not any(self._is_robot_row(x) for x in cur):
+            logger.info("强判据：壳+分类选中但无平铺机器人行 → 判定分组折叠态")
+            return False
         return True
 
     def _wait_until(self, pred: Callable[[], bool], timeout: float,
@@ -556,7 +673,19 @@ class Flow:
         实现此时误判“已回列表”直接返回，随后在错误主 tab 上滚动找机器人名
         ——改为转 _nav_robot_list 走完整导航真正进到列表。两者都不是则物理
         返回一层（BACK 不依赖 dump），上限 max_back 次避免死循环。
+
+        ⚠️ 觅夏资料卡卡死事故（2026-09-30）：`_on_qq_main_shell` 是**弱判据**——
+        机器人资料卡（WebView/H5 全屏页，uiautomator dump **读不到**）盖顶时，
+        dump 穿透读到**背景机器人列表**底部「联系人」tab → 弱判据误判“已回主壳”
+        → 旧实现在此**立即**转 `_nav_robot_list` 并 `return`（实测 0.17s、0 次
+        BACK 就交接）。而资料卡页上 `_looks_like_robot_list` 恒 False、导航
+        （在错误坐标上乱点）必然失败 → 直接返回 False → 上层连败弃权（实测
+        7 台机器人连环弃权、6.5 分钟卡死）。**BACK 是唯一能清掉这种 dump 不可见
+        覆盖层的动作**，却被这一步跳过了。
+        修复：完整导航**最多尝试 1 次**；导航未确认列表后**不再提前收手**，
+        落下去继续物理返回（不在此 return），直到强判据通过或达 max_back 上限。
         """
+
         logger.warning("安全返回机器人列表（异常页兜底，上限 %d 次物理返回）",
                        max_back)
         # F11：离开任务中心语义 → 关闭 banner 禁点区（列表页 y<440 的点击合法）
@@ -571,16 +700,29 @@ class Flow:
                 return False
 
         blind = 0
+        nav_tried = False   # 觅夏事故防御（2026-09-30）：主壳弱判据命中后完整导航最多 1 次
         for i in range(max_back):
             if self._looks_like_robot_list():
                 self._at_robot_list = True
                 logger.info("安全返回成功（第 %d 步，已在机器人列表）", i + 1)
                 return True
             if self._on_qq_main_shell():
-                logger.info("已回到 QQ 主界面壳（第 %d 步），转完整导航", i + 1)
-                self._at_robot_list = False
-                self._nav_robot_list()
-                return bool(self._at_robot_list and self._looks_like_robot_list())
+                if not nav_tried:
+                    nav_tried = True
+                    logger.info("已回到 QQ 主界面壳（第 %d 步），转完整导航", i + 1)
+                    self._at_robot_list = False
+                    self._nav_robot_list()
+                    if self._at_robot_list and self._looks_like_robot_list():
+                        return True
+                    # 导航未确认列表：弱判据可能被 WebView 资料卡 dump 穿透欺骗
+                    # （见 docstring 觅夏事故）——不再 return（旧行为会在错误页上
+                    # 反复导航乱点并直接返回 False 让上层弃权），落到下方继续
+                    # 物理返回。BACK 才能清掉 dump 读不到的覆盖层。
+                    logger.warning(
+                        "主壳弱判据命中但导航后仍未确认机器人列表（疑资料卡/子页 "
+                        "被 dump 穿透盖屏）→ 不再重复导航，改为继续物理返回"
+                        "（第 %d 步，觅夏事故防御 2026-09-30）", i + 1)
+                # else：已导航过仍未回列表 → 直接落到下方继续 BACK
             # 盲按熔断（2026-09-13 小麦事故）：dump 连续失败时两道判据全是瞎的，
             # 继续盲按 BACK 会过度返回（退穿列表顶出资料卡，卡死后续全部机器人）
             # —— 盲区最多按 3 次就停手上报，把页面留给下一台的自愈路径。
@@ -635,6 +777,7 @@ class Flow:
         # 盖顶时 dump 穿透读到背景列表文本，导航 4 次尝试全在假列表里找人名
         # （实测每台空烧 ~6 分钟、3 台配额丢失）。清完浮层导航即可自愈。
         self._dismiss_badcase()
+        ocr_tried = False   # 坑 15：折叠态 OCR 展开每次导航最多尝试 1 次
         for _ in range(4):
             if self._dump_stuck():
                 logger.warning("导航途中页面持续 dump 失败，转安全返回")
@@ -678,6 +821,26 @@ class Flow:
                                                  self._nav_target_wait(),
                                                  desc="分组头展开为列表")
                                 break
+                if not self._looks_like_robot_list() and not ocr_tried:
+                    # 坑 15（2026-09-17）：折叠态自愈。分类已 selected 但分组
+                    # 被折叠时，dump 读不到「我添加的机器人」分组头节点（实测
+                    # 截图有、dump 无）→ 上面的节点兜底必空转。此态改用 OCR
+                    # 全屏定位分组头并点击展开；每次导航最多尝试 1 次防连环
+                    # OCR 空烧（全屏 OCR ~2-3s）。
+                    cur = list(self.ui.nodes())
+                    if self._collapsed_groups_on_nodes(cur):
+                        ocr_tried = True
+                        pos = self._ocr_find("我添加的机器人",
+                                             "我创建的机器人", retries=1)
+                        if pos:
+                            logger.info("OCR 定位折叠分组头 @ %s → 点击展开"
+                                        "（坑 15）", pos)
+                            self._tap(pos[0], pos[1])
+                            self._wait_until(self._looks_like_robot_list,
+                                             self._nav_target_wait(),
+                                             desc="OCR展开分组头")
+                        else:
+                            logger.warning("折叠态 OCR 未定位到分组头（坑 15）")
             else:
                 logger.debug("不在 QQ 主界面壳，物理返回一层")
                 self.ui.back(pause=1.5)
@@ -720,6 +883,7 @@ class Flow:
                     name, r.x1, r.y1, self._at_robot_list,
                     self._looks_like_robot_list())
         self.ui.refresh()
+        row = None
         for x in self.ui.nodes():
             if x.text == name and self._is_robot_row(x):
                 if (x.x1, x.y1, x.x2, x.y2) != (r.x1, r.y1, r.x2, r.y2):
@@ -727,12 +891,67 @@ class Flow:
                                 "(%d,%d)-(%d,%d)，防动画中间帧点错",
                                 r.x1, r.y1, r.x2, r.y2,
                                 x.x1, x.y1, x.x2, x.y2)
-                return x
-        logger.warning("点击前重 dump 找不到 %s 行（页面可能已漂移），"
-                       "放弃本次点击交复位重试；屏文=%s",
-                       name, self._screen_texts(12))
-        self._diag_shot("enter_vanished")
-        return None
+                row = x
+                break
+        if row is None:
+            logger.warning("点击前重 dump 找不到 %s 行（页面可能已漂移），"
+                           "放弃本次点击交复位重试；屏文=%s",
+                           name, self._screen_texts(12))
+            self._diag_shot("enter_vanished")
+            return None
+        # 坑 15（2026-09-17）幽灵行防御：列表滚动后目标行处于「吸顶分类栏
+        # 下缘第一个槽位」（行.y1 - 栏.y2 < 一个行距）时，dump 可能报
+        # ListView 回收残影 —— 视觉上该槽位实为「我添加的机器人」分组头
+        # （10:56 实测：按残影坐标点 (256,392) 落在分组头上 → 列表被折叠
+        # → 4 台 × 3 次连环弃权）。该槽位内的行一律不直接点：先下滑让目标
+        # 行离开边界槽位再重找；两次纠正仍在槽内 → 放弃交上层复位。
+        for _ in range(2):
+            self.ui.refresh()
+            bar = self._cat_bar_node(list(self.ui.nodes()))
+            if (bar is None or bar.y1 >= CAT_BAR_PINNED_Y
+                    or row.y1 - bar.y2 >= ROW_PITCH):
+                break          # 未吸顶或行离栏缘超过一个行距 → 继续 F9 检查
+            logger.warning(
+                "目标 %s 行 @(%d,%d) 紧贴吸顶分类栏下缘（栏底 y=%d）——"
+                "分组头回收残影区（坑 15），下滑让位后重找",
+                name, row.x1, row.y1, bar.y2)
+            self.ui.swipe_down(pause=1.0)
+            moved = self._find_robot(name)
+            if moved is None:
+                logger.warning("下滑后找不到 %s 行，放弃本次点击交复位重试",
+                               name)
+                return None
+            row = moved
+        else:
+            logger.warning("%s 行两次下滑纠正后仍紧贴分类栏，放弃点击交复位重试",
+                           name)
+            return None
+        # F9（2026-09-29 修复）：行底部越界（中心 y 或 y2 > TAP_Y_MAX=1740）时
+        # 直接点会盲钳到上一行（藤非 y=1791 → 1740 命中桑祁，9/10 三连败实锤）。
+        # 改为上滑让位：把行滚入安全点击区后重找，最多 2 次。
+        for attempt in (1, 2):
+            cy = (row.y1 + row.y2) // 2
+            if cy <= TAP_Y_MAX and row.y2 <= TAP_Y_MAX:
+                break
+            logger.warning(
+                "目标 %s 行 @(%d,%d) 超出安全点击区（cy=%d y2=%d > %d）——"
+                "上滑让位后重找（F9 修复，2026-09-29）",
+                name, row.x1, row.y1, cy, row.y2, TAP_Y_MAX)
+            self.ui.swipe_up(pause=1.0)
+            moved = self._find_robot(name)
+            if moved is None:
+                logger.warning("上滑第 %d 次后找不到 %s 行，放弃本次点击交复位重试",
+                               attempt, name)
+                return None
+            row = moved
+        else:
+            # for 正常结束（未 break）：检查最后一次 row 是否仍越界
+            cy = (row.y1 + row.y2) // 2
+            if cy > TAP_Y_MAX or row.y2 > TAP_Y_MAX:
+                logger.error("%s 行两次上滑仍无法进入安全点击区，放弃点击", name)
+                self._diag_shot("reconfirm_row_oob")
+                return None
+        return row
 
     def _screen_robot_names(self) -> List[str]:
         """当前屏所有符合昵称识别规则的文本（不去重、不落日志）。
@@ -838,6 +1057,58 @@ class Flow:
         logger.info("共收集到 %d 个机器人: %s", len(names), names)
         return names
 
+    # F12（2026-09-25）：官方给单个机器人上线新功能时的一次性弹窗（每功能
+    # 仅出现一次，之后不再出现）。实测（尔尔「你蹲蹲的玩法已经上线」，dump+截图）：
+    #   - 弹窗结构：标题「XX的玩法已经上线」+ 右上角「关闭」按钮（dump 节点
+    #     实测 (897,774)-(1056,909)）+ 底部「去体验」大按钮（**绝不可点**，
+    #     点击会跳转新功能页破坏流程）；弹窗盖在任务中心 H5 之上，任务行全遮挡。
+    #   - 稳定特征 = 「关闭」节点 与 「已经上线」文案 **同屏**（双特征确认，
+    #     防误关其它含「关闭」的界面；任务中心/签到浮层/广告页/心动卡促销的
+    #     历史 dump 均无「已经上线」）。若官方日后改模板致检测失效，退化为
+    #     现状（进台失败重试跳过），不会更糟。
+    _NEWFEAT_KEY = "已经上线"
+    _NEWFEAT_CLOSE = "关闭"
+
+    def _dismiss_newfeat_popup(self) -> bool:
+        """检测并关闭「新功能上线」弹窗。返回是否执行了关闭。
+
+        双特征确认才点（_tap_node 走 dump 节点，不涉坐标盲点）；正常路径
+        仅 +1 次 dump（u2 ~0.1s，有缓存期内复用），无弹窗时零额外动作。
+        """
+        close = self._find(self._NEWFEAT_CLOSE)
+        if not close or not self.ui.find_contains(self._NEWFEAT_KEY):
+            return False
+        logger.info("检测到新功能上线弹窗 → 关闭（屏文=%s）",
+                    self._screen_texts(8))
+        self._tap_node(close)
+        time.sleep(1.5)
+        # 确认消失；仍在（动画/双弹窗）再点一次，最多重试 1 次
+        close = self._find(self._NEWFEAT_CLOSE)
+        if close and self.ui.find_contains(self._NEWFEAT_KEY):
+            logger.warning("新功能弹窗关闭后仍在屏，重试一次")
+            self._tap_node(close)
+            time.sleep(1.5)
+        return True
+
+    def _enter_tap_pause(self) -> float:
+        """进台三处点击的 pause（workflow.enter_tap_pause_min/max，默认 0.5-0.9s）。
+
+        2026-09-29 P1b：进台 9.5s 里 6.75s（70%）是三处 `_tap_node` 后的固定
+        pause 空等 —— 诊断实测（王 92 轮 / 唐六爻 91 轮进台打点）段3/段4/段5
+        的分布形状完全等于 uniform(1.5, 3.0)（最小值恒卡 1.6-1.8s、88-92% 落在
+        [1.4, 3.05]），而紧随其后的 `wait_for` 才是真就绪判据 → 页面早就在
+        pause 窗口内加载完了。故此处只保留一个**小随机 floor**（仍非零、非固定，
+        维持非机械节奏），就绪交给 wait_for 轮询。
+
+        注意：`timing.click_min/click_max` 的设计原意是「页面动画起步 floor」
+        （见 MEMORY A1 段），**不是防风控**（风控靠 ad_cooldown + C2 坐标抖动），
+        且本旋钮**只作用于进台**——签到/反馈/关广告/退台节奏完全不变。
+        设回 min:1.5 / max:3.0 即一键回退旧行为。
+        """
+        lo = float(self.wf.get("enter_tap_pause_min", 0.5))
+        hi = float(self.wf.get("enter_tap_pause_max", 0.9))
+        return random.uniform(min(lo, hi), max(lo, hi))
+
     def _enter_taskcenter(self, name: str) -> bool:
         """进入指定机器人的任务中心(WebView)。
 
@@ -848,6 +1119,8 @@ class Flow:
         logger.info("进入机器人任务中心: %s", name)
         t_start = time.time()
         t0 = t_start
+        # 方案 A：清上次进台的旧配额缓存，避免进台失败时残留值被误复用。
+        self._tc_entry_ratio = None
         self._nav_robot_list()
         t0 = self._stage(t0, "进台.1导航列表")
         r = self._find_robot(name)
@@ -861,15 +1134,25 @@ class Flow:
         if r is None:
             return False
         t0 = self._stage(t0, "进台.2找行+现场")
-        # F9：tap y 上钳到 TAP_Y_MAX，避开底部 nav 边缘手势区
-        # （藤非 y=1771 → 1740 上移 31px；游迦 y=1684 不动）。
-        cx, cy = r.center
-        if cy > TAP_Y_MAX:
-            logger.info("机器人行 tap y 上钳 %d -> %d（防 nav 边缘回弹）", cy, TAP_Y_MAX)
-            cy = TAP_Y_MAX
-        self._tap(cx, cy)
+        # F9（2026-09-29）：机器人行底部越界已由 _reconfirm_click_target
+        # 上滑让位并返回安全节点，此处直接点节点中心（_tap_node 带随机抖动）。
+        # P1b（2026-09-29）：pause 从 timing.click_min/max（1.5-3.0s，均值 2.25s）
+        # 收到 workflow.enter_tap_pause_min/max（默认 0.5-0.9s）—— 诊断实测该
+        # pause 是进台 70% 耗时的来源，就绪由下方 wait_for 轮询兜底。
+        wv_fast = self.wf.get("nav_fast_wait", True)
+        wv_int = 0.5 if wv_fast else 1.0
+        # 总窗口守恒：pause 收窄的秒数折成额外轮询次数（旧 pause 均值
+        # ENTER_TAP_PAUSE_REF + retries×interval），慢页最坏等待不缩短。
+        ep = self._enter_tap_pause()
+        ep_extra = max(0, int(round((ENTER_TAP_PAUSE_REF - ep) / wv_int)))
+        self._tap_node(r, pause=ep)
         # profile -> 发消息（条件等待；F2：H5 profile 加载慢时 8s 偏短 → 12s）
-        n = self.ui.wait_for("发消息", retries=12, interval=1.0)
+        # P1（2026-09-29）：u2 后端单次探测毫秒级，轮询间隔 1.0→0.5s 减少
+        # 页面就绪后的过冲空等（均值省 ~0.5s/段）；retries 加倍保持 12s
+        # 总窗口不变。workflow.nav_fast_wait: false 回退 1.0s 旧行为。
+        n = self.ui.wait_for("发消息",
+                             retries=(24 if wv_fast else 12) + ep_extra,
+                             interval=wv_int)
         if not n:
             logger.error("profile 没找到 发消息；屏文=%s looks=%s at_list=%s",
                          self._screen_texts(12), self._looks_like_robot_list(),
@@ -877,15 +1160,24 @@ class Flow:
             self._diag_shot("enter_profile")
             return False
         t0 = self._stage(t0, "进台.3点行到发消息")
-        self._tap_node(n)
+        ep = self._enter_tap_pause()
+        ep_extra = max(0, int(round((ENTER_TAP_PAUSE_REF - ep) / wv_int)))
+        self._tap_node(n, pause=ep)
         # 聊天页 -> 个人（同样条件等待；"个人"在输入框上方 y>=600）
-        n = self.ui.wait_for("个人", retries=8, interval=1.0, ymin=600)
+        n = self.ui.wait_for("个人",
+                             retries=(16 if wv_fast else 8) + ep_extra,
+                             interval=wv_int, ymin=600)
         if not n:
             logger.error("聊天页没找到 个人；屏文=%s", self._screen_texts(12))
             self._diag_shot("enter_private")
             return False
         t0 = self._stage(t0, "进台.4发消息到个人")
-        self._tap_node(n)
+        self._tap_node(n, pause=self._enter_tap_pause())
+        # F12（2026-09-25）：官方给单个机器人上线新功能时会弹「XX的玩法已经上线」
+        # 弹窗（每功能一次；实测 尔尔「你蹲蹲的玩法已经上线」，dump+截图）——
+        # 盖在任务中心 H5 之上，不关则任务行全被遮挡 → 签到/反馈找不到行。
+        # 立即检测关闭（主检测；实测弹窗随个人页即刻弹出）。
+        self._dismiss_newfeat_popup()
         # F10(#5 优化)：进入任务中心的固定等待改条件等待——任务中心特征
         # （每日签到/任务中心）出现即继续，H5 加载快时不再空等满 3~3.5s。
         # 未在窗口内出现也不阻塞（不同机器人版式有差异），后续任务操作自带
@@ -921,7 +1213,8 @@ class Flow:
                 for _ in range(2):
                     self.ui.swipe_up()
                     if (self._find("每日签到") or self._find("任务中心")
-                            or self._find("获取随机") or self._find("看广告")):
+                            or self._find("获取随机") or self._find("看广告")
+                            or self._find("看视频赚电量")):
                         found_tc = True
                         logger.info("上滑后已探测到任务行 → 按正常任务中心继续")
                         break
@@ -930,14 +1223,38 @@ class Flow:
                     self._diag_shot("enter_wrongpage")
                     return False
             else:
-                logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
-                            self.t.get("taskcenter_wait", 3.5))
+                # F12 兜底：弹窗可能晚于个人页渲染才弹出（H5 加载时序）——
+                # 关闭后重探任务行，探到即按正常进入继续；否则维持原放行。
+                if self._dismiss_newfeat_popup():
+                    if (self._find("每日签到") or self._find("任务中心")
+                            or self._find("获取随机") or self._find("看广告")
+                            or self._find("看视频赚电量")):
+                        found_tc = True
+                        logger.info("关闭新功能弹窗后已探测到任务行 → 按正常任务中心继续")
+                if not found_tc:
+                    logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
+                                self.t.get("taskcenter_wait", 3.5))
         t0 = self._stage(t0, "进台.5TC加载探测")
         # 已进入某机器人的任务中心：清快路径状态（下次 nav 需重新导航）
         self._at_robot_list = False
         # F11：进入任务中心 → 启用 banner 禁点区（此后本页任何 y<440 的坐标点击
         # 都要过守卫，防误触顶部 banner）。
         self._page_tc = True
+        # 方案 A（2026-09-28）：进台成功即读一次广告配额并缓存，供后续
+        # base 校准复用（免二次滚动查找）。读不到（覆盖层/版式差异）则保持
+        # None —— 消费端会回退到原地读屏，零行为变化。
+        # 注：这里用只读的 _read_ad_ratio（内部 _find_row 只 dump 不 tap/back），
+        # 不改变点击效率，也不引入额外界面动作。
+        self._tc_entry_ratio = self._read_ad_ratio()
+        if self._tc_entry_ratio:
+            logger.info("进台配额缓存 %s（屏幕 %d/%d）", name,
+                        self._tc_entry_ratio[0], self._tc_entry_ratio[1])
+        # 2026-09-29 P1b：补段6打点 —— 原本「段5 → 进台合计」之间的
+        # _read_ad_ratio() 是**未打点盲区**（实测恒定 1.55s，且 _find_row 走
+        # max_scroll=6 会 swipe 把刚进的任务中心页面滚走）。此处**只加一条计时
+        # 日志**，读取行为与判据完全不变（用户 09-29 决策：配额缓存保持现状），
+        # 目的是让这 1.55s 以后在日志里可见、可对比。
+        t0 = self._stage(t0, "进台.6配额缓存")
         logger.info("[计时] 进台合计 %.1fs", time.time() - t_start)
         return True
 
@@ -979,9 +1296,18 @@ class Flow:
                 return self._safe_back_to_robot_list()
         t0 = self._stage(t_start, "退台.0前提校验")
         # 1) 第 1 轮：直接三层 BACK（快路径，不做任何滚动）
+        # P1（2026-09-29 实测改造，探针 probe_exit_timing.py 3 trial）：层3
+        # BACK 后 0.07-0.08s 列表即可被强判据正确检出、层1/2 在 3.5s 窗口内
+        # 20 次检查全不命中 —— 原层间固定 pause(1.2-1.8)+EXIT_LAYER_WAIT(1.2)
+        # ≈2.7s/层 属纯盲等。改为 pause(0.8-1.2)+BACK 后立即单次强校验
+        # （校验判据/层数/兜底全不变，仅去掉无谓等待），退台合计 8.9s → ~3.5s。
+        # workflow.nav_fast_wait: false 一键回退旧行为。
+        fast = self.wf.get("nav_fast_wait", True)
         for layer in (1, 2, 3):
-            self.ui.back(pause=random.uniform(1.2, 1.8))
-            time.sleep(EXIT_LAYER_WAIT)
+            self.ui.back(pause=random.uniform(0.8, 1.2) if fast
+                         else random.uniform(1.2, 1.8))
+            if not fast:
+                time.sleep(EXIT_LAYER_WAIT)
             hit = self._looks_like_robot_list()
             t0 = self._stage(t0, f"退台.第{layer}层")
             if hit:
@@ -999,8 +1325,10 @@ class Flow:
                 logger.warning("滑动到顶途中页面卡死，转安全返回")
                 return self._safe_back_to_robot_list()
             for layer in (1, 2, 3):
-                self.ui.back(pause=random.uniform(1.2, 1.8))
-                time.sleep(EXIT_LAYER_WAIT)
+                self.ui.back(pause=random.uniform(0.8, 1.2) if fast
+                             else random.uniform(1.2, 1.8))
+                if not fast:
+                    time.sleep(EXIT_LAYER_WAIT)
                 if self._looks_like_robot_list():
                     self._at_robot_list = True
                     logger.info("已回到机器人列表（补退第%d层后）", layer)
@@ -1058,6 +1386,9 @@ class Flow:
     # ----------------------------------------------------------
     def _signin(self) -> bool:
         logger.info("== 每日签到 ==")
+        # 汇总记账辅助位：本次调用是"真签到成功"还是"已签跳过"（True=跳过）。
+        # 供 run_robot 区分汇总表里的 成功/已签，不改 bool 返回契约。
+        self._signin_already = False
         row = self._find_row("每日签到")
         if not row:
             logger.warning("未找到 每日签到 行；屏内文本=%s", self._screen_texts())
@@ -1066,6 +1397,7 @@ class Flow:
         # P1 校准：行内含 1/1 → 今日已签到（按钮已变为「连签N天」），跳过避免无效点击
         if ratio and ratio[0] >= ratio[1]:
             logger.info("今日已签到（%d/%d），跳过", ratio[0], ratio[1])
+            self._signin_already = True
             return True
         self._tap_node(btn)
         # P1 断言：应弹出「每日免费领」浮层。
@@ -1105,6 +1437,8 @@ class Flow:
 
     def _feedback(self) -> bool:
         logger.info("== 问题反馈 ==")
+        # 汇总记账辅助位：本次调用是"真反馈成功"还是"已反馈跳过"（True=跳过）。
+        self._feedback_already = False
         row = self._find_row("问题反馈")
         if not row:
             logger.warning("未找到 问题反馈 行；屏内文本=%s", self._screen_texts())
@@ -1113,25 +1447,169 @@ class Flow:
         # P1 校准：1/1 → 今日已反馈（按钮文案保留「去反馈」），跳过避免重复点击
         if ratio and ratio[0] >= ratio[1]:
             logger.info("今日已反馈（%d/%d），跳过", ratio[0], ratio[1])
+            self._feedback_already = True
             return True
         self._tap_node(btn)
-        # P1 断言：应进入反馈问卷页（左上角出现「返回」，y<300 顶部区域）。
-        # 今日已反馈/行无效 → 无问卷 → 复位并判失败。
+        # P1 断言：应进入反馈页（左上角出现「返回」，y<300 顶部区域）。
+        # 今日已反馈/行无效 → 无反馈页 → 复位并判失败。
         back = self.ui.wait_for("返回", retries=6, interval=1.0, ymax=300)
         if back is None:
-            logger.warning("点反馈后未出现问卷页(顶部无 返回)；今日已反馈或行无效"
+            logger.warning("点反馈后未出现反馈页(顶部无 返回)；今日已反馈或行无效"
                            "；屏内文本=%s", self._screen_texts())
             self._reset_after_fail("问题反馈")
             return False
-        # 反馈页左上角返回（文本定位优先，兜底坐标 1080x1920 实测 @(81,139)）
-        self._tap_node(back)
+        # 2026-09-25 官方改版：反馈页需填写内容并点「提交反馈」才算完成反馈
+        # （旧版进页直接返回即可，实测新页面有必填内容框 + 提交按钮）。
+        # 失败 → 物理 BACK 复位后判失败；上层重试时若实际已提交成功（如断言
+        # 超时），任务中心 ratio 已 1/1 会走「已反馈跳过」，不会重复提交。
+        if not self._fill_and_submit_feedback():
+            logger.warning("反馈填写/提交失败")
+            self._reset_after_fail("问题反馈")
+            # 复位后能认出任务中心则恢复 F11 守卫状态位；认不出保持 False，
+            # 由后续进台/退出路径按页面实际状态重设。
+            if self._find("每日签到") or self._find("任务中心"):
+                self._page_tc = True
+            return False
+        # 提交成功结果页左上角「返回」（页面已切换，重新定位；实测成功页返回
+        # 与表单页同位 (27,107)-(135,172)），点它即回任务中心
+        back2 = self.ui.wait_for("返回", retries=4, interval=1.0, ymax=300)
+        if back2 is None:
+            logger.warning("提交成功页未见返回；屏内文本=%s", self._screen_texts())
+            self._reset_after_fail("问题反馈")
+            if self._find("每日签到") or self._find("任务中心"):
+                self._page_tc = True
+            return False
+        self._tap_node(back2)
         time.sleep(self.t.get("page_wait", 2.0))
         # P1 断言：应回到任务中心
         if not (self._find("每日签到") or self._find("任务中心")):
             logger.warning("反馈返回后未见任务中心特征（可能退到错页）；屏内文本=%s",
                            self._screen_texts())
             return False
+        # F11：已回到任务中心，恢复 banner 禁点守卫
+        self._page_tc = True
         logger.info("问题反馈完成")
+        return True
+
+    # ---- 2026-09-25 反馈页改版（官方新增"反馈内容"必填）----
+    # 实测依据（1080x1920 dump+截图，非臆测）：
+    #   - 表单页：反馈类型/所属分类默认「问题/聊天」无需操作；内容输入框为
+    #     WebView 自绘**不在 dump**（placeholder「请仔细描述你的问题」，区域
+    #     y≈495-1089）；字数计数器 'N/500' 在 dump（输入成功断言锚点）；
+    #     底部「提交反馈」按钮 (60,1737)-(1020,1860) 在 dump。
+    #   - ⚠️ 点击 y<500 会命中「反馈类型/所属分类」行跳全屏选择页，且该选择页
+    #     BACK 会直接退出整个反馈页（实测 (300,350) 事故）→ 输入框点击点取
+    #     y=600（placeholder 下方、框内安全区）。
+    #   - 聚焦输入框后 BACK 一次 = 收键盘、不退页（实测）。
+    FEEDBACK_INPUT_POS = (300, 600)   # 内容输入框聚焦点（框内安全区，见上注）
+    FEEDBACK_SUBMIT_Y = 1500          # 底部提交按钮 y1 下限（区分顶部同名标题 y72-207）
+
+    def _new_feedback_text(self) -> str:
+        """生成 5 位随机反馈内容，持久化记录防重复（2026-09-26 用户方案）。
+
+        官方按「账号+内容」去重（用户实测：同账号内只要输入过一次，往后同
+        内容全部被拒），去重窗口未知 → 每次生成前排除 logs/feedback_used.txt
+        里的历史已用、生成后立即追加记录（跨进程永久不用；5 位数共 9 万个，
+        按每账号每天 ~10 次提交可用 6 年+）。文件 IO 异常不阻断主流程（退化为
+        会话内防重）。_fb_used is None 时从记录文件懒加载；单测预设空 set 且
+        _fb_used_path=None 可完全跳过 IO。
+        """
+        if self._fb_used is None:
+            self._fb_used = set()
+            if self._fb_used_path:
+                try:
+                    with open(self._fb_used_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                self._fb_used.add(line)
+                    logger.info("反馈防重记录已加载 %d 条（%s）",
+                                len(self._fb_used), self._fb_used_path)
+                except FileNotFoundError:
+                    pass    # 首次运行，无历史记录
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("反馈防重记录读取失败（忽略，仅会话内防重）：%s", e)
+        for _ in range(50):
+            text = str(random.randint(10000, 99999))
+            if text not in self._fb_used:
+                break
+        else:
+            # 理论不可达（9 万空间）；防御性回退避免死循环
+            logger.error("5 位随机数与历史记录连续冲突 50 次，回退时间戳后缀")
+            text = str(int(time.time()))[-5:]
+        self._fb_used.add(text)
+        if self._fb_used_path:
+            try:
+                with open(self._fb_used_path, "a", encoding="utf-8") as f:
+                    f.write(text + "\n")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("反馈防重记录写入失败（不影响本次提交）：%s", e)
+        return text
+
+    def _fill_and_submit_feedback(self) -> bool:
+        """反馈页内：填写反馈内容（5 位随机数，持久化防重）→ 点「提交反馈」
+        → 断言「提交成功」结果页。
+
+        内容方案（2026-09-26 用户指定，替代 09-25 序号方案）：5 位随机数，
+        每次生成前排除历史已用并记录（logs/feedback_used.txt）。官方按
+        「账号+内容」去重（实测 toast「反馈内容重复了」，toast 不进 dump），
+        同账号内重复内容必被拒；去重窗口未知 → 记录永久不用。
+
+        返回 True=提交成功（页面为结果页，顶部「返回」在屏）；
+        False=任一步失败（页面状态不定，调用方负责复位）。
+        config workflow.feedback_fill 为 false = 回退旧行为（不填写直接算通过）。
+        """
+        if not self.wf.get("feedback_fill", True):
+            logger.info("feedback_fill=false，跳过填写提交（旧行为）")
+            return True
+        # F11 页面状态：进反馈 H5 页 = 已离开任务中心，解除坐标点击守卫
+        # （输入框聚焦是反馈页唯一合法坐标点击）；回任务中心由调用方确认后恢复。
+        self._page_tc = False
+        # 页面守卫：反馈表单特征（计数器 或 反馈类型行）在屏才允许点输入框，
+        # 防错页盲点。计数器 find_contains 兼容任意已填字数（0/500、3/500…）。
+        if not (self.ui.find_contains("/500") or self._find("反馈类型")):
+            logger.warning("反馈页特征缺失（无计数器/反馈类型），不点输入框；"
+                           "屏内文本=%s", self._screen_texts())
+            return False
+        typed = False
+        for attempt in (1, 2):
+            # 内容在循环内生成：重试必须换新内容 —— 官方按「账号+内容」去重，
+            # 同内容重试必再撞「反馈内容重复了」（2026-09-25 实测）。
+            text = self._new_feedback_text()
+            x, y = self.FEEDBACK_INPUT_POS
+            if not self._tap(x, y):
+                return False    # 守卫拦截（理论不可达：上面已置 False）
+            time.sleep(1.2)     # 键盘弹出
+            self.ui.input_text(text)
+            time.sleep(1.0)
+            # 输入成功断言：计数器 N/500（实测 0/500 → 3/500）
+            if self.ui.find_contains("%d/500" % len(text)):
+                typed = True
+                break
+            logger.warning("第 %d 次输入后未见计数器 %d/500，重试",
+                           attempt, len(text))
+        if not typed:
+            logger.error("反馈内容输入失败（计数器始终未见 %d/500）", len(text))
+            return False
+        # BACK 收键盘（实测：输入框聚焦态 BACK 只收键盘不退页）
+        self.ui.back(pause=1.5)
+        time.sleep(1.0)
+        # 提交按钮：dump 节点「提交反馈」，y1 下限区分顶部同名标题（F11：不盲点）
+        submit = [n for n in self.ui.nodes()
+                  if n.text == "提交反馈" and n.y1 > self.FEEDBACK_SUBMIT_Y]
+        if not submit:
+            logger.warning("未找到底部「提交反馈」按钮；屏内文本=%s",
+                           self._screen_texts())
+            return False
+        self._tap_node(submit[0])
+        time.sleep(self.t.get("page_wait", 2.0))
+        # 提交成功断言：结果页标题/正文均含「提交成功」（子串匹配，与表单页
+        # 「提交反馈」无歧义）
+        if not self.ui.wait_contains("提交成功", retries=5, interval=1.0):
+            logger.warning("提交后未见「提交成功」页；屏内文本=%s",
+                           self._screen_texts())
+            return False
+        logger.info("反馈提交成功（内容=%r）", text)
         return True
 
     def _reset_after_fail(self, ctx: str):
@@ -1160,7 +1638,7 @@ class Flow:
         # dump——实测 708/708 次点开段 ≥5s 的主因就是这里的现场 dump。
         # row=None（首轮/兜底）行为与旧版完全一致：现场 dump 查找。
         if row is None:
-            row = self._find_row("看广告", alt_labels=("获取随机",))
+            row = self._find_row(AD_ROW_LABELS[0], alt_labels=AD_ROW_LABELS[1:])
             if not row:
                 # 破死锁（2026-09-14 尔尔插屏事故）：find_row 失败 ≠ 页面异常
                 # ——上一支广告可能还赖在屏幕上（下载型插屏视频常驻 → uiautomator
@@ -1177,7 +1655,8 @@ class Flow:
                     logger.error("广告残留清场失败")
                     return False
                 time.sleep(self.t.get("ad_close_wait", 2.0))
-                row = self._find_row("看广告", alt_labels=("获取随机",))
+                row = self._find_row(AD_ROW_LABELS[0],
+                                     alt_labels=AD_ROW_LABELS[1:])
                 if not row:
                     logger.warning("清场后仍未找到 看广告/获取随机 行")
                     return False
@@ -1227,7 +1706,9 @@ class Flow:
         # 关闭广告：关键！广告页 WebView 文字 uiautomator 读不到（会穿透读到
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
+        t_close0 = time.time()        # P1（2026-09-29）：关闭链耗时埋点
         closed = self._close_ad(tc_seen=False, sheet_ok=sheet_ok)
+        logger.info("[计时] 广告关闭链 %.1fs", time.time() - t_close0)
         # E 优化：预定位坐标只在本观看周期内有效，无论关闭成败一律作废，
         # 防旧坐标泄漏到后续其它 _close_ad 调用路径（残留清场等）被误消费。
         self._prefetch_close = None
@@ -1290,10 +1771,20 @@ class Flow:
         保守策略。供 run_all 进台时读取基数：后续配额收尾用「基数 + 本会话已看」
         算术预判，不必每次看完都读屏（省审计 C2 的 dump 超时空等）。
         """
-        row = self._find_row("看广告", alt_labels=("获取随机",))
+        row = self._find_row(AD_ROW_LABELS[0], alt_labels=AD_ROW_LABELS[1:])
         if not row:
             return None
         _btn, _label, ratio = row
+        if not ratio:
+            return None
+        # 分母必须是日配额（广告行恒为 X/ad_times_per_robot，2026-09-30）：
+        # 读到不符的分母（如串扰成 (2,1000)）说明命中了错误数字 → 视为读不到，
+        # 走调用方的保守回退（宁可不校准，也不拿错数污染 base / 重锚）。
+        quota = int(self.wf.get("ad_times_per_robot", 10))
+        if ratio[1] != quota:
+            logger.warning("_read_ad_ratio 分母异常（%d/%d，期望 /%d）→ 视为读不到",
+                           ratio[0], ratio[1], quota)
+            return None
         return ratio
 
     def _ad_quota_done(self) -> bool:
@@ -1308,6 +1799,45 @@ class Flow:
         target = self.wf.get("ad_times_per_robot", 10)
         ratio = self._read_ad_ratio()
         return bool(ratio and ratio[0] >= target)
+
+    def _verify_session_quota(self, name: str, done: int) -> int:
+        """方案 A（2026-09-29 游迦 9/10 实锤）：连看会话收尾 break 前读屏复核。
+
+        背景：末支广告 tap 未触发 → 广告页从未打开 → `_close_ad` 双 OCR 判
+        「已在任务中心，无需关闭」（`_ad_close_suspicious=True`）→ done 无条件
+        +1 虚报。09-13 B 优化删除观看后预检时假设「tap 未触发靠下次进台读屏
+        自然纠偏（实测 0 例）」，但 09-28 方案 A/C 引入算术收尾后连看会话
+        收尾不再读屏，「自然纠偏」通道消失 → 出现第 1 例（游迦 10/10 vs 屏
+        幕 9/10）。
+
+        策略：先沉降 ad_close_settle（默认 2.0s）再读屏，失败再等 2s 重试
+        一次，共 2 次机会：
+        - 读到 X：返回 X（屏幕真值）。调用方以 X 继续 while 循环 → 差几支
+          补几支；X>=配额则正常收尾。done 口径本就是「屏幕等价计数」
+          （start_done+已看，entry_ratio 同口径），直接覆盖语义一致。
+        - 两次读不到：保守返回原 done（维持旧行为，不引入新失败模式）。
+
+        仅在末支关闭路径可疑时被调用（正常关闭路径零额外读屏）。
+        """
+        for i in (1, 2):
+            time.sleep(float(self.wf.get("ad_close_settle", 2.0))
+                       if i == 1 else 2.0)
+            ratio = self._read_ad_ratio()
+            if ratio is None:
+                logger.warning("%s 收尾配额复核：第 %d 次读屏失败", name, i)
+                continue
+            actual = ratio[0]
+            if actual < done:
+                logger.warning("%s 收尾配额复核：屏幕 %d/%d < 本会话计数 %d"
+                               "（tap 未触发/未计入实锤）→ 按屏幕真值校准",
+                               name, actual, ratio[1], done)
+            else:
+                logger.info("%s 收尾配额复核：屏幕 %d/%d（本会话计数 %d，一致或"
+                            "有手动补看）", name, actual, ratio[1], done)
+            return actual
+        logger.warning("%s 收尾配额复核：两次读屏均失败 → 保守按原计数 %d 收尾",
+                       name, done)
+        return done
 
     # ----------------------------------------------------------
     # Badcase 问卷巡检（L3 2026-09-09 末次加固）
@@ -1422,12 +1952,17 @@ class Flow:
           - ai:  命中 _AI_FRIEND_HINTS 任一词 且 未命中 _TC_KEYS_OCR 任一词
           - profile: 命中 _PROFILE_KEYS 任一词（2026-09-13 小麦事故新增）
         返回 (bad, ai, profile)。OCR 不可用/截图失败返回 (False, False, False)
-        （与原逻辑"读不到=不认账"一致）。
+        （与原逻辑"读不到=不认账"一致）——但补一条 WARNING：觅夏事故（2026-09-30）
+        暴露出这种"失明即放行"若静默，真机排障无从判断覆盖层漏检是"没命中"还是
+        "根本没读到屏"。行为不变，仅让盲区可见。
         """
         if not _HAS_OCR:
+            logger.warning("_overlay_scan：OCR 不可用 → 覆盖层判定失明（返回无 overlay）")
             return False, False, False
         img = self._ocr_shot()
         if img is None:
+            logger.warning("_overlay_scan：截图失败 → 覆盖层判定失明（本次按无 overlay "
+                           "放行，注意资料卡/问卷可能漏检）")
             return False, False, False
         data = pytesseract.image_to_data(
             img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
@@ -1623,8 +2158,16 @@ class Flow:
             return (x, y)
         return None
 
-    def _back_at_taskcenter(self, timeout: Optional[float] = None) -> bool:
+    def _back_at_taskcenter(self, timeout: Optional[float] = None,
+                            allow_dump_fallback: bool = False) -> bool:
         """判断是否真的回到了「任务中心」页面（F10+ 严格版）。
+
+        allow_dump_fallback（2026-09-27 新增，默认关）：OCR 快通道判「不在任务
+        中心」时，额外用 dump 复核一次（`_dump_confirms_taskcenter`）。**只给
+        即将执行破坏性动作的调用方开** —— `_close_ad` 的物理 BACK 兜底（误判会
+        退穿到 QQ 联系人页，实测 3 次 BACK 退 3 层）与连看会话的复位重进决策
+        （误判会触发全量重新进台＝页面反复刷新）。不开则行为与旧版完全一致，
+        成功/正常路径零额外开销。
 
         timeout（2026-09-11 优化 A）：透传给 dump，供 _close_ad 关闭广告场景压低
         确认阶段的单次 dump 等待（默认 None→DUMP_TIMEOUT=4s；_close_ad 传
@@ -1660,10 +2203,15 @@ class Flow:
         if self.wf.get("tc_confirm_skip_dump", True):
             tc, _pill, _overlay = self._fullscreen_scan()
             if not tc:
+                # 2026-09-27：OCR 快通道判「不在任务中心」→ 可选 dump 复核（默认关）。
+                if allow_dump_fallback and self._dump_confirms_taskcenter(timeout):
+                    return True
                 return False
             if not _pill and not _overlay:
                 return True
         elif not self._taskcenter_confirmed_by_ocr():
+            if allow_dump_fallback and self._dump_confirms_taskcenter(timeout):
+                return True
             return False
         # 2) dump 二次确认：防全屏 H5 / 问卷页 OCR 误命中导致的静默假成功
         #    （旧版漏洞：问卷页 tap 无效却被判成功，白白空等 22s）
@@ -1674,7 +2222,8 @@ class Flow:
                 logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
                             "以 OCR 判定为准", self.ui.dump_fail_streak)
                 return True
-            if not self._find("看广告", timeout=timeout):
+            if not (self._find("看广告", timeout=timeout)
+                    or self._find("看视频赚电量", timeout=timeout)):
                 if getattr(self.ui, "dump_fail_streak", 0) > 0:
                     logger.info("任务中心校验：dump 不可用（连续失败 %d 次），"
                                 "以 OCR 判定为准", self.ui.dump_fail_streak)
@@ -1704,6 +2253,41 @@ class Flow:
                            "判定未回到任务中心（问题反馈静默假成功防线 F11）")
             return False
         return True
+
+    def _dump_confirms_taskcenter(self, timeout: Optional[float] = None) -> bool:
+        """dump 复核「是否在任务中心」（2026-09-27，配合 `_back_at_taskcenter`
+        的 allow_dump_fallback）。
+
+        实测依据：OCR 判据只有 4 词（每日签到/任务中心/获取随机/收支详情），
+        滚动位置、WebView 重绘、视频期读屏失败都会把它打空 —— 真机实测出现过
+        「页面确为任务中心（dump 有 收支详情@(955,138)、任务中心@(172,1903)）
+        但 back_at_tc=False」。而 dump 在页面 idle 时稳定含任务行节点。两信号
+        互补 → 叠加后可避免「误判不在任务中心 → 物理 BACK 退穿 / 全量重新进台」。
+
+        安全（防 F11「dump 穿透」静默假成功）：dump 命中必须叠加 **OCR 未见
+        覆盖层**（问卷 / 个人资料卡 / AI 好友 H5）—— OCR 截屏读最上层像素、
+        不穿透，与 `_back_at_taskcenter` 信号③同一依据。
+
+        成本：仅在 OCR 已判「不在任务中心」的路径上付出（且只在显式开
+        allow_dump_fallback 的调用方），成功/正常路径零开销。
+        """
+        try:
+            bad, ai, profile = self._overlay_scan()
+        except Exception:  # noqa: BLE001
+            return False
+        if bad or ai or profile:
+            return False
+        try:
+            texts = {n.text for n in self.ui.nodes(timeout=timeout) if n.text}
+        except Exception:  # noqa: BLE001
+            return False
+        hit = texts & {"看广告", "获取随机", "看视频赚电量",
+                       "每日签到", "任务中心"}
+        if hit:
+            logger.info("任务中心判定补强：OCR 未读到特征，但 dump 命中 %s"
+                        "（且无覆盖层）→ 判为仍在任务中心", sorted(hit))
+            return True
+        return False
 
     def _stable_in_ad_page(self, checks: Optional[int] = None,
                            interval: Optional[float] = None) -> bool:
@@ -1761,7 +2345,8 @@ class Flow:
     # 任务中心画面必然包含下列特征词之一；广告页一个都读不到。
     # ⚠️ 关键词是**跨词元**匹配（`_ocr_find` 第 2 遍拼接），因为 tesseract 实测
     # 会把「任务中心」读成 `任务`+`中`+`心`、「获取随机」读成 `获取`+`随机`。
-    _TC_KEYS_OCR = ("每日签到", "任务中心", "获取随机", "收支详情")
+    _TC_KEYS_OCR = ("每日签到", "任务中心", "获取随机", "收支详情",
+                    "看视频赚电量")
 
     def _taskcenter_confirmed_by_ocr(self) -> bool:
         """OCR 确认画面在任务中心 —— 用于决定「能否盲点 AD_CLOSE」。
@@ -1925,6 +2510,9 @@ class Flow:
         （≤9s），长广告场景的代价可控，故对调。
         """
         max_tries = self.wf.get("ad_close_retries", max_tries)
+        # 方案 A（2026-09-29）：每次关闭调用重置可疑标记——只有走到
+        # 步骤 0「OCR 判定已在任务中心、未点任何关闭按钮」的返回才置 True。
+        self._ad_close_suspicious = False
         # #2 优化（2026-09-10）：关闭广告时 uiautomator dump 用更短超时（默认 2.5s）
         # 且不重试，压低视频/动画期每次查找的等待（原 DUMP_TIMEOUT 4s×2≈8s 是日志里
         # 123 次 dump 超时浪费的主因）。dump 超时即失败、转 OCR 兜底路径。
@@ -1980,6 +2568,8 @@ class Flow:
             time.sleep(0.8)
             if self._taskcenter_confirmed_by_ocr():
                 logger.info("OCR 二次判定：已在任务中心（复用前置命中），无需关闭")
+                # 方案 A：未点到任何关闭按钮即判成功 → 标记可疑，收尾复核配额
+                self._ad_close_suspicious = True
                 return True
         else:
             if self._taskcenter_confirmed_by_ocr():
@@ -1987,6 +2577,8 @@ class Flow:
                 time.sleep(0.8)
                 if self._taskcenter_confirmed_by_ocr():
                     logger.info("OCR 二次判定：已在任务中心，无需关闭")
+                    # 方案 A：同上（游迦 9/10 虚报即此路径，2026-09-29 实锤）
+                    self._ad_close_suspicious = True
                     return True
         # 0.5) E 优化（2026-09-14）：消费等待窗口内预定位的关闭按钮坐标。
         #      前提是步骤 0 守卫刚确认「不在任务中心」—— 该守卫是 F8 防线：
@@ -2103,8 +2695,12 @@ class Flow:
             #    BACK（封顶）：广告页 1 次 BACK 即可回任务中心，退穿风险由 max_backs
             #    兜住。若 BACK 也退不出，说明页面既不是广告也不是任务中心，本就不该
             #    在这一层乱点坐标。
-            if self._taskcenter_confirmed_by_ocr():
-                logger.info("未定位到关闭按钮(第%d次)，但 OCR 已确认回到任务中心"
+            # 2026-09-27（实测 D2）：这里必须叠加 dump 复核 —— 只靠 OCR 4 词会在
+            # 任务中心重绘期打空（真机实测 `back_at_tc=False` 而页面确为任务中心），
+            # 于是接着盲退（实测连退 3 层直接落到 QQ 联系人页）。
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout,
+                                        allow_dump_fallback=True):
+                logger.info("未定位到关闭按钮(第%d次)，但已确认回到任务中心"
                             "（广告已结束）", i + 1)
                 return True
             ad_close_backs += 1
@@ -2118,11 +2714,28 @@ class Flow:
                            "（第 %d/%d 次 BACK）", i + 1, ad_close_backs, max_backs)
             self.ui.back(pause=random.uniform(1.2, 1.8))
             time.sleep(self.t.get("page_wait", 2.0))
-            if self._back_at_taskcenter(timeout=ad_close_dump_timeout):
+            # 2026-09-27 退穿保护（实测）：BACK 后若已退到「机器人列表 / QQ 主壳」，
+            # 说明广告其实早已结束、这次 BACK 是多余的一层 —— 立即收手上报，绝不
+            # 继续盲退。实测原实现连按 3 次 BACK 会一路退到 QQ 联系人页，把
+            # 「1 次关闭失败」放大成整套导航重建（用户看到的"任务中心页一直刷新"）。
+            try:
+                retreated = (self._looks_like_robot_list()
+                             or self._on_qq_main_shell())
+            except Exception:  # noqa: BLE001
+                # 读屏异常（含 Mock ui / dump 全失）→ 判据不可信，维持原语义继续。
+                retreated = False
+            if retreated:
+                logger.warning("物理 BACK 后已退到机器人列表/QQ 主壳（退穿），"
+                               "停止继续 BACK，交上层复位")
+                self._log_page_snapshot("关闭放弃-退穿保护")
+                return False
+            if self._back_at_taskcenter(timeout=ad_close_dump_timeout,
+                                        allow_dump_fallback=True):
                 logger.info("物理 BACK 后已回到任务中心（广告已结束）")
                 return True
-        # 最后一搏：整体确认一次
-        ok = self._back_at_taskcenter(timeout=ad_close_dump_timeout)
+        # 最后一搏：整体确认一次（叠加 dump 复核，防 OCR 重绘期假阴性误判"没关掉"）
+        ok = self._back_at_taskcenter(timeout=ad_close_dump_timeout,
+                                      allow_dump_fallback=True)
         if not ok:
             self._log_page_snapshot("关闭放弃-最终确认失败")
         return ok
@@ -2157,6 +2770,7 @@ class Flow:
             self._safe_back_to_robot_list()
         if not entered:
             logger.error("进入任务中心失败 %s（重试 3 次后仍失败），跳过", name)
+            self._stat(name)["entered"] = False
             return 0
         # A3（2026-09-10）：进入任务中心后先清理可能残留/即将弹出的 Badcase
         # 问卷 —— 00:34 全量验证实锤：_feedback 操作中途 Badcase H5 会弹出
@@ -2164,16 +2778,29 @@ class Flow:
         # 仍在任务中心，把看广告入口当任务行点、或问卷残留阻断后续机器人。
         # 一次清理覆盖签到+反馈两动作；无问卷时仅 ~2.3s OCR 开销（实测基准）。
         self._dismiss_badcase()
+        # 电量统计（2026-09-29）：本账号第一台机器人进台后读起始值（幂等，
+        # 仅首次生效；读在签到动作前 —— 对应「从第一次进入机器人签到开始」）。
+        self._capture_energy_start()
         if do_signin:
-            if not self._signin():
+            ok = self._signin()
+            if not ok:
                 logger.warning("签到失败，重试 1 次")
-                if not self._signin():
+                ok = self._signin()
+                if not ok:
                     logger.error("签到重试后仍失败，跳过")
+            self._stat(name)["signin"] = (
+                "失败" if not ok else
+                ("已签" if getattr(self, "_signin_already", False) else "成功"))
         if do_feedback:
-            if not self._feedback():
+            ok = self._feedback()
+            if not ok:
                 logger.warning("问题反馈失败，重试 1 次")
-                if not self._feedback():
+                ok = self._feedback()
+                if not ok:
                     logger.error("问题反馈重试后仍失败，跳过")
+            self._stat(name)["feedback"] = (
+                "失败" if not ok else
+                ("已反馈" if getattr(self, "_feedback_already", False) else "成功"))
         # 首轮广告（2026-09-10）：签到/反馈完成后不退出，同会话先看 1 次。
         # 看前按 A3 同款巡检一次 —— 签到/反馈操作后 QQ 可能推送 Badcase 问卷
         # （坑 8：00:34 实测操作中途弹出），不清掉会让 _find_row 空转计失败。
@@ -2182,6 +2809,7 @@ class Flow:
             self._dismiss_badcase()
             if self._watch_ad_once():
                 first_ad_ok = True
+                self._stat(name)["ad"] += 1
                 logger.info("%s 首轮广告完成（剩余次数进入轮转阶段补看）", name)
             else:
                 logger.warning("%s 首轮广告失败（进入轮转阶段补看）", name)
@@ -2189,12 +2817,216 @@ class Flow:
         # 编码返回（见 docstring）：0=进台失败；1=完成无首轮/首轮失败；2=首轮成功
         return 2 if first_ad_ok else 1
 
+    # ----------------------------------------------------------
+    # 电量统计（2026-09-29 用户需求）：账号级「本流程获得电量」
+    # ----------------------------------------------------------
+    def _read_energy(self) -> Optional[int]:
+        """读任务中心「当前电量」数值（用户截图实锤：H5 顶部卡片，数字在
+        「当前电量」标签下方）。两级读取，读不到返回 None（不阻断主流程）：
+
+        1. dump：找「当前电量」标签节点 → 标签下方 y∈[y1, y1+280] 条带内找
+           纯数字节点（H5 WebView 节点可读，与 每日签到 行同源）；
+        2. OCR：image_to_data 词元级扫描 —— 定位「当前电量」标签（整词，
+           失配走跨词元拼接 _merged_match），标签下方条带内收集含数字词元、
+           按阅读顺序拼接后提取 2-7 位数字（tesseract 会把数字切碎）。
+        """
+        if not self.wf.get("energy_stat", True):
+            return None
+        # 1) dump 路径
+        try:
+            label = self._find("当前电量")
+            if label is not None:
+                y_lo, y_hi = label.y1, label.y1 + 280
+                digit_nodes = []
+                for nd_ in self.ui.nodes():
+                    t = (nd_.text or "").strip()
+                    if not t or not (y_lo <= nd_.y1 <= y_hi):
+                        continue
+                    # 纯数字节点接受 1-7 位（新账号电量可能个位数）；
+                    # 混排文本要求 2-7 位（防 "x8" 类噪声）
+                    m = re.fullmatch(r"[0-9]{1,7}", t)
+                    if m:
+                        return int(t)          # 纯数字节点优先
+                    m = re.search(r"([0-9]{2,7})", t)
+                    if m:
+                        digit_nodes.append((nd_.y1, nd_.x1, m.group(1)))
+                if digit_nodes:
+                    digit_nodes.sort()
+                    return int(digit_nodes[0][2])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("电量 dump 读取异常: %s", e)
+        # 2) OCR 路径
+        if not _HAS_OCR:
+            return None
+        img = self._ocr_shot()
+        if img is None:
+            return None
+        try:
+            data = pytesseract.image_to_data(
+                img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
+                output_type=pytesseract.Output.DICT)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("电量 OCR 失败: %s", e)
+            return None
+        toks: List[Tuple[str, int, int]] = []
+        label_y = None
+        for i in range(len(data["text"])):
+            t = (data["text"][i] or "").strip()
+            if not t:
+                continue
+            cx = data["left"][i] + data["width"][i] // 2
+            cy = data["top"][i] + data["height"][i] // 2
+            toks.append((t, cx, cy))
+            if label_y is None and "当前电量" in t:
+                label_y = cy
+        if label_y is None:
+            pos = self._merged_match(toks, ("当前电量",), None)
+            label_y = pos[1] if pos else None
+        if label_y is None:
+            logger.info("[电量] 未找到「当前电量」标签（版式差异/覆盖层），跳过")
+            return None
+        digits = []
+        for t, _x, y in toks:
+            if label_y - 20 <= y <= label_y + 280 and re.search(r"[0-9]", t):
+                digits.append((y, re.sub(r"[^0-9]", "", t)))
+        digits.sort()
+        joined = "".join(d for _y, d in digits)
+        m = re.search(r"([0-9]{2,7})", joined)
+        if m:
+            return int(m.group(1))
+        logger.info("[电量] 标签下方条带内未读到数字")
+        return None
+
+    def _capture_energy_start(self) -> None:
+        """本账号第一台机器人首次进台后读起始电量（幂等：无论成败只尝试
+        一次，后续每次进台/轮换调用零开销）。"""
+        if not self.wf.get("energy_stat", True):
+            return
+        if getattr(self, "_energy_start_done", False):
+            return
+        self._energy_start_done = True
+        self._energy_start = self._read_energy()
+        if self._energy_start is not None:
+            logger.info("[电量] 起始读数 %d", self._energy_start)
+        else:
+            logger.info("[电量] 起始读数失败（覆盖层/版式差异），本次差额缺失")
+
+    def _capture_energy_end(self, robots: List[str]) -> None:
+        """广告阶段全部结束后补一次进台读终值（最后一支广告看完时已退台，
+        电量数字只在任务中心可见）。算出差额并记日志；起始未读到则不白跑。"""
+        if not self.wf.get("energy_stat", True):
+            return
+        if getattr(self, "_energy_start", None) is None:
+            logger.info("[电量] 起始读数缺失，跳过结束统计")
+            return
+        self._energy_end = getattr(self, "_energy_end", None)
+        for name in robots:          # 任一台能进台即可读
+            if self._enter_taskcenter(name):
+                try:
+                    self._dismiss_badcase()
+                    self._energy_end = self._read_energy()
+                finally:
+                    self._exit_taskcenter()
+                break
+        s, e = self._energy_start, self._energy_end
+        if e is not None:
+            logger.info("[电量] 本流程获得：%d → %d（+%d）", s, e, e - s)
+        else:
+            logger.warning("[电量] 结束读数失败（起始 %s），本次差额缺失", s)
+
+    def _stat(self, name: str) -> dict:
+        """汇总记账（2026-09-22 用户需求）：取单台机器人统计条目，懒初始化。
+
+        兼容单测 Flow.__new__(Flow) 绕过 __init__ 的构造方式（stats 缺失时
+        现场补空容器）。字段：entered(进台)/signin/feedback(结果文本或 None)/
+        ad(本次进程看广告支数)/note(备注，如弃权原因)。"""
+        if getattr(self, "stats", None) is None:
+            self.stats = {}
+        return self.stats.setdefault(name, {"entered": True, "signin": None,
+                                            "feedback": None, "ad": 0,
+                                            "note": ""})
+
+    def _log_summary(self, do_signin: bool = True,
+                     do_feedback: bool = True,
+                     title: Optional[str] = None) -> None:
+        """流程结束汇总：每台机器人 签到/问题反馈 是否成功 + 本次看广告支数。
+
+        title（2026-09-24 多账号）：非空时作为表头前缀 + 落盘文件名后缀。
+        多账号模式逐账号出汇总（各账号机器人列表不同、可能有同名机器人），
+        加后缀可避免汇总文件互相覆盖。
+
+        数据全部来自运行期内存记账（self.stats），零额外读屏；输出到日志
+        （run.log + 控制台）并落一份 logs/summary_YYYYMMDD_HHMMSS.txt 供事后
+        翻看。写文件失败只告警不抛出（不影响流程收尾）。"""
+        stats = getattr(self, "stats", None) or {}
+        if not stats:
+            logger.info("汇总%s：无可统计的处理记录",
+                        ("·" + title) if title else "")
+            return
+        head = ("===== %s 运行汇总（%d 台）=====" % (title, len(stats))
+                if title else "===== 本次运行汇总（%d 台）=====" % len(stats))
+        lines = [head,
+                 "机器人      签到      问题反馈    本次广告  备注"]
+        n_signin_ok = n_feedback_ok = 0
+        ad_total = 0
+        for name, s in stats.items():
+            if do_signin:
+                v = s.get("signin")
+                if v in ("成功", "已签"):
+                    n_signin_ok += 1
+            else:
+                v = "跳过"
+            if do_feedback:
+                fv = s.get("feedback")
+                if fv in ("成功", "已反馈"):
+                    n_feedback_ok += 1
+            else:
+                fv = "跳过"
+            ad = int(s.get("ad") or 0)
+            ad_total += ad
+            note = "" if s.get("entered", True) else "进台失败"
+            note = note or (s.get("note") or "")
+            lines.append("%-10s %-8s %-10s %-8d %s"
+                         % (name, v or "—", fv or "—", ad, note))
+        lines.append("合计：签到 %d/%d，问题反馈 %d/%d，广告 %d 支"
+                     % (n_signin_ok, len(stats) if do_signin else 0,
+                        n_feedback_ok, len(stats) if do_feedback else 0,
+                        ad_total))
+        # 电量统计（2026-09-29）：起始/结束读数都在时输出本流程获得电量
+        es = getattr(self, "_energy_start", None)
+        ee = getattr(self, "_energy_end", None)
+        if getattr(self, "wf", {}).get("energy_stat", True) and es is not None:
+            if ee is not None:
+                lines.append("电量：%d → %d，本流程获得 +%d" % (es, ee, ee - es))
+            else:
+                lines.append("电量：起始 %d，结束读数失败（差额缺失）" % es)
+        for ln in lines:
+            logger.info("%s", ln)
+        try:
+            log_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(
+                log_dir, "summary_%s%s.txt"
+                % (time.strftime("%Y%m%d_%H%M%S"),
+                   ("_" + re.sub(r"[^\w\u4e00-\u9fff]+", "", title))
+                   if title else ""))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            logger.info("汇总已写入 %s", path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("汇总文件写入失败（不影响主流程）：%s", e)
+
     def run_all(self, robots: List[str], do_signin: bool, do_feedback: bool,
                 ad_times: Optional[int], rotate: bool = False,
                 group: int = 3):
         target = ad_times if ad_times is not None else self.wf.get(
             "ad_times_per_robot", 10)
         cd = self.wf.get("ad_cooldown", 60)
+        # 汇总记账（2026-09-22）：先为全部机器人建条目，覆盖 ad-only 模式
+        # （不进 run_robot）、轮换阶段无待看等不逐台处理路径，保证汇总齐全。
+        for name in robots:
+            self._stat(name)
 
         # 签到/反馈阶段：仅当确实要做时进入任务中心。纯广告模式(--ad-only)下
         # run_robot 内部也会无条件先进一次任务中心再退出 —— 纯浪费（实测每台
@@ -2222,6 +3054,7 @@ class Flow:
 
         if rotate:
             self._run_rotate_phase(robots, first_done, target, group)
+            self._capture_energy_end(robots)   # 电量统计（2026-09-29）
             return
 
         # 顺序连看路径（F10 结构优化 2026-09-09，行为不变）：单次任务中心
@@ -2229,11 +3062,13 @@ class Flow:
         # 单次进出 ~68-71s。逻辑抽入 _watch_ads_session（rotate 模式 1 台
         # 回落复用同一路径），run_all 内只保留调度。
         for name in robots:
-            self._watch_ads_session(name, target, cd, start_done=0)
+            d = self._watch_ads_session(name, target, cd, start_done=0)
+            self._stat(name)["ad"] += d
         logger.info("所有机器人看广告完成")
+        self._capture_energy_end(robots)       # 电量统计（2026-09-29）
 
     # ----------------------------------------------------------
-    # 组制轮询看广告（2026-09-16 用户需求，rotate 模式）
+    # 滑动窗口轮询看广告（2026-09-16 组制轮询 → 2026-09-26 演进，rotate 模式）
     # ----------------------------------------------------------
     def _quota_left(self, s: dict, target: int, quota_target: int) -> int:
         """rotate 记账：单台剩余可看支数 = min(本次目标进度, 屏幕日配额)。
@@ -2282,7 +3117,13 @@ class Flow:
         # 导致满额机器人空转三连败（18:22 代柯实测 4m52s 全失败）。
         self._dismiss_badcase()
         quota_target = int(self.wf.get("ad_times_per_robot", 10))
-        entry_ratio = self._read_ad_ratio()
+        # 方案 A（2026-09-28）：优先复用 _enter_taskcenter 进台时的配额缓存，
+        # 免二次滚动查找；缓存 None 时回退原地读屏（行为与旧版一致）。
+        entry_ratio = getattr(self, "_tc_entry_ratio", None)
+        if entry_ratio is None:
+            entry_ratio = self._read_ad_ratio()
+        else:
+            logger.info("%s 复用进台配额缓存（免二次读屏）", name)
         if entry_ratio and entry_ratio[0] >= quota_target:
             logger.info("%s 看广告已达每日配额，本会话直接退出", name)
             self._exit_taskcenter()
@@ -2298,6 +3139,9 @@ class Flow:
             if first_iter:
                 self._dismiss_badcase()
                 first_iter = False
+            # 每支观看前重置可疑标记（方案 A）：_close_ad 未被调用到的
+            # 路径（如已达配额跳过）不得继承上一支的旧标记
+            self._ad_close_suspicious = False
             ok = self._watch_ad_once(row=pre_row)
             pre_row = None
             if not ok:
@@ -2305,25 +3149,84 @@ class Flow:
                 logger.warning("%s 看广告失败，累计失败 %d/%d",
                                name, fail, max_fail)
                 time.sleep(1.0)
+                # P0 修复（2026-09-27）：断开「一次关闭失败 → 3 连败弃权」级联。
+                # 触发链：广告播完 OCR 在顶条 (0,0,1080,320) 漏读关闭按钮 →
+                # _close_ad 走物理 BACK 兜底 → BACK 撞 ad_close_max_backs 上限后
+                # 放弃关闭，此时页面常已被一路退到 QQ 联系人页（09-27 实测 6 次
+                # `页面快照[关闭放弃-BACK封顶]: ... '联系人'...`）。原实现失败后
+                # 原地重试，下一次 _watch_ad_once 只会在错误页面上必然再失败
+                # （`未找到 看广告/获取随机 行`），把 1 次真实失败放大成 3 连败。
+                # 修复：重试前先确认仍在任务中心，不在则复位并重新进台。
+                # 成本：仅失败路径付出（成功路径零额外读屏）；末次失败不再校验。
+                #
+                # 2026-09-27 二次修复（用户反馈「连看时一直刷新任务中心页」）：
+                # ① 判定改开 allow_dump_fallback —— OCR 4 词常被重绘/视频期读屏
+                #    打空（实测真任务中心页 back_at_tc=False），叠加 dump 复核后
+                #    不再把「仍在任务中心」误判成「已离开」。
+                # ② 仍在任务中心时**不做任何导航**，原地沉降后重试即可 —— 那条
+                #    `_safe_back_to_robot_list()+_enter_taskcenter()` 全量重进正是
+                #    用户看到的「任务中心页反复刷新」；多数失败（dump 超时瞬态）
+                #    根本不需要重建导航。
+                if fail < max_fail:
+                    probe_t = float(self.wf.get("ad_close_dump_timeout", 2.5))
+                    if self._back_at_taskcenter(timeout=probe_t,
+                                                allow_dump_fallback=True):
+                        logger.info("%s 仍在任务中心（瞬时读屏失败）→ 原地沉降"
+                                    "重试，不做导航", name)
+                        time.sleep(float(self.wf.get("ad_close_settle", 2.0)))
+                        continue
+                    logger.info("%s 失败后已不在任务中心（页面被兜底 BACK 退出）"
+                                "→ 复位并重新进台", name)
+                    self._safe_back_to_robot_list()
+                    if not self._enter_taskcenter(name):
+                        logger.error("%s 重进任务中心失败，终止本会话", name)
+                        break
+                    # 重进后按会话起始语义重跑一次清场（问卷 H5 可能延迟弹出）
+                    first_iter = True
                 continue
             t_close = time.time()   # CD 起点：广告关闭时刻（2026-09-10 用户优化）
             done += 1
             fail = 0
             logger.info("%s 本会话已看 %d/%d 次广告", name, done, target)
+            # 方案 A（2026-09-29 游迦 9/10 实锤）：末支关闭路径可疑（未点到
+            # 任何关闭按钮、OCR 判已回任务中心）→ 收尾 break 前读屏复核配额，
+            # 堵「tap 未触发 → 虚报计数」。正常关闭路径零额外读屏（不影响
+            # 点击效率）。ad_end_verify: false 可整体回退旧行为。
+            skip_arith = False
             if done >= target:
-                break
+                if (self.wf.get("ad_end_verify", True)
+                        and getattr(self, "_ad_close_suspicious", False)):
+                    logger.warning("%s 末支关闭路径可疑（未点到关闭按钮）→ "
+                                   "收尾前复核配额", name)
+                    done = self._verify_session_quota(name, done)
+                    if done >= target:
+                        break
+                    # 校准后仍差几支：屏幕真值已复核，算术收尾（基于过时的
+                    # entry_ratio）本圈作废，直接落 CD 段继续补看
+                    skip_arith = True
+                else:
+                    break
             # 算术收尾（进台基数 + 本会话已看 >= 每日配额 → 必满）：
             # 不读屏、不等 CD，直接退出。省掉旧实现"每次看完读屏复核"
             # 在刚关广告的重载动画期必然 dump 超时的 ~40s 空等（审计 C2，
             # 18:02 实测两次复核烧 43s 串行加在 CD 前）。
             # 注：done 含 start_done 而 entry_ratio 屏幕快照同样含之，
             # 会话内净看数 = done - start_done，避免重复计数提前收尾。
-            if (entry_ratio is not None
+            if (not skip_arith and entry_ratio is not None
                     and entry_ratio[0] + done - start_done >= quota_target):
-                logger.info("%s 看广告已达每日配额（进台 %d/10 + 本会话 %d 次），"
-                            "提前收尾", name, entry_ratio[0],
-                            done - start_done)
-                break
+                if (self.wf.get("ad_end_verify", True)
+                        and getattr(self, "_ad_close_suspicious", False)):
+                    logger.warning("%s 算术收尾但末支关闭路径可疑 → 复核配额",
+                                   name)
+                    done = self._verify_session_quota(name, done)
+                    if done >= target:
+                        break
+                    skip_arith = True
+                else:
+                    logger.info("%s 看广告已达每日配额（进台 %d/10 + 本会话 %d 次），"
+                                "提前收尾", name, entry_ratio[0],
+                                done - start_done)
+                    break
             # 会话内 CD 从关闭时刻起算：配额复核挪进 CD 窗口末尾
             # （cd-10s 处，页面已稳定 dump 不再超时）——校验耗时与 CD
             # 重叠，不再串行累加（用户 2026-09-10 提出）。
@@ -2342,7 +3245,8 @@ class Flow:
                 break
             # 行预取：复用配额复核刚写入的 nodes 缓存（TTL 0.8s 内，~0 成本）；
             # 读不到（dump 超时等）= None → _watch_ad_once 现场重新查找兜底。
-            pre_row = self._find_row("看广告", alt_labels=("获取随机",))
+            pre_row = self._find_row(AD_ROW_LABELS[0],
+                                     alt_labels=AD_ROW_LABELS[1:])
             time.sleep(max(0.0, wake - time.time()))
         self._exit_taskcenter()
         logger.info("%s 看广告结束（本会话 %d/%d，失败 %d）",
@@ -2351,19 +3255,20 @@ class Flow:
 
     def _run_rotate_phase(self, robots: List[str], first_done: dict,
                           target: int, group: int) -> None:
-        """组制轮询看广告（2026-09-16 用户需求）。
+        """滑动窗口轮询看广告（2026-09-26 演进自 2026-09-16 组制轮询）。
 
-        剩余机器人按 group（默认 3）台一组；组内循环 R1→R2→R3→R1... 每台
-        每轮看 1 支，靠切换吸收 CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）。
-        - 某台配额满（进程内累计或首访屏幕基数校准）即移出循环；
-        - 组内动态缩员：剩 2 台继续轮换，剩 1 台回落 _watch_ads_session 连看；
-        - 单台连续失败 max_fail(3) 次弃权，不影响组内其他机器人；
-        - 首轮广告（签到会话内）成败由 first_done 记账，不重复看。
+        固定 group（默认 3）台窗口 + 补位队列：窗口内循环 R1→R2→R3→R1...
+        每台每轮看 1 支，靠切换吸收 CD（u2 实测 ~48-49s/支 vs 同机连看
+        ~89s/支）。某台配额满（进程内累计或首访屏幕基数校准）或连败
+        max_fail(3) 次弃权即出窗，队列下一位立即补位进窗（排尾部），窗口
+        保持满员直至机器人耗尽；队列空且窗口剩 1 台回落 _watch_ads_session
+        连看。首轮广告（签到会话内）成败由 first_done 记账，不重复看。
         """
         max_fail = 3
         quota_target = int(self.wf.get("ad_times_per_robot", 10))
         cd = self.wf.get("ad_cooldown", 60)
-        st = {n: {"done": int(first_done.get(n) or 0), "fail": 0, "base": None}
+        st = {n: {"done": int(first_done.get(n) or 0), "fail": 0,
+                  "base": None, "reanchor": 0}
               for n in robots}
         pending = [n for n in robots
                    if self._quota_left(st[n], target, quota_target) > 0]
@@ -2372,38 +3277,80 @@ class Flow:
             return
         if group <= 0:
             group = 3
-        groups = [pending[i:i + group] for i in range(0, len(pending), group)]
-        logger.info("轮换阶段：%d 台待看，分 %d 组（每组 %d 台），日配额 %d",
-                    len(pending), len(groups), group, quota_target)
+        # 滑动窗口轮询（2026-09-26 用户需求）：固定 group 台窗口 + 补位队列。
+        # 旧实现按 pending 静态分组，组内缩员后不补人 —— 例：3 台组
+        # [剩8, 剩9, 剩9]，第一台看完出组后只剩 2 台轮换，CD 吸收效率下降
+        # （每支广告的等待从 ~2×CD 退化为 ~1×CD 空等）。改为：某台出窗
+        # （配额满/连败弃权）后**立即**从队列补下一位进窗（排窗口尾部，
+        # 下圈轮到它，天然吸收上一台的 CD）；窗口保持满员轮换直至机器人
+        # 耗尽。数学性质：窗口一旦 <group 队列必已耗尽（队列非空时出窗
+        # 必补位，窗口不减），故「窗口剩 1 台」⇔ 队列空 → 回落连看。
+        queue = list(pending)
+        window = queue[:group]
+        del queue[:group]
+        logger.info("轮换阶段：%d 台待看，滑动窗口 %d 台，日配额 %d",
+                    len(pending), group, quota_target)
         total = 0
-        for gi, grp in enumerate(groups, 1):
-            logger.info("===== 广告轮换组 %d/%d（%d 台）：%s =====",
-                        gi, len(groups), len(grp), grp)
-            while True:
-                active = [n for n in grp
-                          if self._quota_left(st[n], target, quota_target) > 0
-                          and st[n]["fail"] < max_fail]
-                if not active:
-                    break
-                if len(active) == 1:
-                    name = active[0]
-                    logger.info("%s 组内仅剩 1 台，回落同机连看（CD 等待语义）",
-                                name)
+
+        def _rotate_out(name: str, reason: str) -> None:
+            """出窗 + 补位（队列下一位排窗口尾部）。"""
+            window.remove(name)
+            if queue:
+                nxt = queue.pop(0)
+                window.append(nxt)
+                logger.info("%s %s出窗，%s 补位进窗（窗口 %d 台 %s，待补 %d）",
+                            name, reason, nxt, len(window), window, len(queue))
+            else:
+                logger.info("%s %s出窗（无待补，窗口剩 %d 台）",
+                            name, reason, len(window))
+
+        while window:
+            # 回落判定前置到每圈开始：窗口剩 1 台且无待补时，连看会话只需
+            # 进台 1 次（轮换模式每支 1 次进台），剩余支数 >1 时省 k-1 次进台；
+            # 单台初始窗口（pending 仅 1 台）同样直接走会话，不走窗口循环。
+            if len(window) == 1 and not queue:
+                name = window[0]
+                s = st[name]
+                if (self._quota_left(s, target, quota_target) > 0
+                        and s["fail"] < max_fail):
+                    logger.info("%s 窗口仅剩 1 台且无待补，回落同机连看"
+                                "（CD 等待语义）", name)
                     d = self._watch_ads_session(name, target, cd,
-                                                start_done=st[name]["done"])
-                    st[name]["done"] += d
+                                                start_done=s["done"])
+                    s["done"] += d
                     total += d
-                    break
-                for name in active:
-                    total += self._rotate_watch_once(
-                        name, st, target, quota_target, max_fail)
+                break
+            for name in list(window):
+                s = st[name]
+                # 圈内先处理上一圈遗留的出窗态（初始化即满的台已被 pending
+                # 过滤，这里主要是连败弃权兜底），再做本轮观看。
+                if (self._quota_left(s, target, quota_target) <= 0
+                        or s["fail"] >= max_fail):
+                    _rotate_out(name, "（判定满/弃权）")
+                    continue
+                total += self._rotate_watch_once(
+                    name, st, target, quota_target, max_fail)
+                # 看完 1 支立即判定出窗补位（用户语义：第一台看完即接入第四台）
+                s = st[name]
+                if (self._quota_left(s, target, quota_target) <= 0
+                        or s["fail"] >= max_fail):
+                    reason = ("（配额满）" if self._quota_left(
+                        s, target, quota_target) <= 0 else "（连败弃权）")
+                    _rotate_out(name, reason)
+            if not window:
+                break
         for n in robots:
             s = st[n]
+            # 汇总记账（2026-09-22）：st["done"] 已含签到首轮广告，与
+            # stats["ad"] 当前值同口径，直接绝对值覆盖防重复累计。
+            self._stat(n)["ad"] = s["done"]
             if (s["fail"] >= max_fail
                     and self._quota_left(s, target, quota_target) > 0):
+                left = self._quota_left(s, target, quota_target)
                 logger.warning("%s 连败 %d 次弃权，剩余 %d 支未看",
-                               n, max_fail,
-                               self._quota_left(s, target, quota_target))
+                               n, max_fail, left)
+                self._stat(n)["note"] = "连败%d次弃权，余%d支未看" % (
+                    max_fail, left)
         logger.info("轮换阶段完成：本进程共看 %d 支广告", total)
 
     def _rotate_watch_once(self, name: str, st: dict, target: int,
@@ -2411,6 +3358,7 @@ class Flow:
         """轮换组内单台看 1 支：进台（3 试）→ 清问卷 → 首访校准基数 →
         看 1 支 → 退台。返回本次新看支数（0/1）；失败计入 st[name]["fail"]。"""
         s = st[name]
+        t_turn = time.time()          # P1（2026-09-29）：单支耗时埋点
         entered = False
         for attempt in (1, 2, 3):
             if self._enter_taskcenter(name):
@@ -2425,14 +3373,61 @@ class Flow:
             s["fail"] = max_fail
             return 0
         try:
+            # 电量统计（2026-09-29）：--ad-only 无签到段，起始快照在首次
+            # 轮换进台补读（幂等，_energy_start 已有值时零开销）。
+            self._capture_energy_start()
             self._dismiss_badcase()
             # 首访基数校准：屏幕 X/10 已包含本轮进程看过的（含签到首轮广告）
+            # r：本次进台读到的屏幕真值（_enter_taskcenter 每次都刷新到
+            # _tc_entry_ratio，读不到为 None）——首访用它算 base，其后用它重锚。
+            r = getattr(self, "_tc_entry_ratio", None)
             if s["base"] is None:
-                r = self._read_ad_ratio()
+                # 方案 A（2026-09-28）：优先复用 _enter_taskcenter 进台时读到的
+                # 配额缓存 —— 免去此处二次滚动查找「看广告」行（用户观察到的
+                # "进台后一直下滑刷新"根因）。缓存 None（覆盖层/版式差异）则
+                # 回退到原地读屏，行为与旧版完全一致。
+                if r is None:
+                    r = self._read_ad_ratio()
+                else:
+                    logger.info("%s 复用进台配额缓存（免二次读屏）", name)
                 if r:
                     s["base"] = max(0, r[0] - s["done"])
                     logger.info("%s 进台基数校准：屏幕 %d/%d（进程内已看 %d）",
                                 name, r[0], r[1], s["done"])
+            elif r and r[1] == quota_target:
+                # 坑 25（2026-09-30 用户实锤）：**每次进台都用屏幕真值重锚**。
+                # 旧实现只在首访校准一次 base，其后每次进台读到的屏幕值仅打日志、
+                # 不参与记账 → 轮换的 done 纯算术累加永不复核。只要某支「节目播放
+                # 但未到账」（广告自动回任务中心 / tap 未真开广告 / 服务端未记账），
+                # done 就永久虚高、该台少看 1 支（实测王 7 台各虚报 1 支，汇总虚报
+                # 100 实为 ~93）。此处以屏幕为准修正 done：向下纠正未到账、向上
+                # 吸收手动补看（人在跑流程时手动补的也会被正确认账）。
+                # 分母异常（实测偶发读成 /1000，疑读到别的行）时不认账，防误读。
+                code_today = s["base"] + s["done"]
+                if r[0] != code_today:
+                    new_done = max(0, r[0] - s["base"])
+                    if new_done < s["done"]:
+                        # 向下纠正 = 上一次广告「未到账」（屏幕没前进）。累计
+                        # 到 max_fail 视为连败弃权 —— 否则屏幕长期不前进会让
+                        # done 反复归零 → 轮换窗口死循环（无全局圈数上限）。
+                        s["reanchor"] = s.get("reanchor", 0) + 1
+                    else:
+                        s["reanchor"] = 0     # 向上吸收（手动补看）→ 视为正常前进
+                    logger.warning(
+                        "%s 屏幕真值重锚（坑25）：屏幕 %d/%d vs 进程口径 %d/%d "
+                        "→ done %d→%d（未到账累计 %d/%d）", name, r[0], r[1],
+                        code_today, quota_target, s["done"], new_done,
+                        s.get("reanchor", 0), max_fail)
+                    s["done"] = new_done
+                    if s.get("reanchor", 0) >= max_fail:
+                        logger.error(
+                            "%s 连续 %d 次广告未到账（屏幕不前进）→ 弃权出窗",
+                            name, s["reanchor"])
+                        s["fail"] = max_fail
+                        return 0
+            elif r:
+                logger.warning("%s 屏幕读数分母异常（%d/%d，期望 /%d）→ 本次不重锚",
+                               name, r[0], r[1], quota_target)
             if self._quota_left(s, target, quota_target) <= 0:
                 logger.info("%s 已达每日配额，移出轮换", name)
                 return 0
@@ -2449,3 +3444,308 @@ class Flow:
             return 0
         finally:
             self._exit_taskcenter()
+            logger.info("[计时] 轮换单支合计 %.1fs（%s）",
+                        time.time() - t_turn, name)
+
+    # ----------------------------------------------------------
+    # 多账号切换（2026-09-24 用户需求：跑完一个账号自动切下一个）
+    # ----------------------------------------------------------
+    def _wait_for_text(self, text: str, timeout: float = 6.0,
+                       interval: float = 0.4) -> Optional[Node]:
+        """轮询等待文本出现（以秒为单位超时，比 ui.wait_for 的 retries 语义直观）。
+
+        每次落空后 `ui.refresh()` 强制失效 nodes() 的 0.8s TTL 缓存 —— 否则连续
+        两次查询会读到**同一份坏帧**（2026-09-24 实测：进程刚起时首帧异常，
+        `_sidebar_nick` 与 `_switch_account` 两次 `_find` 命中同一缓存帧都判失败
+        → 误触发整套 `_safe_back_to_robot_list()` 复位）。refresh 仅清缓存、零 adb 开销。
+        """
+        t0 = time.time()
+        while True:
+            n = self._find(text)
+            if n is not None:
+                return n
+            if time.time() - t0 >= timeout:
+                return None
+            time.sleep(interval)
+            self.ui.refresh()
+
+    def _sidebar_nick(self) -> Optional[str]:
+        """打开左上角「账户及设置」侧栏，读当前登录账号昵称，随后 BACK 关闭侧栏。
+
+        昵称节点判据（实测 2026-09-24）：侧栏内与「切换账号」**同一行**、
+        x 更靠左的文本 —— 唐灵 (324,451)-(432,514) vs 切换账号 (468,459)-(596,507)；
+        下一行「等级：14」中心 y 差 181 > 窗口 44，天然排除。
+        读不到返回 None（**不**按 BACK，避免在非预期页面误退）。
+        """
+        entry = self._find(ACCOUNT_ENTRY_TEXT)
+        if entry is None:
+            return None
+        self._tap_node(entry, pause=1.2)
+        sw = self._wait_for_text(SWITCH_ACCOUNT_TEXT, timeout=6.0)
+        if sw is None:
+            return None
+        nick = None
+        cy = (sw.y1 + sw.y2) // 2
+        best = None
+        for nd in self.ui.nodes():
+            t = (nd.text or "").strip()
+            if not t or t == SWITCH_ACCOUNT_TEXT:
+                continue
+            ncy = (nd.y1 + nd.y2) // 2
+            if abs(ncy - cy) <= 44 and nd.x2 <= sw.x1:
+                if best is None or nd.x2 > best.x2:
+                    best = nd
+        nick = best.text if best is not None else None
+        self.ui.back()
+        time.sleep(0.8)
+        return nick
+
+    def _switch_account(self, uin: str, nick: Optional[str] = None) -> bool:
+        """按 UIN 切换 QQ 登录账号（2026-09-24 实测：免密秒切，单次 ~8.5s）。
+
+        链路：联系人页「账户及设置」→ 侧栏「切换账号」→ 账号列表点 **UIN 行**
+        → 等回联系人页 → settle → 校验昵称。**全程 dump 节点定位，零盲点坐标**
+        （与 F11「不盲点」铁律一致）。
+
+        ⚠️ 账号列表顺序会变（当前登录账号置顶，实测 UIN 节点 y 从 653 → 1016），
+        故必须按 UIN 文本定位，**禁止记忆任何坐标**。
+        返回 True 表示已切到目标账号且昵称校验通过。
+        """
+        # 0. 复位：切号必须从干净主壳出发（残留任务中心/子页会让入口找不到）。
+        # 入口查找带重试 + 强制刷帧 —— 单次 `_find` 撞上过渡帧就白走一次
+        # safe_back 复位（2026-09-24 实测：多花 ~15s 且多发几次 BACK）。
+        if getattr(self, "_page_tc", False):
+            self._exit_taskcenter()
+        if self._wait_for_text(ACCOUNT_ENTRY_TEXT, timeout=2.0) is None:
+            self._safe_back_to_robot_list()
+        # R1（2026-09-28 实测复现）：入口「账户及设置」只在**联系人页顶部**可见
+        # （y≈133）。若上一流程把列表停在**中段**（吸顶分类栏覆盖顶部栏）或停在
+        # 机器人**资料卡**上，则入口找不到 → 旧实现只做一次 safe_back 复位，
+        # 复位层数不对时依然找不到 → 单次就白跑一个切号机会（实测第 1 次
+        # 报「侧栏未出现切换账号」）。此处补「确认在列表顶部」：仍是主壳却在
+        # 列表中段时，先滑回顶部再找入口；滑不回去也不阻塞（交给下一层重试）。
+        if self._on_qq_main_shell() and not self._contacts_tab_active():
+            tab = self._find(CONTACTS_TAB, ymin=TAB_Y)
+            if tab:
+                logger.info("切号复位：先点底部「联系人」tab 回位")
+                self._tap_node(tab, pause=1.0)
+        if self._find(ACCOUNT_ENTRY_TEXT) is None and self._on_qq_main_shell():
+            # 列表被滚到中段 → 分类栏吸顶顶掉顶部入口栏。滑回顶部再找一次。
+            logger.info("切号复位：入口未现，尝试滑回列表顶部")
+            for _ in range(4):
+                self.ui.swipe_down(pause=random.uniform(0.5, 0.7))
+            self.ui.refresh()
+
+        # 1. 打开侧栏
+        entry = self._find(ACCOUNT_ENTRY_TEXT)
+        if entry is None:
+            logger.error("切号失败：找不到「%s」入口（当前页非 QQ 主壳？）",
+                         ACCOUNT_ENTRY_TEXT)
+            self._log_page_snapshot("switch_no_entry")
+            return False
+        self._tap_node(entry, pause=1.2)
+
+        # 2. 点「切换账号」
+        sw = self._wait_for_text(SWITCH_ACCOUNT_TEXT, timeout=6.0)
+        if sw is None:
+            logger.error("切号失败：侧栏未出现「%s」", SWITCH_ACCOUNT_TEXT)
+            self._log_page_snapshot("switch_no_btn")
+            return False
+        self._tap_node(sw, pause=1.2)
+
+        # 3. 账号列表按 UIN 文本定位（顺序会变，禁止记坐标）
+        target = self._wait_for_text(uin, timeout=6.0)
+        if target is None:
+            logger.error("切号失败：账号列表未出现 UIN %s", uin)
+            self._log_page_snapshot("switch_no_uin")
+            return False
+        logger.info("切号：命中账号 UIN %s @ (%d,%d)-(%d,%d)", uin,
+                    target.x1, target.y1, target.x2, target.y2)
+        self._tap_node(target, pause=1.0)
+
+        # 4. 等切号完成（回到联系人页）——实测 3s 内出结果，给 25s 余量
+        if self._wait_for_text(CONTACT_PAGE_HINT, timeout=25.0) is None:
+            # R2（2026-09-28 实测复现）：切号本身**已完成**，但 QQ 会停在
+            # 「上一个停留页」而不是联系人页 —— 实测落点两种：① 个人资料页
+            # （'唐灵'@(378,482)+'切换账号'+相册/收藏/钱包/设置）；② 消息页
+            # （仅底部 tab 可见）。旧实现只认「新朋友」→ 判失败，白重试到
+            # 3/3 后整账号跳过（本次唐灵/觅夏受害）。此处补主壳兜底：登录已
+            # 完成（在主壳内 / 资料页）时主动导航回联系人页，成功即认成功。
+            # 成本：仅失败路径付出；成功路径零额外读屏。
+            if self._recover_to_contacts_after_switch():
+                logger.info("切号落点非联系人页（已在主壳/资料页）→ 兜底导航回位成功")
+            else:
+                logger.error("切号失败：点击 UIN %s 后未回到联系人页", uin)
+                self._log_page_snapshot("switch_timeout")
+                return False
+        # 切号后 QQ 重置到联系人页默认分类：寻路快路径标志与任务中心状态位全部失效
+        self._at_robot_list = False
+        self._page_tc = False
+        settle = float(self.acc.get("settle", 2.0) or 0)
+        if settle:
+            time.sleep(settle)
+
+        # 5. 校验（昵称比对）
+        cur = self._sidebar_nick()
+        if nick and cur != nick:
+            logger.error("切号校验失败：期望昵称 %r，实际 %r", nick, cur)
+            return False
+        logger.info("切号成功：%s (%s)", cur or nick, uin)
+        return True
+
+    def _recover_to_contacts_after_switch(self) -> bool:
+        """切号后的落点兜底（2026-09-28 真机实测新增）。
+
+        QQ 切号成功后并不保证停在联系人页 —— 实测两种落点：
+          ① 个人资料页：全屏页（'切换账号'+相册/收藏/钱包/设置），底部 tab 栏
+             **不可见**（`_on_qq_main_shell` 判 False），BACK×1~3 可退出；
+          ② 消息页：QQ 主壳内（底部 tab 可见），但非联系人页。
+        旧实现只等 `CONTACT_PAGE_HINT`「新朋友」→ 两种落点都判失败（本次
+        唐灵/觅夏两个账号因此 3/3 全败被跳过，而账号其实已切过去）。
+
+        本方法只在上述判据超时后调用（失败路径），做一次轻量导航复位：
+          资料页 → `_safe_back_to_robot_list()`（内部 BACK 逐层退 + 到主壳转
+            完整导航）；消息页 → 点「联系人」tab。
+        返回 True 表示已停在联系人页（`_looks_like_robot_list` 或「新朋友」出现）。
+        幂等：已在联系人页则立即返回 True，不做任何点击。
+        """
+        if self._wait_for_text(CONTACT_PAGE_HINT, timeout=0.5) is not None:
+            return True
+        # ① 主壳内但不在联系人页（消息/动态 tab）→ 点「联系人」tab
+        if self._on_qq_main_shell():
+            if not self._contacts_tab_active():
+                tab = self._find(CONTACTS_TAB, ymin=TAB_Y)
+                if tab:
+                    logger.info("切号落点兜底：点底部「联系人」tab 回位")
+                    self._tap_node(tab, pause=1.0)
+                    self._wait_until(self._contacts_tab_active,
+                                     self._nav_target_wait(), desc="联系人tab选中")
+            if self._wait_for_text(CONTACT_PAGE_HINT, timeout=3.0) is not None:
+                return True
+        # ② 资料页等全屏子页（不在主壳）→ 复用安全返回（内部 BACK 逐层退，
+        #    到主壳后转完整导航真正进列表，再验一次「新朋友」）
+        logger.info("切号落点兜底：尝试安全返回联系人页（资料页/子页）")
+        self._safe_back_to_robot_list()
+        if self._wait_for_text(CONTACT_PAGE_HINT, timeout=3.0) is not None:
+            return True
+        return self._looks_like_robot_list()
+
+    def _ensure_account(self, uin: str, nick: Optional[str] = None) -> bool:
+        """确保当前登录账号为 uin：已是该账号则直接返回 True，否则切号（含重试）。
+
+        实测切号 ~8.5s/次，故首个账号先读一次昵称，命中即省掉整套切换动作。
+        """
+        cur = self._sidebar_nick()
+        if cur is not None and nick and cur == nick:
+            logger.info("当前已是账号 %s，跳过切换", nick)
+            return True
+        max_retry = int(self.acc.get("max_retry", 2) or 0)
+        for attempt in range(1, max_retry + 2):
+            if self._switch_account(uin, nick):
+                return True
+            logger.warning("切号到 %s 失败（第 %d/%d 次）", nick,
+                           attempt, max_retry + 1)
+            time.sleep(1.0)
+        return False
+
+    def _collect_ready(self) -> List[str]:
+        """切号后收集机器人列表，直到「连续 N 次结果一致」才采纳（数据加载就绪）。
+
+        ⚠️ 实测（2026-09-24，两次独立复现）：切号后**首次收集必漏列表顶部若干行**
+        —— 唐灵 7 vs 12（漏 代柯/尔尔/古禹/李宥恩/黎小姐）、觅夏 10 vs 13
+        （漏 代柯/尔尔/古禹），隔一次重收即补齐并稳定。根因：QQ 切号后联系人
+        数据在后台重建，重建期 `_collect_robot_names` 的 Phase1「连续 2 屏内容
+        不变 ⇒ 已到顶」被误判 → 顶部行永远收不到。故必须等结果稳定后才采纳。
+        """
+        stable = max(1, int(self.acc.get("ready_stable", 2) or 1))
+        _rt = self.acc.get("ready_timeout", 120.0)
+        timeout = 120.0 if _rt is None else float(_rt)   # 不用 `or`：0 是合法值
+        if stable <= 1:
+            return self._collect_robot_names()
+        t0 = time.time()
+        prev: Optional[List[str]] = None
+        while True:
+            names = self._collect_robot_names()
+            if prev is not None and names == prev:
+                logger.info("账号数据已就绪（连续 2 次结果一致，%d 个）", len(names))
+                return names
+            if time.time() - t0 >= timeout:
+                logger.warning("账号数据就绪判定超时（>%.0fs），采用末次结果 %d 个",
+                               timeout, len(names))
+                return names
+            logger.info("账号数据仍在加载（本次 %d 个），等待后重收", len(names))
+            prev = names
+            time.sleep(1.0)
+
+    def run_all_accounts(self, accounts: List[dict], do_signin: bool,
+                         do_feedback: bool, ad_times: Optional[int],
+                         rotate: bool = False, group: int = 3,
+                         whitelist: Optional[List[str]] = None) -> List[tuple]:
+        """多账号主流程编排（2026-09-24）：逐账号 切号 → 收集 → run_all。
+
+        accounts：config `accounts.list`，列表顺序即执行顺序，每项
+          {"nick": 昵称, "uin": QQ 号, "enabled": bool}。
+        whitelist：全局机器人白名单（沿用 workflow.robot_whitelist）——
+          实测各账号机器人列表不同（唐灵 12 / 王 11 / 觅夏 13），名单里该账号
+          没有的名字自动跳过，无名可跑则跳过该账号。
+        rotate/group：原样透传给 run_all（滑动窗口轮询模式）。
+        返回 [(nick, 该账号是否跑通, 该账号处理的机器人列表), ...]。
+        """
+        results: List[tuple] = []
+        total = len(accounts)
+        for idx, acc in enumerate(accounts, 1):
+            nick = acc.get("nick") or ""
+            uin = str(acc.get("uin") or "")
+            if not acc.get("enabled", True):
+                logger.info("[账号 %d/%d] %s 已禁用，跳过", idx, total, nick)
+                continue
+            if not uin:
+                logger.error("[账号 %d/%d] %s 缺少 uin，跳过", idx, total, nick)
+                continue
+            logger.info("========== [账号 %d/%d] %s (%s) ==========",
+                        idx, total, nick, uin)
+
+            # 1) 切号（首个账号若已是该号则自动跳过切换）
+            if not self._ensure_account(uin, nick):
+                logger.error("[账号 %s] 切号失败，跳过该账号", nick)
+                results.append((nick, False, []))
+                continue
+
+            # 2) 收集该账号机器人（等数据加载就绪，防切号后首次收集漏号）
+            robots = self._collect_ready()
+
+            # 3) 白名单过滤（全局一份，该账号没有的名字自动跳过）
+            if whitelist:
+                skipped = [r for r in robots if r not in whitelist]
+                if skipped:
+                    logger.info("[账号 %s] 跳过白名单外机器人 %d 个: %s",
+                                nick, len(skipped), skipped)
+                robots = [r for r in robots if r in whitelist]
+            if not robots:
+                logger.warning("[账号 %s] 白名单过滤后无可处理机器人，跳过", nick)
+                results.append((nick, True, []))
+                continue
+            logger.info("[账号 %s] 处理 %d 个机器人: %s", nick, len(robots), robots)
+
+            # 4) 复用既有主流程；每账号独立记账（防跨账号同名机器人串账），
+            #    跑完立即出该账号汇总再清空。
+            self.stats = {}
+            self._energy_start = None      # 电量统计按账号独立（2026-09-29）
+            self._energy_end = None
+            self._energy_start_done = False
+            try:
+                self.run_all(robots, do_signin, do_feedback, ad_times,
+                             rotate=rotate, group=group)
+                results.append((nick, True, robots))
+            except Exception as e:  # noqa: BLE001
+                logger.error("[账号 %s] 主流程异常: %s", nick, e)
+                results.append((nick, False, robots))
+            finally:
+                self._log_summary(do_signin, do_feedback,
+                                  title="账号 %s (%s)" % (nick, uin))
+                self.stats = {}
+
+        logger.info("多账号主流程结束：%s",
+                    ", ".join("%s=%s" % (n, "OK" if ok else "FAIL")
+                              for n, ok, _ in results))
+        return results

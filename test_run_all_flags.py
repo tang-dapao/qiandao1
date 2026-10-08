@@ -143,6 +143,11 @@ class FlowAllBase(unittest.TestCase):
         self.f._dismiss_badcase = mock.Mock()
         self.f._find_row = mock.Mock(return_value=None)
         self.f._safe_back_to_robot_list = mock.Mock(return_value=True)
+        # P0（2026-09-27）：连看会话「失败后是否已不在任务中心」的校验。
+        # 默认 True = 仍在任务中心 → 不触发复位重进（保持本文件既有用例的
+        # 旧语义）。必须显式 mock：Flow.__new__ 无 ui 属性，漏 mock 会静默
+        # 落到真实实现上，用例基于假前提通过。
+        self.f._back_at_taskcenter = mock.Mock(return_value=True)
         # 2026-09-10 CD 重叠优化：进台读一次 X/10 基数（默认读不到 → 走屏幕
         # 复核的旧路径，与 _ad_quota_done 的 None 语义一致）
         self.f._read_ad_ratio = mock.Mock(return_value=None)

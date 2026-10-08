@@ -99,6 +99,7 @@ class TestFeedbackGuard(unittest.TestCase):
         ui = mock.Mock()
         ui.nodes.return_value = []
         f = make_flow(ui)
+        f.wf["feedback_fill"] = False   # 本组用例锁定旧行为（不填写直接返回）
         f._find_row = mock.Mock(return_value=_row("去反馈", label="问题反馈"))
         f._tap_node = mock.Mock()
         return ui, f
@@ -118,9 +119,12 @@ class TestFeedbackGuard(unittest.TestCase):
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._feedback()
         self.assertTrue(ok)
-        # 问卷返回按钮在顶部区域（ymax=300）
-        self.assertEqual(ui.wait_for.call_args,
-                         mock.call("返回", retries=6, interval=1.0, ymax=300))
+        # 问卷返回按钮在顶部区域（ymax=300）：进页断言 + 提交后成功页重定位
+        # （feedback_fill=false = 旧行为回退，但返回定位已统一为两次 wait_for）
+        self.assertEqual(
+            ui.wait_for.call_args_list,
+            [mock.call("返回", retries=6, interval=1.0, ymax=300),
+             mock.call("返回", retries=4, interval=1.0, ymax=300)])
         self.assertEqual(f._tap_node.call_count, 2)        # 点行 + 点返回
 
     def test_no_questionnaire_returns_false_with_reset(self):
@@ -140,6 +144,173 @@ class TestFeedbackGuard(unittest.TestCase):
             ok = f._feedback()
         self.assertFalse(ok)
         self.assertEqual(f._tap_node.call_count, 2)
+
+
+# ----------------------------------------------------------------------
+# 2026-09-25 反馈页改版：填写内容 + 提交（config workflow.feedback_fill，
+# 内容 = 机器人序号 1,2,3...：官方按内容去重，实测 toast「反馈内容重复了」）
+# 实测（dump+截图）：输入框 WebView 自绘不在 dump → 聚焦点 (300,600) 是反馈页
+# 唯一合法坐标点击；输入成功断言 = 计数器 'N/500'；提交按钮 = dump 节点
+# 「提交反馈」y1>1500；成功页含「提交成功」。
+# 上面 TestFeedbackGuard 现覆盖 feedback_fill=false 旧行为回退路径。
+# ----------------------------------------------------------------------
+class TestFeedbackFillSubmit(unittest.TestCase):
+    def _f(self, fill=True):
+        ui = mock.Mock()
+        ui.nodes.return_value = [nd("提交反馈", 1700)]     # 底部提交按钮（y1>1500）
+        f = make_flow(ui)
+        f.wf["feedback_fill"] = fill
+        f._fb_used = set()          # 预设空集：跳过记录文件懒加载
+        f._fb_used_path = None      # 单测无文件 IO
+        f._find_row = mock.Mock(return_value=_row("去反馈", label="问题反馈"))
+        f._tap_node = mock.Mock()
+        f._tap = mock.Mock(return_value=True)
+        f._page_tc = True                                  # 模拟已在任务中心
+        return ui, f
+
+    def test_fill_submit_success_and_guard_restore(self):
+        ui, f = self._f()
+        ui.find_contains.return_value = nd("12345/500", 1176)  # 计数器断言锚
+        ui.wait_for.return_value = nd("返回", 120)          # 反馈页/成功页返回
+        ui.find.side_effect = [nd("每日签到", 300)]         # 返回后见任务中心
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._feedback()
+        self.assertTrue(ok)
+        # 输入框聚焦：反馈页唯一合法坐标点击 (300,600)
+        self.assertEqual(f._tap.call_args_list, [mock.call(300, 600)])
+        # 内容 = 5 位随机数（2026-09-26 用户方案，官方按账号+内容去重）
+        ui.input_text.assert_called_once()
+        (text,), _ = ui.input_text.call_args
+        self.assertRegex(text, r"^\d{5}$")
+        ui.back.assert_called_once()                       # 输入后收键盘 1 次
+        # 点行 + 点提交按钮 + 点成功页返回
+        self.assertEqual(f._tap_node.call_count, 3)
+        self.assertTrue(f._page_tc)                        # 回任务中心后守卫恢复
+
+    def test_retry_uses_new_random_text(self):
+        ui, f = self._f()
+        ui.find_contains.return_value = None               # 计数器始终不出现
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._feedback()
+        self.assertFalse(ok)
+        self.assertEqual(f._tap.call_count, 2)             # 重试 1 次（共 2 次聚焦）
+        # 重试换新内容：官方按账号+内容去重，同内容重试必再撞
+        calls = [c.args[0] for c in ui.input_text.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(len(t) == 5 and t.isdigit() for t in calls))
+        self.assertNotEqual(calls[0], calls[1])
+        self.assertEqual(f._fb_used, set(calls))           # 两条均已记录防重
+        ui.back.assert_called_once()                       # 失败复位物理 BACK
+        self.assertEqual(f._tap_node.call_count, 1)        # 只点了行按钮
+
+    def test_persist_records_and_reload(self):
+        # 持久化防重：生成即追加记录；新实例懒加载后避开历史内容
+        import os
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            ui = mock.Mock()
+            ui.nodes.return_value = []
+            f1 = make_flow(ui)
+            f1._fb_used_path = path          # _fb_used 保持 None → 触发懒加载
+            t1 = f1._new_feedback_text()
+            t2 = f1._new_feedback_text()
+            self.assertRegex(t1, r"^\d{5}$")
+            self.assertNotEqual(t1, t2)      # 同会话内不重复
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = [l.strip() for l in fh if l.strip()]
+            self.assertEqual(lines, [t1, t2])
+            f2 = make_flow(mock.Mock())      # 新实例：懒加载同一记录文件
+            f2._fb_used_path = path
+            t3 = f2._new_feedback_text()
+            self.assertNotIn(t3, (t1, t2))   # 跨进程避开历史已用
+        finally:
+            os.remove(path)
+
+    def test_submit_without_success_page_fails(self):
+        ui, f = self._f()
+        ui.find_contains.return_value = nd("1/500", 1176)
+        ui.wait_contains.return_value = None               # 提交后无成功页
+        ui.find.return_value = None                        # 复位后也认不出任务中心
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._feedback()
+        self.assertFalse(ok)
+        self.assertEqual(f._tap_node.call_count, 2)        # 行 + 提交按钮
+        self.assertEqual(ui.back.call_count, 2)            # 收键盘 + 失败复位
+
+    def test_no_submit_button_fails(self):
+        ui, f = self._f()
+        ui.nodes.return_value = [nd("提交反馈", 100)]      # 只有顶部同名标题
+        ui.find_contains.return_value = nd("1/500", 1176)
+        ui.find.return_value = None
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._feedback()
+        self.assertFalse(ok)
+        self.assertEqual(f._tap.call_count, 1)             # 只聚焦输入框 1 次
+        self.assertEqual(f._tap_node.call_count, 1)        # 不盲点提交坐标
+
+    def test_fill_disabled_keeps_legacy_behavior(self):
+        ui, f = self._f(fill=False)
+        ui.wait_for.return_value = nd("返回", 120)
+        ui.find.side_effect = [nd("每日签到", 300)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._feedback()
+        self.assertTrue(ok)
+        f._tap.assert_not_called()                         # 不聚焦输入框
+        ui.input_text.assert_not_called()                  # 不输入
+        self.assertEqual(f._tap_node.call_count, 2)        # 行 + 返回（旧行为）
+
+
+# ----------------------------------------------------------------------
+# F12: 新功能上线弹窗检测与关闭（2026-09-25 尔尔「你蹲蹲的玩法已经上线」）
+# 双特征（关闭节点 + 「已经上线」同屏）才点；「去体验」绝不可点。
+# ----------------------------------------------------------------------
+class TestDismissNewfeatPopup(unittest.TestCase):
+    def _f(self):
+        ui = mock.Mock()
+        ui.nodes.return_value = []
+        f = make_flow(ui)
+        f._tap_node = mock.Mock()
+        return ui, f
+
+    def test_popup_detected_and_closed(self):
+        ui, f = self._f()
+        close = nd("关闭", 774, x1=897)
+        ui.find.side_effect = [close, None]          # 点击后弹窗消失
+        ui.find_contains.return_value = nd("你蹲蹲的玩法已经上线", 807)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertTrue(ok)
+        f._tap_node.assert_called_once_with(close)   # 点的是 dump 节点
+
+    def test_no_popup_no_action(self):
+        ui, f = self._f()
+        ui.find.return_value = None                  # 无关闭按钮
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertFalse(ok)
+        f._tap_node.assert_not_called()
+        ui.find_contains.assert_not_called()         # 短路：不查第二特征
+
+    def test_close_without_key_is_ignored(self):
+        ui, f = self._f()
+        ui.find.return_value = nd("关闭", 774)       # 有「关闭」
+        ui.find_contains.return_value = None         # 但无「已经上线」→ 非该弹窗
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertFalse(ok)
+        f._tap_node.assert_not_called()              # 防误关其它含「关闭」的界面
+
+    def test_still_on_screen_retries_once(self):
+        ui, f = self._f()
+        ui.find.side_effect = [nd("关闭", 774, x1=897),
+                               nd("关闭", 774, x1=897)]  # 点击后仍在屏
+        ui.find_contains.return_value = nd("已经上线", 807)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertTrue(ok)
+        self.assertEqual(f._tap_node.call_count, 2)  # 重试一次，共 2 次点击
 
 
 # ----------------------------------------------------------------------
@@ -163,7 +334,9 @@ class TestWatchAdSkipWhenDone(unittest.TestCase):
         self.assertTrue(ok)                                # 视为"完成"
         self.assertEqual(f._tap_node.call_count, 0)       # 不点广告按钮
         # 2026-09-10：行标题+按钮词同轮查找（满额后按钮文案变「已完成」）
-        f._find_row.assert_called_once_with("看广告", alt_labels=("获取随机",))
+        # 2026-09-28：备选词集中到 flow.AD_ROW_LABELS（官方新增「看视频赚电量」）
+        f._find_row.assert_called_once_with(
+            flow_mod.AD_ROW_LABELS[0], alt_labels=flow_mod.AD_ROW_LABELS[1:])
 
     def test_skips_with_partial_progress_below_target(self):
         ui, f = self._f(target=5)
@@ -342,6 +515,42 @@ class TestSafeBack(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(len(ui.taps), 4)
         self.assertEqual(f._at_robot_list, False)
+
+    # ---- 觅夏资料卡卡死事故（2026-09-30）回归 ----
+    def _overlay_page(self):
+        """dump 穿透盖屏特征页：背景机器人列表底部「联系人」tab 被读到
+        （_on_qq_main_shell 弱判据 True），但无 机器人 分类 selected
+        → _looks_like_robot_list 强判据 False。模拟资料卡/WebView 覆盖层。"""
+        return _bottom_tabs("联系人") + [nd("发消息", 1700)]
+
+    def test_mainshell_nav_fail_keeps_backing_until_list(self):
+        # 事故核心：弱判据命中主壳 → 立即转导航并 return（旧行为 0 次 BACK 交接）。
+        # 修复后：导航失败不提前收手，继续物理返回 → 页面(索引1)退回即真列表(索引0)。
+        pages = [_robot_list_page(("黎小姐", 300)), self._overlay_page()]
+        ui = FakeUI(pages)
+        ui.pos = 1
+        f = make_flow(ui, at_list=False)
+        f._nav_robot_list = mock.Mock()            # 模拟"导航在覆盖层上必然失败"
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._safe_back_to_robot_list()
+        self.assertTrue(ok)
+        self.assertEqual(f._at_robot_list, True)
+        f._nav_robot_list.assert_called_once()     # 完整导航只尝试 1 次
+        self.assertEqual(len(ui.taps), 1)          # 导航失败后仍按了 1 次 BACK
+
+    def test_mainshell_nav_tried_only_once_then_backs_to_cap(self):
+        # 覆盖层始终不退（无真列表）：导航只尝试 1 次，其后每步只物理返回，
+        # 达 max_back 上限后返回 False（不再像旧实现 0 次 BACK 就放弃）。
+        ui = FakeUI([self._overlay_page()])
+        f = make_flow(ui, at_list=False)
+        f._nav_robot_list = mock.Mock()
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._safe_back_to_robot_list(max_back=5)
+        self.assertFalse(ok)
+        f._nav_robot_list.assert_called_once()     # 关键：不再每步重复导航乱点
+        self.assertEqual(len(ui.taps), 5)          # 5 步全部是物理返回
+        self.assertEqual(f._at_robot_list, False)
+
 
 
 # ----------------------------------------------------------------------

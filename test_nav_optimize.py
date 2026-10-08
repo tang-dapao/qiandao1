@@ -112,7 +112,7 @@ def make_flow(ui, at_list=False):
     f.wf = {"ad_cooldown": 60}
     f._at_robot_list = at_list
     # 注：_tap/_tap_node 由各测试按需 stub（TestExitTaskcenter 需真实 _tap；
-    # TestEnterTaskcenter/F9 钳位测试需要 mock 以断言 tap 坐标）
+    # F9 修复后越界防御在 _reconfirm_click_target 内验证）
     return f
 
 
@@ -335,10 +335,12 @@ class TestNavFastPath(unittest.TestCase):
     def test_robot_cat_recognized_regardless_of_y_position(self):
         # 实机回归：聊天返回后分类行被吸附到顶部 y≈201（之前误用 y 400-650
         # 窗口导致强判据恒 False，导航循环 2 分钟无效重试）。改用 x 范围后
-        # 必须不论 y 在哪儿都能识别
+        # 必须不论 y 在哪儿都能识别。
+        # （坑 15 后补：行节点需 x1=183 满足"平铺行≥1"新正信号 —— 本用例
+        # 测的是分类栏 y 漂移，不是折叠态。）
         ui = FakeUI([_bottom_tabs("联系人")
                      + [nd("机器人", 210, x1=677, selected=True)]
-                     + [nd("黎小姐", 400)]])
+                     + [nd("黎小姐", 400, x1=183)]])
         f = make_flow(ui, at_list=True)
         self.assertTrue(f._looks_like_robot_list())
 
@@ -462,12 +464,18 @@ class TestEnterTaskcenter(unittest.TestCase):
     def _f(self):
         ui = mock.Mock()
         ui.nodes.return_value = []                    # _screen_texts 读屏用
+        ui.find.return_value = None                   # F12：默认无新功能弹窗
+        ui.find_contains.return_value = None          # F12：默认无「已经上线」
         f = make_flow(ui)
         f._nav_robot_list = mock.Mock()
         f._find_robot = mock.Mock(return_value=nd("某机器人", 300))
         f._tap_node = mock.Mock()
-        f._tap = mock.Mock()                          # F9：钳位测试需断言 tap 坐标
+        f._tap = mock.Mock()
         f._diag_shot = mock.Mock()                    # F5：跳过真实截图
+        # 方案 A（2026-09-28）：_enter_taskcenter 成功返回前会读一次广告配额
+        # 缓存（_read_ad_ratio）→ 须 mock，否则落到真实实现（ui 为 Mock，
+        # dump_fail_streak 比较报 TypeError）。返回 None = 未读到（旧行为等价）。
+        f._read_ad_ratio = mock.Mock(return_value=None)
         # F8：点击前新鲜校验默认放行（行仍存在、坐标不变）
         f._reconfirm_click_target = mock.Mock(
             side_effect=lambda name, r: r)
@@ -476,22 +484,43 @@ class TestEnterTaskcenter(unittest.TestCase):
     def test_success_uses_conditional_wait_and_clears_flag(self):
         ui, f = self._f()
         f._at_robot_list = True
+        # P1b（2026-09-29）：进台三处点击的 pause 改由 workflow.enter_tap_* 取值，
+        # 并把 pause 收窄的秒数折成额外轮询 → 本用例只验证 nav_fast_wait 契约，
+        # 故把 pause 钉在旧均值（ep_extra=0）隔离 P1b 变量。P1b 自身见
+        # TestEnterTapPause。
+        f._enter_tap_pause = mock.Mock(
+            return_value=flow_mod.ENTER_TAP_PAUSE_REF)
         ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
-        # 条件等待参数正确：个人 限定 y>=600；发消息 12s（F2 放宽）
+        # 条件等待参数正确：个人 限定 y>=600；发消息 12s（F2 放宽）。
+        # P1（2026-09-29 nav_fast_wait 默认开）：轮询间隔 1.0→0.5s、retries
+        # 加倍（24/16）保持总窗口 12s/8s 不变。
         self.assertEqual(ui.wait_for.call_args_list[0],
-                         mock.call("发消息", retries=12, interval=1.0))
+                         mock.call("发消息", retries=24, interval=0.5))
         self.assertEqual(ui.wait_for.call_args_list[1],
-                         mock.call("个人", retries=8, interval=1.0, ymin=600))
-        # F9：机器人行 tap 改走 _tap(cx, cy)（带 y 钳位），不走 _tap_node
-        self.assertEqual(f._tap_node.call_count, 2)   # profile→发消息 + 聊天页→个人
+                         mock.call("个人", retries=16, interval=0.5, ymin=600))
+        # F9（2026-09-29 修复）：机器人行也走 _tap_node；总计机器人行 + 发消息 + 个人
+        self.assertEqual(f._tap_node.call_count, 3)
+        self.assertEqual(f._tap.call_count, 0)
         self.assertEqual(f._at_robot_list, False)     # 进入后清快路径状态
         f._reconfirm_click_target.assert_called_once()
-        # 机器人行 tap 应使用 row center（无贴底钳位）
-        # nd("某机器人", 300) → x1=100,x2=300,y1=300,y2=380 → center=(200, 340)
-        self.assertEqual(f._tap.call_args_list[0][0][:2], (200, 340))
+
+    def test_newfeat_popup_dismissed_on_enter(self):
+        # F12 集成：点「个人」后新功能弹窗在屏 → 自动关闭 → 任务行探测通过
+        ui, f = self._f()
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        # find 消费顺序：弹窗关闭按钮 → 确认消失(None) → 探测循环 每日签到
+        ui.find.side_effect = [nd("关闭", 774, x1=897), None,
+                               nd("每日签到", 600)]
+        ui.find_contains.return_value = nd("你蹲蹲的玩法已经上线", 807)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        # 机器人行 + 发消息 + 个人 + 弹窗关闭 = 4 次 _tap_node
+        self.assertEqual(f._tap_node.call_count, 4)
 
     def test_profile_fail_returns_false(self):
         ui, f = self._f()
@@ -499,8 +528,9 @@ class TestEnterTaskcenter(unittest.TestCase):
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertFalse(ok)
-        self.assertEqual(f._tap_node.call_count, 0)   # 没等到发消息，不点后续
-        self.assertEqual(f._tap.call_count, 1)       # 只点了机器人条目
+        # 机器人行已点，但 profile 未加载 → 不再点后续
+        self.assertEqual(f._tap_node.call_count, 1)
+        self.assertEqual(f._tap.call_count, 0)
         f._diag_shot.assert_called_once_with("enter_profile")
 
     def test_robot_not_in_list_returns_false(self):
@@ -585,72 +615,6 @@ class TestEnterTaskcenter(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# F9: _enter_taskcenter tap 机器人行 y 上钳（TAP_Y_MAX=1740 防 nav 边缘回弹）
-# 实证：藤非 @(183,1771) 3/3 弹回消息 tab（实测 09-09 20:34 f9），
-# 上钳到 1740 (TAB_Y-100) 留 100px nav 缓冲；游迦 1684 等低于阈值的行不变。
-# ----------------------------------------------------------------------
-class TestEnterTaskcenterYClamp(unittest.TestCase):
-    def _f(self, row_y):
-        ui = mock.Mock()
-        ui.nodes.return_value = []
-        f = make_flow(ui)
-        f._nav_robot_list = mock.Mock()
-        # 构造指定 y 的 row（默认 x1=100 仅做 Mock Node 用，reconfirm 被 stub）
-        f._find_robot = mock.Mock(return_value=nd("藤非", row_y))
-        f._tap_node = mock.Mock()
-        f._tap = mock.Mock()                          # F9：钳位测试需断言 tap 坐标
-        f._diag_shot = mock.Mock()
-        f._reconfirm_click_target = mock.Mock(
-            side_effect=lambda name, r: r)             # 直通返回
-        # profile→个人 链直接返回 None（钳位测试只看第一 tap 坐标）
-        ui.wait_for.return_value = None
-        return f
-
-    def test_bottom_edge_row_y1771_clamps_to_1740(self):
-        # 藤非实机 y=1771 → 应上钳到 TAP_Y_MAX=1740（防 nav 回弹）
-        f = self._f(1771)
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f._enter_taskcenter("藤非")
-        # 第一个 _tap 调用即机器人行；坐标应为 (cx, 1740)
-        self.assertEqual(f._tap.call_args_list[0][0][1],
-                         flow_mod.TAP_Y_MAX)
-
-    def test_safe_row_y1684_unchanged(self):
-        # 游迦实机 y=1684（远低于阈值）→ 应原值 tap，不触发钳位
-        f = self._f(1684)
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f._enter_taskcenter("游迦")
-        # nd("游迦", 1684) → y1=1684,y2=1764 → center=(?, 1724)
-        # 1724 < 1740，不钳位，tap y 保持 1724
-        self.assertEqual(f._tap.call_args_list[0][0][1], 1724)
-
-    def test_top_row_y799_unchanged(self):
-        # 代柯实机 y=799 → 原值 tap
-        f = self._f(799)
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f._enter_taskcenter("代柯")
-        # nd("代柯", 799) → y1=799,y2=879 → center=(?, 839)
-        self.assertEqual(f._tap.call_args_list[0][0][1], 839)
-
-    def test_clamp_exact_boundary_y1741(self):
-        # 边界：y=1740 (=TAP_Y_MAX) → 不钳位；y=1741 → 钳到 1740
-        f1 = self._f(1690)                             # center=1730, 不钳
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f1._enter_taskcenter("R")
-        self.assertEqual(f1._tap.call_args_list[0][0][1], 1730)
-
-        f2 = self._f(1700)                             # center=1740, 不钳
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f2._enter_taskcenter("R")
-        self.assertEqual(f2._tap.call_args_list[0][0][1], 1740)
-
-        f3 = self._f(1701)                             # center=1741, 钳到 1740
-        with mock.patch.object(flow_mod.time, "sleep"):
-            f3._enter_taskcenter("R")
-        self.assertEqual(f3._tap.call_args_list[0][0][1], 1740)
-
-
-# ----------------------------------------------------------------------
 # F8: _reconfirm_click_target 点击前新鲜坐标校验（真实逻辑直测）
 # ----------------------------------------------------------------------
 class TestReconfirmClickTarget(unittest.TestCase):
@@ -682,6 +646,66 @@ class TestReconfirmClickTarget(unittest.TestCase):
         out = f._reconfirm_click_target(
             "某机器人", nd("某机器人", 300, x1=183))
         self.assertEqual(out.y1, 500)                  # 用新坐标
+        f._diag_shot.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # F9（2026-09-29 修复）：行底部越界 → 上滑让位后重找，不再盲钳点上一行
+    # ------------------------------------------------------------------
+    def _oob_node(self, y):
+        """构造一个 cy 略高于 TAP_Y_MAX 但仍通过 _is_robot_row 的行节点。"""
+        return Node("藤非", 183, y, 383, y + 80)
+
+    def test_safe_row_no_swipe(self):
+        """安全区内的行直接放行，零 swipe。"""
+        page = _robot_list_page(("藤非", 1300))         # cy=1340 < TAP_Y_MAX
+        ui = FakeUI([page])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f._find_robot = mock.Mock(return_value=None)   # 不应走到
+        out = f._reconfirm_click_target("藤非", self._oob_node(1300))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 1300)
+        self.assertEqual(ui.swipes, 0)
+        f._diag_shot.assert_not_called()
+        f._find_robot.assert_not_called()
+
+    def test_oob_row_swipes_up_and_returns_safe(self):
+        """越界行（cy=1771）→ 上滑 1 次后滚入安全区 → 返回新坐标。"""
+        safe = self._oob_node(1300)
+        ui = FakeUI([_robot_list_page(("藤非", 1731)),
+                     _robot_list_page(("藤非", 1300))])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f._find_robot = mock.Mock(return_value=safe)
+        out = f._reconfirm_click_target("藤非", self._oob_node(1731))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 1300)
+        self.assertEqual(ui.swipes, 1)
+        f._diag_shot.assert_not_called()
+
+    def test_oob_row_still_oob_after_swipe_returns_none(self):
+        """越界行上滑 2 次后仍无法进入安全区 → 放弃点击 + 截图。"""
+        oob = self._oob_node(1731)
+        ui = FakeUI([_robot_list_page(("藤非", 1731)),
+                     _robot_list_page(("藤非", 1731))])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f._find_robot = mock.Mock(return_value=oob)
+        out = f._reconfirm_click_target("藤非", self._oob_node(1731))
+        self.assertIsNone(out)
+        self.assertEqual(ui.swipes, 2)
+        f._diag_shot.assert_called_once_with("reconfirm_row_oob")
+
+    def test_oob_row_vanishes_after_swipe_returns_none(self):
+        """越界行上滑后目标消失 → 放弃点击（不截图，等复位重试）。"""
+        ui = FakeUI([_robot_list_page(("藤非", 1731)),
+                     _robot_list_page(("桑祁", 1300))])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f._find_robot = mock.Mock(return_value=None)
+        out = f._reconfirm_click_target("藤非", self._oob_node(1731))
+        self.assertIsNone(out)
+        self.assertEqual(ui.swipes, 1)
         f._diag_shot.assert_not_called()
 
 
@@ -904,6 +928,303 @@ class TestCollectRobotNamesScroll(unittest.TestCase):
             max_scroll=8, stop_when=["代柯", "李宥恩"])
         self.assertEqual(
             set(names), {"代柯", "尔尔", "古禹", "李宥恩", "黎小姐"})
+
+
+# ----------------------------------------------------------------------
+# 坑 15（2026-09-17）：折叠分组页 + 幽灵行防御 + OCR 展开自愈
+# 实锤：10:56 轮换组3 藤非@(183,364) 为 ListView 回收残影（视觉槽位实为
+# 「我添加的机器人」分组头），点击把分组折叠；折叠态壳+分类正信号仍满足
+# → 判据误 True → 快路径/安全返回全短路 → 4 台 × 3 次连环弃权（-19 支）。
+# ----------------------------------------------------------------------
+def _collapsed_page():
+    """折叠态页：壳 + 机器人分类 selected（吸顶 y=201）+ 分组头可见，
+    无任何平铺机器人行（与 10:57 失败截图一致；真机 dump 连分组头都
+    读不到，这里多给一个头节点更严格 —— 行判定必须只认平铺行）。"""
+    return (_bottom_tabs("联系人")
+            + [nd("机器人", 201, x1=677, selected=True),
+               nd("我添加的机器人", 380, x1=40)])
+
+
+class _TapAdvancesUI(FakeUI):
+    """tap 推进一页：模拟「点分组头 → 列表展开」。"""
+
+    def tap(self, x, y, pause=1.2):
+        self.taps.append((x, y))
+        self._move(1)
+
+
+class TestCollapsedGroupState(unittest.TestCase):
+    def test_collapsed_page_not_robot_list(self):
+        # 坑 15 核心：壳+分类 selected 齐全但无平铺行 → 必须判 False
+        # （旧判据在此返回 True → 导航快路径/安全返回全部短路）
+        ui = FakeUI([_collapsed_page()])
+        f = make_flow(ui, at_list=True)
+        self.assertFalse(f._looks_like_robot_list())
+
+    def test_collapsed_state_detected_by_helper(self):
+        ui = FakeUI([_collapsed_page()])
+        f = make_flow(ui, at_list=True)
+        self.assertTrue(f._collapsed_groups_on_nodes(list(ui.nodes())))
+
+    def test_expanded_list_not_collapsed(self):
+        ui = FakeUI([_robot_list_page(("代柯", 1226))])
+        f = make_flow(ui, at_list=True)
+        self.assertFalse(f._collapsed_groups_on_nodes(list(ui.nodes())))
+        self.assertTrue(f._looks_like_robot_list())
+
+
+class TestGhostRowDefense(unittest.TestCase):
+    """_reconfirm_click_target：吸顶栏下缘第一个槽位的行 = 回收残影区，
+    不得直接点击（点击会落在「我添加的机器人」分组头上把列表折叠）。"""
+
+    def _pinned_bar(self):
+        return nd("机器人", 201, x1=677, selected=True)   # y2=281
+
+    def _ghost_page(self):
+        # 10:56 实测同款：藤非@(183,358) 紧贴栏底(281)，间距 77 < 行距 162
+        return _bottom_tabs("联系人") + [self._pinned_bar(),
+                                          nd("藤非", 358, x1=183)]
+
+    def _safe_page(self):
+        return _bottom_tabs("联系人") + [self._pinned_bar(),
+                                          nd("藤非", 700, x1=183)]
+
+    def test_ghost_row_swipes_down_and_recovers(self):
+        # 首屏幽灵行 → 下滑 1 次让行离开边界槽位 → 返回安全位置的新坐标
+        # （FakeUI 页面序：index 0=滚到顶的安全态，index 1=下滚后的幽灵态；
+        #   swipe_down = 向列表顶回滚，pos-1）
+        ui = FakeUI([self._safe_page(), self._ghost_page()])
+        ui.pos = 1
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        out = f._reconfirm_click_target("藤非", nd("藤非", 358, x1=183))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 700)                 # 用让位后的新坐标
+        self.assertEqual(ui.swipes, 1)
+        f._diag_shot.assert_not_called()
+
+    def test_ghost_row_unresolvable_returns_none(self):
+        # 连续下滑仍在边界槽位（页面恒同款）→ 放弃点击交上层复位
+        ui = FakeUI([self._ghost_page() for _ in range(3)])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        self.assertIsNone(
+            f._reconfirm_click_target("藤非", nd("藤非", 358, x1=183)))
+        self.assertEqual(ui.swipes, 2)                # 最多纠正 2 次
+
+    def test_row_far_below_pinned_bar_passes(self):
+        # 行离吸顶栏底 ≥ 一个行距（如小麦@520 实测安全位）→ 正常放行不滑动
+        page = (_bottom_tabs("联系人")
+                + [self._pinned_bar(), nd("小麦", 520, x1=183)])
+        ui = FakeUI([page])
+        f = make_flow(ui)
+        out = f._reconfirm_click_target("小麦", nd("小麦", 520, x1=183))
+        self.assertIsNotNone(out)
+        self.assertEqual(ui.swipes, 0)
+
+    def test_unpinned_bar_no_defense(self):
+        # 页面在顶部（分类栏未吸顶 y=688）→ 无回收残影问题，不触发防御
+        page = (_bottom_tabs("联系人")
+                + [nd("机器人", 688, x1=677, selected=True),
+                   nd("藤非", 790, x1=183)])
+        ui = FakeUI([page])
+        f = make_flow(ui)
+        out = f._reconfirm_click_target("藤非", nd("藤非", 790, x1=183))
+        self.assertIsNotNone(out)
+        self.assertEqual(ui.swipes, 0)
+
+
+class TestNavExpandCollapsedGroups(unittest.TestCase):
+    """_nav_robot_list 折叠态自愈：dump 读不到分组头 → OCR 定位点击展开。"""
+
+    def _f(self, ui, ocr_ret):
+        f = make_flow(ui, at_list=False)
+        f._ocr_find = mock.Mock(return_value=ocr_ret)
+        f._dismiss_badcase = mock.Mock()
+        f._diag_shot = mock.Mock()
+        return f
+
+    def test_nav_expands_collapsed_groups_via_ocr(self):
+        # 折叠页 → OCR 定位分组头 (250,560) → 点击 → 列表展开 → 导航成功
+        ui = _TapAdvancesUI([_collapsed_page(),
+                             _robot_list_page(("代柯", 1226))])
+        f = self._f(ui, (250, 560))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            f._nav_robot_list()
+        self.assertEqual(f._at_robot_list, True)
+        self.assertIn((250, 560), ui.taps)
+        f._ocr_find.assert_called_once()
+        self.assertIn("我添加的机器人", f._ocr_find.call_args.args)
+
+    def test_nav_collapsed_ocr_miss_tried_only_once(self):
+        # OCR 未命中分组头 → 4 轮循环里只尝试 1 次（防连环全屏 OCR 空烧）
+        ui = FakeUI([_collapsed_page()])
+        f = self._f(ui, None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            f._nav_robot_list()
+        self.assertEqual(f._ocr_find.call_count, 1)
+        self.assertEqual(f._at_robot_list, False)     # 如实报告未恢复
+        f._diag_shot.assert_called_once_with("nav_not_list")
+
+    def test_nav_expanded_list_skips_ocr(self):
+        # 正常展开列表 → 不触发 OCR 兜底（零额外开销）
+        ui = FakeUI([_robot_list_page(("代柯", 1226))])
+        f = self._f(ui, (250, 560))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            f._nav_robot_list()
+        f._ocr_find.assert_not_called()
+        self.assertEqual(f._at_robot_list, True)
+
+
+# ----------------------------------------------------------------------
+# P1（2026-09-29）：workflow.nav_fast_wait —— 退台去层间盲等 + 进台轮询间隔 0.5s
+# 实测依据（probe_exit_timing.py 3 trial）：层3 BACK 后 0.07-0.08s 列表即可被
+# 强判据检出、层1/2 列表校验恒不命中 → 层间固定 sleep(EXIT_LAYER_WAIT) 属盲等。
+# ----------------------------------------------------------------------
+class TestNavFastWaitExit(unittest.TestCase):
+    def _f(self, pages):
+        ui = _TapAdvanceUI(pages)
+        f = make_flow(ui)
+        f._scroll_to_top_of_taskcenter = mock.Mock()
+        return ui, f
+
+    def test_exit_fast_path_skips_layer_sleep(self):
+        # 默认开：三层 BACK 期间不再盲等 EXIT_LAYER_WAIT（无任何 time.sleep）
+        ui, f = self._f([_tc_page(), _chat_page(), _chat_page(), _list_page()])
+        with mock.patch.object(flow_mod.time, "sleep") as ms:
+            ok = f._exit_taskcenter()
+        self.assertTrue(ok)
+        self.assertEqual(ui.taps, [("BACK",), ("BACK",), ("BACK",)])
+        ms.assert_not_called()
+
+    def test_exit_knob_off_keeps_layer_sleep(self):
+        # 旋钮关：回退旧行为 —— 每层 sleep(EXIT_LAYER_WAIT) 各一次
+        ui, f = self._f([_tc_page(), _chat_page(), _chat_page(), _list_page()])
+        f.wf["nav_fast_wait"] = False
+        with mock.patch.object(flow_mod.time, "sleep") as ms:
+            ok = f._exit_taskcenter()
+        self.assertTrue(ok)
+        self.assertEqual(ms.call_count, 3)
+
+
+class TestNavFastWaitEnter(unittest.TestCase):
+    def _f(self):
+        # P1b：把进台点击 pause 钉在旧均值（ep_extra=0），隔离 P1b 变量 ——
+        # 本类只验证 nav_fast_wait 的 interval/retries 契约。
+        ui, f = TestEnterTaskcenter._f(self)
+        f._enter_tap_pause = mock.Mock(
+            return_value=flow_mod.ENTER_TAP_PAUSE_REF)
+        return ui, f
+
+    def test_knob_off_restores_interval_1(self):
+        # 旋钮关：进台 wait_for 回退 interval=1.0 / retries=12、8（F2 旧窗口）
+        ui, f = self._f()
+        f.wf["nav_fast_wait"] = False
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.wait_for.call_args_list[0],
+                         mock.call("发消息", retries=12, interval=1.0))
+        self.assertEqual(ui.wait_for.call_args_list[1],
+                         mock.call("个人", retries=8, interval=1.0, ymin=600))
+
+    def test_knob_on_doubles_retries_keeps_window(self):
+        # 默认开：interval 0.5 + retries 加倍（24/16）→ 总窗口 12s/8s 不变
+        ui, f = self._f()
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.wait_for.call_args_list[0],
+                         mock.call("发消息", retries=24, interval=0.5))
+        self.assertEqual(ui.wait_for.call_args_list[1],
+                         mock.call("个人", retries=16, interval=0.5, ymin=600))
+
+
+# ----------------------------------------------------------------------
+# P1b（2026-09-29）：workflow.enter_tap_pause_min/max —— 进台三处点击的 pause
+# 从 timing.click_min/click_max（1.5-3.0s，均值 2.25s）收到 0.5-0.9s。
+# 实测依据：进台 9.5s 里 6.75s（70%）是该 pause 空等，段3/4/5 分布形状 =
+# uniform(1.5, 3.0)；就绪由紧随的 wait_for 兜底，故 pause 收窄秒数折成额外
+# retries，保持 tap 后总窗口不短于旧行为。
+# ----------------------------------------------------------------------
+class TestEnterTapPause(unittest.TestCase):
+    def _f(self):
+        ui, f = TestEnterTaskcenter._f(self)
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        return ui, f
+
+    def _taps(self, f):
+        """三次 _tap_node 的 (位置序, pause) —— 顺序即 机器人行/发消息/个人。"""
+        return [(c.args[0].text, c.kwargs.get("pause"))
+                for c in f._tap_node.call_args_list]
+
+    def test_default_pause_comes_from_knob(self):
+        # 默认（wf 未配置）：pause 落在旋钮默认区间 0.5-0.9，而非 click_min/max
+        ui, f = self._f()
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        taps = self._taps(f)
+        self.assertEqual(len(taps), 3)
+        for _name, pause in taps:
+            self.assertIsNotNone(pause)                     # 显式传了 pause
+            self.assertGreaterEqual(pause, 0.5 - 1e-9)
+            self.assertLessEqual(pause, 0.9 + 1e-9)
+            self.assertLess(pause, f.t["click_min"])        # 未落回旧 1.5s 下限
+
+    def test_total_window_preserved_by_extra_retries(self):
+        # pause=0.5 → ep_extra=round((2.25-0.5)/0.5)=4 → retries 24+4 / 16+4；
+        # tap 后总窗口 = 0.5 + 28×0.5 = 14.5s ≥ 旧 2.25 + 12 = 14.25s
+        ui, f = self._f()
+        with mock.patch.object(flow_mod.random, "uniform", return_value=0.5), \
+                mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.wait_for.call_args_list[0],
+                         mock.call("发消息", retries=28, interval=0.5))
+        self.assertEqual(ui.wait_for.call_args_list[1],
+                         mock.call("个人", retries=20, interval=0.5, ymin=600))
+        for _name, pause in self._taps(f):
+            self.assertAlmostEqual(pause, 0.5, places=6)
+
+    def test_knob_backoff_restores_old_pause_and_retries(self):
+        # 回退档：enter_tap_pause_min/max 设回 1.5/3.0 → pause 落旧区间且
+        # ep_extra=0（retries 回 24/16）＝ 一键回退旧行为
+        # 注：ep 取自 random.uniform(min,max)，ep_extra 依赖它相对 REF(2.25) 的
+        # 位置 —— 必须钉住随机值，否则 ep<2.25 时 ep_extra>0、断言偶发失败
+        # （历史 flaky 根因）。
+        ui, f = self._f()
+        f.wf["enter_tap_pause_min"] = 1.5
+        f.wf["enter_tap_pause_max"] = 3.0
+        with mock.patch.object(flow_mod.random, "uniform",
+                               return_value=flow_mod.ENTER_TAP_PAUSE_REF), \
+                mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.wait_for.call_args_list[0],
+                         mock.call("发消息", retries=24, interval=0.5))
+        for _name, pause in self._taps(f):
+            self.assertGreaterEqual(pause, 1.5 - 1e-9)
+            self.assertLessEqual(pause, 3.0 + 1e-9)
+
+    def test_seg6_stage_logged_after_quota_read(self):
+        # P1b 补的段6埋点：_read_ad_ratio 之后必须打一条 [计时] 进台.6配额缓存，
+        # 让「段5→进台合计」之间的盲区（实测恒定 1.55s）在日志里可见。
+        ui, f = self._f()
+        f._stage = mock.Mock(side_effect=lambda t0, tag: t0)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        tags = [c.args[1] for c in f._stage.call_args_list]
+        self.assertIn("进台.6配额缓存", tags)
+        self.assertLess(tags.index("进台.5TC加载探测"),
+                        tags.index("进台.6配额缓存"))
+        f._read_ad_ratio.assert_called_once()
 
 
 if __name__ == "__main__":

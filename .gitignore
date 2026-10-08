@@ -37,3 +37,7 @@ node_modules/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# ---- 本地调试残留（非源码/非配置）----
+_git_status.txt
+_unittest_out.txt

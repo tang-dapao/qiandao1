@@ -43,11 +43,11 @@ D:\qiandao\
 ├─ ad_test_all.bat [COUNT]  # 启动：全白名单手动跑广告（默认每台 1 次，全链路快速验证）
 │
 ├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限 + dump 复核补强(dump_fallback) + BACK 退穿保护（99 用例）
-├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（21 用例）
+├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（27 用例）
 ├─ test_run_all_flags.py    # mock 单测：run_all 各 flag 组合 + 单会话连看 + 首轮广告 + 配额收尾 + 白名单（29 用例）
-├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0) + 进台流程(条件等待/新功能弹窗/心动卡/Y钳位)（61 用例）
-├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数 + 看广告配额跳过，46 用例）
-├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 + 滑动窗口 rotate + 4 台补位/连败弃权 + 进台配额缓存复用 TestEntryQuotaCache，26 用例）
+├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0) + 进台流程(条件等待/新功能弹窗/心动卡/Y钳位) + 落点断言/F9让位后复核/配额单快照(P1P3 2026-10-08)（84 用例）
+├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数 + 看广告配额跳过，48 用例）
+├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 + 滑动窗口 rotate + 4 台补位/连败弃权 + 进台配额缓存复用 TestEntryQuotaCache，31 用例）
 ├─ test_signin_ad.py        # mock 单测：签到奖励广告（签到触发/跳过/配置关闭/异常隔离 + 看广告按钮 dump 命中/OCR 兜底/无按钮/sheet_ok 关闭，9 用例）
 ├─ test_u2_backend.py       # mock 单测：u2 backend（Node 解析兼容/dump 三态/TTL/agent 生命周期，13 用例）
 ├─ test_account_switch.py   # mock 单测：多账号切换（切号链路/4 失败分支/顺序漂移按 UIN 定位/
@@ -55,7 +55,10 @@ D:\qiandao\
 │                           #   run_all_accounts 编排/main 模式路由，41 用例）
 ├─ test_watch_recover.py    # mock 单测：连看会话失败后复位重进 + 仍在任务中心时原地重试不重建导航（P0 2026-09-27，7 用例）
 ├─ test_summary.py          # mock 单测：运行汇总记账（签到/反馈/广告计数 + 汇总文件输出，10 用例）
-│                           # → 合计 362/362（1 个环境依赖 ERROR：test_u2_backend tap 用例 wraps 真实 adb，设备 offline 时必失败，与代码无关）
+├─ test_energy.py           # mock 单测：账号级「本流程获得电量」（_read_energy dump/OCR 双路 + 起始/结束读数幂等 + 汇总电量行，15 用例）
+├─ test_quota_verify.py     # mock 单测：方案 A 收尾配额复核（末支关闭可疑时读屏校准 done，正常路径零额外读屏，9 用例）
+├─ test_row_ratio.py        # mock 单测：任务行 X/Y 计数解析（/1000 串扰修复 + 分母必须 == 配额，8 用例）
+│                           # → 合计 430/430（1 个环境依赖 ERROR：test_u2_backend tap 用例 wraps 真实 adb，设备 offline 时必失败，与代码无关）
 ├─ test_plan_fullflow.md    # 全流程测试计划文档
 │
 ├─ e2e_ad_once.py           # 真机验证：单机器人看一次广告（RESULT: OK/FAIL）
@@ -137,6 +140,10 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 | `ad_times_per_robot` | 10 | 每台每日广告配额 |
 | `ad_rotate` / `ad_rotate_group` | false / 3 | 滑动窗口轮询模式（2026-09-16 组制轮询 → 2026-09-26 滑动窗口）：true=固定 N 台窗口 + 补位队列，某台出窗（配额满/连败 3 次）立即补位，窗口常满员；仅剩 1 台且无待补时回落同机连看。靠换台吸收 60s CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）。`--rotate` 命令行可强制开启 |
 | `signin_ad` | true | 签到奖励广告（2026-09-16）：签到成功后浮层「看广告 +⚡」→ 再看一次 15s 广告拿奖励；失败只记日志不阻断主流程 |
+| `enter_tap_pause_min/max` | 0.5 / 0.9 | 进台三处 `_tap_node` 后 pause 收紧（2026-09-29）：诊断实测进台 9.5s 里 6.75s（70%）是「点机器人行/点发消息/点个人」后的固定 pause 空等（分布 = uniform(1.5,3.0)）；收窄的秒数折成额外 `wait_for` 轮询 → tap 后**总窗口不短于旧行为**。⚠️ 仅作用于 `_enter_taskcenter` 三处点击，签到/反馈/关广告/退台零变化。设回 `1.5 / 3.0` 即完全回退 |
+| `tc_ready_by_quota` | true | **P3（2026-10-08）**：进台「TC 探测 + 配额读屏」合并 —— 段5 就绪轮询的**同一份 `ui.nodes()` 快照**顺手解析广告行 X/Y，命中即同时证明「任务行已渲染」+ 拿到配额基数 → 跳过 段6 独立读屏（省 ~1.55s，且避免其 `max_scroll=6` 把刚进的页滚走）。**零额外 dump**，快照打空即回落 段6 原链路（零回归）。见「进入任务中心」一节。`false` = 一键回退 |
+| `enter_landing_assert` | true | **P1（2026-10-08）**：进台**落点断言** —— 段5 探不到任务行时做一次 OCR 判别：读到任务中心特征 = H5 慢加载放行；读到**错页特征**（聊天页/资料卡，`_LANDING_WRONG_KEYS`）= 判进入失败交上层复位重试（否则白跑一轮 签到+反馈+广告 ~4min）。⚠️ 判据只能用 OCR —— 这些页对 dump **穿透透明**。成本仅 1.1% 异常分支一次 OCR。`false` = 回退旧行为 |
+| `enter_landing_recheck` | true | **P1（2026-10-08）**：F9/坑 15 **让位后落点复核** —— 上滑让位改变列表版式，目标行可能被滚入吸顶分类栏下缘的回收残影槽位（坑 15）；让位后用新 dump 复核「同名行仍在 + 仍在安全点击区(`cy`/`y2<=TAP_Y_MAX`) + 未贴吸顶栏」，任一不过则放弃交复位。仅「确实让位过」时付一次 dump。`false` = 回退旧行为 |
 
 **效率基线（2026-09-16 u2 后端组制轮询实测）**：4 台 × 5 轮稳态 **48-49s/支**（0 失败）；
 14:35 全流程场 90 支全含 **49.8s/支**（89.7min，0 WARN/0 Err/0 弃权）。
@@ -156,6 +163,39 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 > 所有坐标基于 **1080×1920 竖屏固定分辨率**（flow.py 顶部常量），改分辨率需重新标定。
 > **滑动锚点 `SWIPE_X=140`**（2026-09-10 #1 优化）：`swipe_up`/`swipe_down` 起止 x 固定左安全列 140，
 > 避开中列 540 的「签到/问题反馈/banner」命中区，防止 WebView 自绘页把滑动误判为点按而飘页。
+
+## 进入任务中心（进台：6 段 + 就绪快照 + 落点断言，2026-10-08）
+
+进台全链路（`_enter_taskcenter`）分 6 段，稳态中位 **~4.05s/台**（P3 前 ~5.6s）：
+
+| 段 | 动作 | 稳态中位 | 关键点 |
+|---|---|---|---|
+| 段3 | 点机器人行 | ~1.0s | `enter_tap_pause_*` 收窄 pause，余量折成 `wait_for` 轮询 |
+| 段4 | 点「发消息」进个人页 | ~0.9s | 同上 |
+| 段5 | 点「个人」→ 轮询任务中心就绪 | ~1.95s | **H5 真实渲染等待**；`tc_ready_by_quota` 时该轮询单快照**顺手取配额** |
+| 段6 | 配额读屏（兜底） | ~1.55s | P3 后仅在 段5 快照未取到时才走 |
+
+> **P3 · TC 探测 + 配额读屏合并**（2026-10-08）：段5 就绪轮询本就每 0.5s 取一次
+> `ui.nodes()`；合并后让该**同一份快照**顺手解析广告行 X/Y（`_ad_ratio_from_snapshot`），
+> 命中即同时拿到「已渲染」+ 配额基数 → 跳过 段6（省 ~1.55s）。**零额外 dump**，
+> 快照打空即回落 段6 原链路（零回归）。⚠️ 曾被实测推翻的一版设计：进台一开始单发
+> 一次「免滚探针」（`_read_ad_ratio(scroll=False)`）—— 段5 是**真实渲染等待**，探针在
+> 页面渲染前必然打空，只会白加一次 dump。`tc_ready_by_quota: false` 可一键回退。
+
+> **P1 · 落点断言**（`enter_landing_assert`，2026-10-08）：段5 探不到任务行时 OCR 判别
+> 落点 —— 命中任务中心特征 = H5 慢加载放行；命中**错页特征**（`_LANDING_WRONG_KEYS` =
+> 发送/语音通话/QQ空间/资料卡/相册/听听）= 落错页（聊天页/资料卡）→ 判进入失败交上层
+> 复位重试。**根因**：聊天页/资料卡都是 WebView，对 uiautomator dump **穿透透明**（dump
+> 读到的是背景页文本）→ 旧逻辑「版式差异，继续流程」放行 → 六步全绿但后续 签到/反馈/
+> 广告全失败（10-04 古禹静默失败，整台白跑 ~4min）。实测兜底分支 **91/8419 = 1.1%**，
+> 其中仅 **6 次真错页**、其余 85 次慢加载最终成功 → **不能**改成「必须命中任务中心特征」
+> （会误伤那 85 次，反而更差）。详见 `MEMORY.md` 坑 26。
+
+> **P1 · F9 让位后复核**（`enter_landing_recheck`，2026-10-08）：目标行 `cy`/`y2` 超出
+> 安全点击区（`> TAP_Y_MAX = 1740`）时会 `swipe_up` 让位；让位改变列表版式，坑 15 的
+> 「贴吸顶栏」检查在让位前已失效 → 让位后用新 dump 复核「同名机器人行仍在 + 仍在安全
+> 区 + 未贴吸顶栏」，任一不过则放弃本次点击交复位重试。仅「确实让位过」时付一次 dump，
+> 未让位的成功路径零开销。
 
 ## banner 根治：任务中心页禁止盲点坐标点击（F11）
 
@@ -382,8 +422,8 @@ dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `
 
 ```bash
 # mock 单测（无需设备 / 无 OCR 依赖，任意环境可跑）
-py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 362 用例（1 个环境依赖 ERROR：test_u2_backend tap 用例需真机 adb，设备 offline 时必失败，与代码无关）
-py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend test_account_switch test_watch_recover
+py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 430 用例（1 个环境依赖 ERROR：test_u2_backend tap 用例需真机 adb，设备 offline 时必失败，与代码无关）
+py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend test_account_switch test_watch_recover test_energy test_quota_verify test_row_ratio test_summary
 
 # 真机验证（需模拟器在线 + QQ 停在机器人列表）
 py -3.13 main.py --only-switch              # 多账号切号链路验证（逐个切号 + 校验昵称）
@@ -397,7 +437,7 @@ py -3.13 scripts_test/observe_ad.py "昵称"  # 广告页证据采集（不自�
 > u2 后端另需 `pip install uiautomator2` 且设备端执行过 `py -3.13 -m uiautomator2 init -s <udid>`）。
 > 单测需要能 import `main.py`，故 **PyYAML 必须装**（缺它会导致 main 参数映射类用例报
 > `ModuleNotFoundError: No module named 'yaml'`）。
-> 详细技术档案、坑 1-25、恢复流程见仓库根 **`MEMORY.md`**。
+> 详细技术档案、坑 1-27、恢复流程见仓库根 **`MEMORY.md`**。
 
 ## 已知注意点
 
@@ -410,6 +450,10 @@ py -3.13 scripts_test/observe_ad.py "昵称"  # 广告页证据采集（不自�
 - **可能误入「心动卡会员 H5」**（2026-09-10 方案 A 防御）：该页是 WebView，dump 穿透读不到，
   由 `_enter_taskcenter` 在未见任务中心特征时 OCR 一次识别（命中 `心动卡 / 高级模型 / 立即续费`
   → 判进入失败 + 复位重试）。2026-09-11 00:32 小麦 实测命中并正确判失败。
+- **进台「落错页」静默失败（2026-10-08 已加落点断言）**：进台后屏幕可能是**聊天页**或
+  **个人资料卡**（均为 WebView，对 dump **穿透透明** → 六步全绿但页面错），旧逻辑「版式差异，
+  继续流程」放行 → 后续 签到/反馈/广告全失败（10-04 古禹整台白跑 ~4min）。现 `enter_landing_assert`
+  在段5 探不到任务行时 OCR 判别错页特征（`_LANDING_WRONG_KEYS`）→ 判失败交复位重试。见 `MEMORY.md` 坑 26。
 - **导航偶发「未确认在机器人列表」（坑 12）**：dump 残留/穿透节点（如同屏混入「发消息」）会让
   `_looks_like_robot_list()` 误判为"不在列表"→ 导航空转。**D1（2026-09-12）已修**：改
   「先看正信号再谈 veto」—— 正信号（QQ 主壳 + 机器人分类 selected）成立即是列表的充分证据，

@@ -40,6 +40,9 @@ class ThreeBotRotationBase(unittest.TestCase):
         self.f._watch_ad_once = mock.Mock(return_value=True)
         self.f._exit_taskcenter = mock.Mock()
         self.f._safe_back_to_robot_list = mock.Mock(return_value=True)
+        # P0（2026-09-27）：连看会话失败后的「是否仍在任务中心」校验。
+        # 默认 True = 不触发复位重进（轮换路径不受该修复影响）。
+        self.f._back_at_taskcenter = mock.Mock(return_value=True)
         self.f._read_ad_ratio = mock.Mock(return_value=None)  # 基数未知 → 屏幕复核路径
         self.f._ad_quota_done = mock.Mock(return_value=False)
         self._sleep = mock.patch.object(flow_mod.time, "sleep")
@@ -275,6 +278,78 @@ class TestRotateGroupMode(ThreeBotRotationBase):
         self.assertEqual(self.f2._watch_ad_once.call_count, 6)  # 每台补 2 支
 
 
+class TestSlidingWindowRotate(ThreeBotRotationBase):
+    """滑动窗口轮询（2026-09-26 用户需求）：固定窗口 + 出窗补位。
+
+    语义（演进自静态分组）：
+    - 某台配额满/连败弃权出窗后，队列下一位**立即**补位进窗（排窗口尾部）；
+    - 窗口保持满员轮换直至机器人耗尽，避免缩员后 CD 空等；
+    - 队列空且窗口剩 1 台 → 回落 _watch_ads_session 连看。
+    """
+
+    def test_early_full_bot_refills_from_queue(self):
+        # 用户场景：5 台 group=3，R1 首访校准剩 1（屏幕 9/10，target=2）
+        # → R1 看 1 支出窗，R4 立即补位；R2/R3/R4 各看 2 支
+        calls = {"n": 0}
+
+        def fake_ratio():
+            calls["n"] += 1
+            return (9, 10) if calls["n"] == 1 else None   # 第 1 次读屏=R1 首访
+        self.f._read_ad_ratio = mock.Mock(side_effect=fake_ratio)
+        self.f.run_all(["R1", "R2", "R3", "R4"], False, False, 2,
+                       rotate=True, group=3)
+        # R1×1 + R2×2 + R3×2 + R4×2 = 7 支
+        self.assertEqual(self.f._watch_ad_once.call_count, 7)
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        # 圈1：R1(看1支出窗,R4补位排尾)→R2→R3；圈2：R2→R3→R4(各看满出窗)；
+        # 圈2 末窗口剩 R4(还差1支) → 下圈顶部回落连看再进 1 次
+        self.assertEqual(names, ["R1", "R2", "R3", "R2", "R3", "R4", "R4"])
+
+    def test_refill_preserves_queue_order_multiple_outs(self):
+        # 5 台 group=3，R1/R2 依次提前满（各校准剩 1）→ R4 补 R1 位、
+        # R5 补 R2 位；R3/R4/R5 各看 2 支
+        seq = iter([(9, 10), (9, 10)])
+
+        def fake_ratio():
+            try:
+                return next(seq)
+            except StopIteration:
+                return None
+        self.f._read_ad_ratio = mock.Mock(side_effect=fake_ratio)
+        self.f.run_all(["R1", "R2", "R3", "R4", "R5"], False, False, 2,
+                       rotate=True, group=3)
+        # R1×1 + R2×1 + R3×2 + R4×2 + R5×2 = 8 支
+        self.assertEqual(self.f._watch_ad_once.call_count, 8)
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        # 圈1：R1(出窗,R4补)→R2(出窗,R5补)→R3；圈2：R3→R4→R5 各第1支；
+        # 圈3：R4→R5 各第2支（看满出窗，窗口耗尽）
+        self.assertEqual(names, ["R1", "R2", "R3", "R3", "R4", "R5",
+                                 "R4", "R5"])
+
+    def test_window_drains_to_empty_when_queue_exhausted(self):
+        # 4 台 group=3 target=1：R1/R2/R3 各看 1 支满出窗，R4 补位后窗口
+        # 仅剩 1 台且队列空 → 回落连看（进 1 次、看 1 支、退 1 次）
+        self.f.run_all(["R1", "R2", "R3", "R4"], False, False, 1,
+                       rotate=True, group=3)
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        self.assertEqual(names, ["R1", "R2", "R3", "R4"])
+        self.assertEqual(self.f._watch_ad_once.call_count, 4)
+        self.assertEqual(self.f._exit_taskcenter.call_count, 4)
+
+    def test_refill_after_strike_out_keeps_window_full(self):
+        # 4 台 group=3 target=1，R1 进台三连败弃权出窗 → R4 补位，
+        # R2/R3/R4 各看 1 支。弃权台不再进台，窗口保持轮换到耗尽。
+        self.f._enter_taskcenter = mock.Mock(
+            side_effect=lambda name: name != "R1")
+        self.f.run_all(["R1", "R2", "R3", "R4"], False, False, 1,
+                       rotate=True, group=3)
+        names = [c.args[0] for c in self.f._enter_taskcenter.call_args_list]
+        # R1 单次 _rotate_watch_once 内 3 次进台尝试全败 → 弃权出窗补 R4；
+        # 圈1 剩余 R2,R3 各看 1 支；圈2 R4 看 1 支
+        self.assertEqual(names, ["R1", "R1", "R1", "R2", "R3", "R4"])
+        self.assertEqual(self.f._watch_ad_once.call_count, 3)
+
+
 class TestThreeBotAdOnlyMapping(ThreeBotRotationBase):
     """--ad-only：不逐台空进出（run_robot 不调用），直接进入 3 台看广告轮询。"""
 
@@ -283,6 +358,145 @@ class TestThreeBotAdOnlyMapping(ThreeBotRotationBase):
         self.f.run_all(ROBOTS_3, False, False, 1)
         self.f.run_robot.assert_not_called()
         self.assert_entered_per_bot()      # 3 台仍各自进入任务中心看广告
+
+
+class TestEntryQuotaCache(ThreeBotRotationBase):
+    """方案 A（2026-09-28）：进台配额缓存复用 —— 免二次读屏。
+
+    背景：用户观察「进任务中心后一直下滑刷新」= _read_ad_ratio 的 _find_row
+    为找「看广告」行反复 swipe。改为 _enter_taskcenter 成功时读一次并缓存
+    （self._tc_entry_ratio），轮换/连看的 base 校准优先复用，免二次滚动。
+
+    覆盖三条边界：
+      ① 缓存命中 → 消费端不再调用 _read_ad_ratio（免二次读屏）；
+      ② 缓存为 None（覆盖层/版式差异）→ 回退原地读屏（旧行为不变）；
+      ③ 缓存值正确参与 base 校准（X - done），配额收尾等效。
+    """
+
+    def test_cache_hit_skips_second_screen_read(self):
+        # 进台成功时缓存已就位（模拟 _enter_taskcenter 已读 (3,10)）
+        self.f._tc_entry_ratio = (3, 10)
+        self.f._read_ad_ratio = mock.Mock(return_value=(3, 10))
+        self.f.run_all(["R1"], False, False, 1, rotate=True, group=3)
+        # 消费端复用缓存 → 不再原地读屏
+        self.f._read_ad_ratio.assert_not_called()
+        # base = 3 - 0 = 3 → left = min(1-0, 10-3-0) = 1 → 正常看 1 支
+        self.assertEqual(self.f._watch_ad_once.call_count, 1)
+        self.f._read_ad_ratio.assert_not_called()
+
+    def test_cache_miss_falls_back_to_screen_read(self):
+        # 缓存 None（未读到/未进台）→ 回退原地读屏（旧行为）
+        self.f._tc_entry_ratio = None
+        self.f._read_ad_ratio = mock.Mock(return_value=None)
+        self.f.run_all(["R1"], False, False, 1, rotate=True, group=3)
+        self.f._read_ad_ratio.assert_called()      # 回退路径确实读屏
+        self.assertEqual(self.f._watch_ad_once.call_count, 1)
+
+    def test_cache_value_drives_base_calibration(self):
+        # 屏幕已看 5/10 + 进程内已看 0 → base=5 → left=min(1,10-5)=1 → 看 1 支
+        self.f._tc_entry_ratio = (5, 10)
+        self.f._read_ad_ratio = mock.Mock(return_value=(5, 10))
+        self.f.run_all(["R1"], False, False, 1, rotate=True, group=3)
+        self.f._read_ad_ratio.assert_not_called()
+        self.assertEqual(self.f._watch_ad_once.call_count, 1)
+
+    def test_cache_screen_already_full_skips_watch(self):
+        # 屏幕已满 10/10（跨进程已看完）→ base=10 → left=min(1,10-10)=0
+        # → 直接移出轮换，不看广告
+        self.f._tc_entry_ratio = (10, 10)
+        self.f._read_ad_ratio = mock.Mock(return_value=(10, 10))
+        self.f.run_all(["R1"], False, False, 1, rotate=True, group=3)
+        self.f._read_ad_ratio.assert_not_called()
+        self.assertEqual(self.f._watch_ad_once.call_count, 0)
+
+    def test_enter_taskcenter_resets_and_populates_cache(self):
+        # 真实 _enter_taskcenter 路径：进台前清空缓存、成功返回前写入
+        import test_nav_optimize as tno
+        ui = mock.Mock()
+        ui.nodes.return_value = []
+        ui.find.return_value = None
+        ui.find_contains.return_value = None
+        f = tno.make_flow(ui)
+        f._nav_robot_list = mock.Mock()
+        f._find_robot = mock.Mock(return_value=tno.nd("某机器人", 300))
+        f._tap_node = mock.Mock()
+        f._tap = mock.Mock()
+        f._diag_shot = mock.Mock()
+        f._reconfirm_click_target = mock.Mock(side_effect=lambda n, r: r)
+        f._read_ad_ratio = mock.Mock(return_value=(4, 10))
+        # 新功能弹窗探测走 OCR 分支时避免真实调用（ui 为 Mock）→ 直接 None
+        f._ocr_find = mock.Mock(return_value=None)
+        ui.wait_for.side_effect = [tno.nd("发消息", 900), tno.nd("个人", 700)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_entry_ratio, (4, 10))   # 成功进台写入缓存
+        f._read_ad_ratio.assert_called_once()
+
+
+class TestReanchorKeng25(ThreeBotRotationBase):
+    """坑 25（2026-09-30 用户实锤）：轮换「屏幕真值重锚」。
+
+    背景：旧实现只在首访校准一次 base，其后每次进台读到的屏幕值仅打日志、
+    不参与记账 → done 纯算术累加永不复核。只要某支「节目播放但未到账」
+    （广告自动回任务中心 / tap 未真开广告 / 服务端未记账），done 就永久
+    虚高、该台少看 1 支（实测王 7 台各虚报 1 支，汇总报 100 实为 ~93）。
+
+    覆盖：① 屏幕落后于进程口径 → done 向下纠正；② 屏幕与口径一致 → 不动；
+    ③ 屏幕高于口径（手动补看）→ 向上吸收并重置未到账计数；④ 分母异常
+    （实测偶发读成 /1000）→ 不认账；⑤ 屏幕长期不前进 → 到达 max_fail
+    上限弃权出窗（防轮换窗口死循环）。
+    """
+
+    def _st(self, done=1, base=2, reanchor=0):
+        return {"R1": {"done": done, "fail": 0, "base": base,
+                       "reanchor": reanchor}}
+
+    def setUp(self):
+        super().setUp()
+        self.f._capture_energy_start = mock.Mock()
+
+    def test_screen_lag_corrects_done_downward(self):
+        st = self._st(done=1, base=2)          # 进程口径 2+1=3
+        self.f._tc_entry_ratio = (2, 10)       # 屏幕未前进（上一支未到账）
+        n = self.f._rotate_watch_once("R1", st, 2, 10, 3)
+        # done 1→0（重锚），随后补看 1 支 → done 回到 1；本次新看 1
+        self.assertEqual(st["R1"]["done"], 1)
+        self.assertEqual(st["R1"]["reanchor"], 1)
+        self.assertEqual(n, 1)
+
+    def test_screen_matches_code_is_noop(self):
+        st = self._st(done=1, base=2)
+        self.f._tc_entry_ratio = (3, 10)       # 屏幕 3 == base2+done1
+        self.f._rotate_watch_once("R1", st, 2, 10, 3)
+        self.assertEqual(st["R1"]["reanchor"], 0)
+        self.assertEqual(st["R1"]["done"], 2)
+
+    def test_manual_topup_absorbed_upward(self):
+        st = self._st(done=1, base=2, reanchor=2)   # 进程口径 3
+        self.f._tc_entry_ratio = (4, 10)            # 屏幕 4（人手动补了 1）
+        n = self.f._rotate_watch_once("R1", st, 2, 10, 3)
+        self.assertEqual(st["R1"]["done"], 2)       # 向上吸收到 2 → 达 target
+        self.assertEqual(st["R1"]["reanchor"], 0)   # 视为正常前进，清零
+        self.assertEqual(n, 0)                      # 已满，不再看
+
+    def test_abnormal_denominator_skips_reanchor(self):
+        st = self._st(done=1, base=2)
+        self.f._tc_entry_ratio = (1, 1000)     # 分母异常（实测读到别的行）
+        n = self.f._rotate_watch_once("R1", st, 2, 10, 3)
+        self.assertEqual(st["R1"]["reanchor"], 0)   # 不认账
+        self.assertEqual(st["R1"]["done"], 2)       # 照常再补看 1 支
+        self.assertEqual(n, 1)
+
+    def test_persistent_no_progress_gives_up_after_max_fail(self):
+        st = self._st(done=1, base=2)
+        self.f._tc_entry_ratio = (2, 10)       # 屏幕永远不前进
+        n = 1
+        for _ in range(3):
+            n = self.f._rotate_watch_once("R1", st, 2, 10, 3)
+        self.assertEqual(st["R1"]["reanchor"], 3)
+        self.assertEqual(st["R1"]["fail"], 3)       # 触发既有弃权出窗路径
+        self.assertEqual(n, 0)                      # 第 3 次：达上限 → 不再看
 
 
 if __name__ == "__main__":

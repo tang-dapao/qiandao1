@@ -88,7 +88,7 @@ def _parse_xml(xml: str, include_desc: bool) -> List[Node]:
         if not m:
             continue
         x1, y1, x2, y2 = map(int, m.groups())
-        if x2 <= x1 and y2 <= y1:
+        if x2 <= x1 or y2 <= y1:
             continue
         sel = attrs.get("selected") == "true"
         t = (attrs.get("text") or "").strip()
@@ -329,7 +329,8 @@ class AdbUI:
         swipe_down 已改、swipe_up 漏改（同批编辑丢失，2026-09-12 发现），此处补齐。
         """
         self._run("shell", "input", "swipe",
-                  str(SWIPE_X), "1500", str(SWIPE_X), "700", "400")
+                  str(SWIPE_X), "1500", str(SWIPE_X), "700",
+                  str(int(steps * 1000)))
         self._invalidate_cache()
         self._notify_action()
         time.sleep(pause)
@@ -347,6 +348,19 @@ class AdbUI:
 
     def back(self, pause: float = 1.2):
         self._run("shell", "input", "keyevent", "4")
+        self._invalidate_cache()
+        self._notify_action()
+        time.sleep(pause)
+
+    def input_text(self, text: str, pause: float = 0.8):
+        """向当前焦点输入框注入文本（adb input text）。
+
+        2026-09-25 反馈表单改版配套：QQ 反馈页内容输入框为 WebView 自绘
+        （不在 dump），聚焦后用 input text 注入。仅支持 ASCII 安全字符
+        （空格按 adb 惯例转义为 %s）；中文需输入法广播不可靠，不支持。
+        """
+        safe = text.replace(" ", "%s")
+        self._run("shell", "input", "text", safe)
         self._invalidate_cache()
         self._notify_action()
         time.sleep(pause)

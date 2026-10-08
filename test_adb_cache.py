@@ -183,6 +183,42 @@ class TestIncludeDescSeparation(AdbCacheBase):
                          ["每日签到"])
 
 
+class TestParseXmlFilter(unittest.TestCase):
+    """P1-3 修复：_parse_xml 应过滤零宽或零高节点。"""
+
+    def test_zero_width_node_is_filtered(self):
+        xml = ('<node text="x" bounds="[100,200][100,260]"/>')
+        self.assertEqual(_texts(adb_ui_mod._parse_xml(xml, False)), [])
+
+    def test_zero_height_node_is_filtered(self):
+        xml = ('<node text="x" bounds="[100,200][160,200]"/>')
+        self.assertEqual(_texts(adb_ui_mod._parse_xml(xml, False)), [])
+
+    def test_zero_area_node_is_filtered(self):
+        xml = ('<node text="x" bounds="[100,200][100,200]"/>')
+        self.assertEqual(_texts(adb_ui_mod._parse_xml(xml, False)), [])
+
+    def test_normal_node_is_kept(self):
+        xml = ('<node text="每日签到" bounds="[0,100][200,140]"/>')
+        self.assertEqual(_texts(adb_ui_mod._parse_xml(xml, False)),
+                         ["每日签到"])
+
+
+class TestSwipeUpDuration(AdbCacheBase):
+    """P1-4 修复：swipe_up 的 steps 参数应作为 swipe 持续时间。"""
+
+    def test_default_duration_is_400ms(self):
+        self.ui.swipe_up(pause=0.1)
+        self.ui._run.assert_called_once()
+        args = self.ui._run.call_args[0]
+        self.assertEqual(args[-1], "400")
+
+    def test_custom_steps_converted_to_ms(self):
+        self.ui.swipe_up(steps=0.8, pause=0.1)
+        args = self.ui._run.call_args[0]
+        self.assertEqual(args[-1], "800")
+
+
 class TestFlowPatterns(AdbCacheBase):
     def test_back_to_back_find_shares_one_dump(self):
         # 模拟 _back_at_taskcenter / _scroll_to_top 的 `find(A) or find(B)`

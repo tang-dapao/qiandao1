@@ -1080,6 +1080,52 @@ EDF 轮换 + C1/C4 分布抖动 + C5/C6/C7 + E1 量化验收。第 2 批已落�
   李宥恩 3 / 黎小姐 4 / 裴旖 4 / 藤非 9 / 小麦 9 / 席恩 9 / 游迦 9 = **47 支待补**（用户指令：
   唐六爻跑完 + 修复后**优先补觅夏**）。
 
+### 坑 26：进台「六步全绿但页面是聊天页」静默失败 + F9 让位后落点未复核（P1，2026-10-08 修复 ✅）
+- **现象**：`_enter_taskcenter` 六步（点行 → 发消息 → 个人 → …）**全部打点成功并返回 True**，
+  但屏幕实际停在**机器人聊天页 / 个人资料卡**上 → 后续 签到/反馈/广告 **全失败**
+  （整台白跑 ≈4min）。10-04 古禹 02:12 实测：`[计时] 进台合计 12.9s` 之后立刻
+  `未找到 每日签到 行；屏内文本=02:12 | 古禹 | 在线 | 相册 | 听听 | 个人 | 发送 | … | 聊天设置`。
+- **根因（dump 穿透）**：聊天页 / 资料卡对 uiautomator dump **穿透透明** —— dump 读到的是
+  **背景页**文本，所以 `_looks_like_robot_list()` / `_find("每日签到")` 这类 dump 判据在这种
+  页面上**必被欺骗**（同族：坑 22 / 坑 24）。**只有 OCR 免疫。**
+- **量化（先量后改，91 vs 8419）**：`版式差异，继续流程` 兜底分支全量出现 **91 次**
+  （占进台 **1.1%**），其中**真错页仅 6 次**（09-10 / 09-12 / 09-22 / 09-23 /
+  10-02 李宥恩 / 10-04 古禹），其余 **85 次是 H5 慢加载**且最终签到成功。
+  → **关键结论：不能改成「必须命中任务中心特征」** —— 那会误伤 85 次、比不改更差。
+- **修复（两处，默认开，可一键回退）**：
+  1. **落点断言**（`workflow.enter_landing_assert`）：**仅在「段5 探测不到任务行」的兜底分支上**
+     做一次 OCR 判别：`_fullscreen_scan()` 读到任务中心特征（`tc_ocr`）→ H5 慢加载 → 放行
+     （与旧行为一致）；否则再 `_ocr_find(*_LANDING_WRONG_KEYS)`（`发送`/`语音通话`/`QQ空间`/
+     `资料卡`/`相册`/`听听`）命中 → **判进入失败** + `_diag_shot("enter_landing")` +
+     `return False`（交上层复位重试）；两者都没命中 → 维持旧「版式差异放行」。
+     成本只落在这 1.1% 的异常分支（**成功路径零开销**）。
+  2. **F9 / 坑 15 让位后落点复核**（`workflow.enter_landing_recheck` → `_verify_relocated_row`）：
+     `swipe_up` 让位会改变列表版式，而坑 15 的「贴吸顶分类栏」检查是在让位**之前**跑的
+     → 让位后用**新 dump** 复核三件事：① 同名机器人行仍在（防穿透残影）；② 仍在安全点击区
+     （cy / y2 ≤ TAP_Y_MAX）；③ 未贴吸顶栏（行.y1 − 栏.y2 ≥ ROW_PITCH）。任一不过 → 放弃点击
+     交复位（现场帧 `enter_relocate_gone` / `_oob` / `_pinned`）。仅「确实让位过」时付一次 dump。
+- 回归：`test_nav_optimize.TestEnterLandingAssert`（5 例）+ `TestVerifyRelocatedRow`（4 例）
+  + `TestReconfirmClickTarget` 新增 2 例；全量 **430** 用例（环境依赖 ERROR 1 个不变）。
+
+### 坑 27：进台「TC 探测 + 配额读屏」合并（P3，2026-10-08）
+- **背景**：进台 段5（`_find("每日签到") or _find("任务中心")` 轮询等 H5 渲染）与 段6
+  （`_read_ad_ratio()`，`max_scroll=6`）是两段独立读屏。实测 段6 **恒定 ~1.55s**（= 2 次 dump），
+  且其 `swipe` 会把**刚进的任务中心页面滚走**。
+- **实测前提（先量后改）**：10-06~10-08 三天 `进台配额缓存` 读到率 **99.5%**（374/375）——
+  说明广告行本就稳定可读；而 段5 中位 **~1.95s 是 H5 真实渲染等待**
+  （进台 5.6s ≈ 段3 1.0 + 段4 0.9 + 段5 1.95 + 段6 1.55）。
+  → **否决了「进台一开始单发一次免滚探针」的初版设计**：渲染前必然打空，只会白加一次 dump。
+- **最终实现**：段5 轮询改**单快照**判定 —— 每轮只取一次 `ui.nodes()`，既判「任务行是否已渲染」，
+  命中时顺手用 `_ad_ratio_from_snapshot(cur)` 从**同一份快照**解析广告行 X/Y 当配额基数
+  （纯 CPU，**零额外 dump/swipe**）；配套 `_row_completion(label_node, nodes=None)` 新增
+  「可传入调用方快照」形参（默认 None = 自己取，行为不变）。
+  快照里没有广告行 / 分母异常（≠ `ad_times_per_robot`）→ `_tc_entry_ratio` 保持 None
+  → **段6 原链路兜底**（绝不新增 dump = **零回归**）。
+- **收益**：绝大多数进台省掉 段6 的 ~1.55s（进台 5.6s → ~4.05s，**−28%**）。
+- **回退**：`workflow.tc_ready_by_quota: false` → 段5 回 `_find` 轮询 + 段6 独立读屏。
+- 回归：`test_nav_optimize.TestQuotaProbe` 4 例；`test_seg6_stage_logged_after_quota_read` /
+  `test_newfeat_popup_dismissed_on_enter` 钉 `tc_ready_by_quota=false` 以隔离新变量。
+
 ## 五、常用命令速查
 - 截图+OCR+dump：`py -3.13 scripts_test\snap.py <tag>`（输出 logs\snap_<tag>.txt + screenshots\<tag>.png）
 - 解析 Node：`py -3.13 scripts_test\shownodes.py logs\snap_<tag>.txt`

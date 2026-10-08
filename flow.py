@@ -293,9 +293,15 @@ class Flow:
     # （电量等）拼进分母（实测偶发把 "…2/10" 读成 (2,1000)）。
     _ROW_RATIO_RE = re.compile(r"^\s*(\d{1,2})\s*/\s*(\d{1,2})\s*$")
 
-    def _row_completion(self, label_node: Node) -> Optional[Tuple[int, int]]:
+    def _row_completion(self, label_node: Node,
+                        nodes: Optional[List[Node]] = None
+                        ) -> Optional[Tuple[int, int]]:
         """读 label 行内的 X/Y 计数（仅同 y 范围 ±30px 的节点，避免误命中其他行）。
         返回 (X, Y) 或 None。
+
+        nodes（P3，2026-10-08）：可传入**调用方已取好的 dump 快照**，避免本方法
+        内部再触发一次 `ui.nodes()`（MuMu 单次 dump 2.4-3.8s > 0.8s TTL →
+        必然重新 dump）。None = 自己取，行为与旧版完全一致。
 
         2026-09-10 修复「满额不直退」根因：X/Y 计数在 dump 里可能被拆成多个
         节点（代柯 10/10 实测为 '10' '/' '10' 三个独立节点，签到 1/1 同理）。
@@ -304,7 +310,8 @@ class Flow:
         序拼接后 search——'看广告'+'10'+'/'+'10'+'已完成' 拼为
         「看广告10/10已完成」即可提取 (10,10)。"""
         cur_y = (label_node.y1 + label_node.y2) // 2
-        band = [nd_ for nd_ in self.ui.nodes()
+        src = list(nodes) if nodes is not None else self.ui.nodes()
+        band = [nd_ for nd_ in src
                 if abs(((nd_.y1 + nd_.y2) // 2) - cur_y) <= 30]
         # 第 1 遍：单节点整词（旧行为，MuMu 有时把计数合并为一个节点）
         for nd_ in band:
@@ -929,6 +936,7 @@ class Flow:
         # F9（2026-09-29 修复）：行底部越界（中心 y 或 y2 > TAP_Y_MAX=1740）时
         # 直接点会盲钳到上一行（藤非 y=1791 → 1740 命中桑祁，9/10 三连败实锤）。
         # 改为上滑让位：把行滚入安全点击区后重找，最多 2 次。
+        letway = False
         for attempt in (1, 2):
             cy = (row.y1 + row.y2) // 2
             if cy <= TAP_Y_MAX and row.y2 <= TAP_Y_MAX:
@@ -938,6 +946,7 @@ class Flow:
                 "上滑让位后重找（F9 修复，2026-09-29）",
                 name, row.x1, row.y1, cy, row.y2, TAP_Y_MAX)
             self.ui.swipe_up(pause=1.0)
+            letway = True
             moved = self._find_robot(name)
             if moved is None:
                 logger.warning("上滑第 %d 次后找不到 %s 行，放弃本次点击交复位重试",
@@ -951,7 +960,60 @@ class Flow:
                 logger.error("%s 行两次上滑仍无法进入安全点击区，放弃点击", name)
                 self._diag_shot("reconfirm_row_oob")
                 return None
+        # P1（2026-10-08）：F9 让位后的**落点复核**。
+        # swipe_up 只保证把行滚进安全区，却可能把行推进「吸顶分类栏下缘的
+        # 回收残影槽位」（坑 15：点该槽位会命中分组头 → 列表被折叠 → 连环
+        # 弃权），而坑 15 的贴边检查是在让位**之前**跑的，让位后无人复核。
+        # 仅「确实让位过」时付出这一次 dump；未让位的成功路径零开销。
+        if letway and self.wf.get("enter_landing_recheck", True):
+            row = self._verify_relocated_row(name, row)
+            if row is None:
+                return None
         return row
+
+    def _verify_relocated_row(self, name: str, row: Node) -> Optional[Node]:
+        """F9/坑 15 让位后的落点复核（P1，2026-10-08）。
+
+        让位（swipe）会改变列表版式：目标行可能被滚入「吸顶分类栏下缘的回收
+        残影槽位」（坑 15 事故：点该槽位坐标命中分组头 → 列表被折叠 → 连环
+        弃权），也可能因 `_find_robot` 的 max_scroll=10 滚动而返回一个已贴边/贴底
+        的节点 —— 让位前的检查已经失效。故此处用**新 dump** 复核：
+          ① 同名机器人行仍存在（防返回穿透残影）；
+          ② 仍在安全点击区内（cy / y2 <= TAP_Y_MAX）；
+          ③ 未贴吸顶分类栏（行.y1 - 栏.y2 >= ROW_PITCH）。
+        通过 → 返回**新鲜坐标**节点；任一不过 → 警告 + 现场截图 + None（交
+        上层复位重试，不冒险点可疑坐标）。
+        """
+        self.ui.refresh()
+        cur = list(self.ui.nodes())
+        fresh = next((x for x in cur if x.text == name and self._is_robot_row(x)),
+                     None)
+        if fresh is None:
+            logger.warning("让位后复核：找不到 %s 行（页面已漂移），放弃本次点击"
+                           "交复位重试；屏文=%s", name, self._screen_texts(12))
+            self._diag_shot("enter_relocate_gone")
+            return None
+        cy = (fresh.y1 + fresh.y2) // 2
+        if cy > TAP_Y_MAX or fresh.y2 > TAP_Y_MAX:
+            logger.warning("让位后复核：%s 行 @(%d,%d) 仍超出安全点击区"
+                           "（cy=%d y2=%d > %d），放弃点击交复位重试",
+                           name, fresh.x1, fresh.y1, cy, fresh.y2, TAP_Y_MAX)
+            self._diag_shot("enter_relocate_oob")
+            return None
+        bar = self._cat_bar_node(cur)
+        if (bar is not None and bar.y1 >= CAT_BAR_PINNED_Y
+                and fresh.y1 - bar.y2 < ROW_PITCH):
+            logger.warning("让位后复核：%s 行 @(%d,%d) 被滚入吸顶分类栏下缘残影"
+                           "槽位（栏底 y=%d，坑 15）——放弃点击交复位重试",
+                           name, fresh.x1, fresh.y1, bar.y2)
+            self._diag_shot("enter_relocate_pinned")
+            return None
+        if ((fresh.x1, fresh.y1, fresh.x2, fresh.y2)
+                != (row.x1, row.y1, row.x2, row.y2)):
+            logger.info("让位后复核：%s 行坐标刷新 (%d,%d)-(%d,%d) -> "
+                        "(%d,%d)-(%d,%d)", name, row.x1, row.y1, row.x2,
+                        row.y2, fresh.x1, fresh.y1, fresh.x2, fresh.y2)
+        return fresh
 
     def _screen_robot_names(self) -> List[str]:
         """当前屏所有符合昵称识别规则的文本（不去重、不落日志）。
@@ -1183,11 +1245,37 @@ class Flow:
         # 未在窗口内出现也不阻塞（不同机器人版式有差异），后续任务操作自带
         # 等待器会兜住；这里最多探测 taskcenter_wait 秒。
         found_tc = False
-        for _ in range(max(1, int(self.t.get("taskcenter_wait", 3.5) * 2))):
-            if self._find("每日签到") or self._find("任务中心"):
-                found_tc = True
-                break
-            time.sleep(0.5)
+        # P3（2026-10-08）TC 探测 + 配额读屏合并：段5 就绪轮询改为**单快照**
+        # 判定 —— 每轮只取一次 `ui.nodes()`，既判定任务行是否已渲染，又在命中
+        # 时**顺手**从同一份快照解析广告行 X/Y 当配额基数（纯 CPU，零额外
+        # dump/swipe）→ 原本独立的 段6 配额读屏（实测恒定 1.55s）在绝大多数
+        # 进台上被整体省掉。
+        # 为什么不在进台一开始就单发一次「免滚探针」：实测 段5 中位 ~1.95s 是
+        # H5 **真实渲染等待**（进台 5.6s 里段3 1.0 + 段4 0.9 + 段5 1.95 +
+        # 段6 1.55），探针在页面渲染前必然打空 → 只会白加一次 dump。
+        # 快照里没有广告行时 `_tc_entry_ratio` 保持 None → 段6 原链路兜底，
+        # **绝不新增任何 dump**（零回归）。
+        # false = 一键回退旧行为（段5 走 _find 轮询 + 段6 独立读屏）。
+        merge = bool(self.wf.get("tc_ready_by_quota", True))
+        if not found_tc:
+            for _ in range(max(1, int(self.t.get("taskcenter_wait", 3.5) * 2))):
+                if merge:
+                    cur = self.ui.nodes()
+                    if (any(x.text in ("每日签到", "任务中心") for x in cur)
+                            or any(x.text in AD_ROW_LABELS for x in cur)):
+                        found_tc = True
+                        self._tc_entry_ratio = self._ad_ratio_from_snapshot(cur)
+                        if self._tc_entry_ratio is not None:
+                            logger.info(
+                                "进台快照命中 %s（屏幕 %d/%d）→ 已含配额，"
+                                "免去 段6 读屏", name,
+                                self._tc_entry_ratio[0],
+                                self._tc_entry_ratio[1])
+                        break
+                elif self._find("每日签到") or self._find("任务中心"):
+                    found_tc = True
+                    break
+                time.sleep(0.5)
         if not found_tc:
             # A（2026-09-10）：dump 窗口内未见任务中心特征时，OCR 一次区分
             # 「H5 版式加载慢（真任务中心）」与「误入错页（心动卡 H5 会员页）」。
@@ -1232,8 +1320,39 @@ class Flow:
                         found_tc = True
                         logger.info("关闭新功能弹窗后已探测到任务行 → 按正常任务中心继续")
                 if not found_tc:
-                    logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
-                                self.t.get("taskcenter_wait", 3.5))
+                    # P1（2026-10-08）**落点断言**：段5 探不到任务行时，区分
+                    # 「H5 慢加载（真任务中心 → 放行）」与「落错页（聊天页 /
+                    # 资料卡 → 判进入失败）」。实测依据：兜底分支 91 次里只有
+                    # 6 次是真错页（10-02 李宥恩 / 10-04 古禹 …），其余 85 次
+                    # 是慢加载且最终签到成功 —— 所以**绝不能**改成「必须命中
+                    # 任务中心特征」（会误伤那 85 次，反而更差），只能在**命中
+                    # 错页实锤**时收手。
+                    # 判据只能用 OCR：错页（聊天页/资料卡）对 uiautomator dump
+                    # 是**穿透透明**的，dump 读到的是背景页文本 —— 这正是
+                    # 10-04 古禹「六步全绿但页面是聊天页」静默失败的根因
+                    # （整台机器人白跑一轮签到+反馈+广告 ≈ 4min）。
+                    # false = 回退旧行为（一律放行）。
+                    if self.wf.get("enter_landing_assert", True):
+                        tc_ocr, _pill, overlay_ocr = self._fullscreen_scan()
+                        if tc_ocr:
+                            found_tc = True
+                            logger.info("落点断言：OCR 读到任务中心特征"
+                                        "（H5 慢加载）→ 按正常任务中心继续")
+                        elif (overlay_ocr
+                              or self._ocr_find(*self._LANDING_WRONG_KEYS,
+                                                retries=1) is not None):
+                            logger.warning(
+                                "落点断言失败：任务中心特征缺失且 OCR 命中错页"
+                                "特征（资料卡/聊天页）→ 判定进入失败，交上层"
+                                "复位重试")
+                            self._diag_shot("enter_landing")
+                            return False
+                        else:
+                            logger.info("落点断言：无错页实锤（疑 H5 慢加载）"
+                                        "→ 维持版式差异放行")
+                    if not found_tc:
+                        logger.info("等待 %.1fs 未见任务中心特征（版式差异，继续流程）",
+                                    self.t.get("taskcenter_wait", 3.5))
         t0 = self._stage(t0, "进台.5TC加载探测")
         # 已进入某机器人的任务中心：清快路径状态（下次 nav 需重新导航）
         self._at_robot_list = False
@@ -1245,7 +1364,10 @@ class Flow:
         # None —— 消费端会回退到原地读屏，零行为变化。
         # 注：这里用只读的 _read_ad_ratio（内部 _find_row 只 dump 不 tap/back），
         # 不改变点击效率，也不引入额外界面动作。
-        self._tc_entry_ratio = self._read_ad_ratio()
+        # P3：段5 快照已含配额时不再重复读屏（省 ~1.55s 的 max_scroll=6 滚动
+        # 查找，且避免把刚进的任务中心页面滚走）；未取到才走原链路。
+        if self._tc_entry_ratio is None:
+            self._tc_entry_ratio = self._read_ad_ratio()
         if self._tc_entry_ratio:
             logger.info("进台配额缓存 %s（屏幕 %d/%d）", name,
                         self._tc_entry_ratio[0], self._tc_entry_ratio[1])
@@ -1770,6 +1892,13 @@ class Flow:
         行未读到（含页面未就绪 / 被问卷 H5 覆盖）返回 None —— 调用方自行决定
         保守策略。供 run_all 进台时读取基数：后续配额收尾用「基数 + 本会话已看」
         算术预判，不必每次看完都读屏（省审计 C2 的 dump 超时空等）。
+
+        注（P3，2026-10-08）：进台路径已改由 段5 的**单快照**判定顺手取配额
+        （`_ad_ratio_from_snapshot`，零额外 dump）；本方法只作兜底与其它调用点
+        （`_ad_quota_done` / `_verify_session_quota` / 轮换 base）使用。
+        实测（10-06~10-08）本方法读屏成功率 **99.5%**（374/375 进台），但耗时
+        恒定 ~1.55s（2 次 dump），且 max_scroll=6 的 swipe 会把刚进的任务中心
+        页面**滚走** —— 故能免则免。
         """
         row = self._find_row(AD_ROW_LABELS[0], alt_labels=AD_ROW_LABELS[1:])
         if not row:
@@ -1783,6 +1912,30 @@ class Flow:
         quota = int(self.wf.get("ad_times_per_robot", 10))
         if ratio[1] != quota:
             logger.warning("_read_ad_ratio 分母异常（%d/%d，期望 /%d）→ 视为读不到",
+                           ratio[0], ratio[1], quota)
+            return None
+        return ratio
+
+    def _ad_ratio_from_snapshot(self, cur) -> Optional[Tuple[int, int]]:
+        """在**已取好的 dump 快照**里解析广告行 X/Y（绝不触发 dump / swipe）。
+
+        P3（2026-10-08）：供 `_enter_taskcenter` 段5 的就绪轮询使用 —— 每轮只用
+        一次 `ui.nodes()` 快照，既判定「任务行是否已渲染」，又在命中时顺手把
+        配额基数读出来，从而省掉原先独立的 段6 配额读屏（实测恒定 1.55s）。
+
+        判据与 `_read_ad_ratio` 完全同口径：行标题命中 AD_ROW_LABELS 任一 +
+        分母必须等于 `ad_times_per_robot`（防邻近数字串扰）。不满足返回 None →
+        调用方回落 段6 原链路（零回归：绝不新增任何 dump）。
+        """
+        lab = next((x for x in cur if x.text in AD_ROW_LABELS), None)
+        if lab is None:
+            return None
+        ratio = self._row_completion(lab, nodes=cur)
+        if not ratio:
+            return None
+        quota = int(self.wf.get("ad_times_per_robot", 10))
+        if ratio[1] != quota:
+            logger.warning("配额快照分母异常（%d/%d，期望 /%d）→ 视为读不到",
                            ratio[0], ratio[1], quota)
             return None
         return ratio
@@ -1852,6 +2005,18 @@ class Flow:
     # 穿透读到背景列表文本，导航/安全返回判定全被欺骗（实测卡死 ~1h）。
     # 「语音通话」「QQ空间」仅出现在资料卡上，列表/任务中心/问卷均无。
     _PROFILE_KEYS = ("语音通话", "QQ空间", "她的QQ空间", "他的QQ空间")
+    # 进台落点断言的「错页」特征词（P1，2026-10-08）：
+    # 任务中心 H5 **绝不含**这些词，而机器人聊天页 / 个人资料卡必含 ——
+    # 用于「进台段5 探测不到任务行」时判别是否落错页（交上层复位重试），
+    # 而不是继续白跑一轮签到/反馈/广告（10-04 古禹静默失败：六步全绿但页面
+    # 是聊天页 → 签到/反馈/广告全失败，整台机器人白跑 ~4min）。
+    #   发送             聊天页底部发送按钮（大按钮，OCR 必读）
+    #   语音通话/QQ空间   资料卡独有（与 _PROFILE_KEYS 同源）
+    #   资料卡/相册/听听  资料卡残影 / 聊天页「个人」面板
+    # ⚠️ 判据只能用 OCR：这些页面对 uiautomator dump 是**穿透透明**的（dump
+    #   读到的是背景页文本），dump 判据必被欺骗 —— 这是该静默失败的根因。
+    _LANDING_WRONG_KEYS = ("发送", "语音通话", "QQ空间", "资料卡",
+                           "相册", "听听")
     # AI 好友 banner H5：方案 A 实施后被观测到的"OCR 漏读任务中心特征词 →
     # 误 tap (160,152) 命中任务中心顶部 banner"事故（2026-09-10 11:43 实锤）。
     # banner H5 全屏显示「QQ AI好友·常见问题答疑」。**不能**仅凭"常见问题答疑"

@@ -511,6 +511,9 @@ class TestEnterTaskcenter(unittest.TestCase):
         # F12 集成：点「个人」后新功能弹窗在屏 → 自动关闭 → 任务行探测通过
         ui, f = self._f()
         f._at_robot_list = True
+        # P3（2026-10-08）：本用例驱动的是弹窗关闭 + 段5 的 _find 轮询序列，
+        # 故关掉「单快照合并」以隔离新变量（合并行为单测见 TestQuotaProbe）。
+        f.wf["tc_ready_by_quota"] = False
         ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
         # find 消费顺序：弹窗关闭按钮 → 确认消失(None) → 探测循环 每日签到
         ui.find.side_effect = [nd("关闭", 774, x1=897), None,
@@ -603,15 +606,17 @@ class TestEnterTaskcenter(unittest.TestCase):
         # A：OCR 未命中错页标记（真任务中心 H5 加载慢）→ 维持原"版式差异，
         # 继续流程"放行，返回 True —— 看广告路径行为不变
         ui, f = self._enter_timeout()
+        f._fullscreen_scan = mock.Mock(return_value=(False, False, False))
         f._ocr_find.return_value = None
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
         f._diag_shot.assert_not_called()
         self.assertEqual(f._at_robot_list, False)     # 进入后清快路径状态
-        # 守卫 OCR 只检索错页标记词
-        args = f._ocr_find.call_args.args
-        self.assertIn("心动卡", args)
+        # 第一次 OCR 是心动卡错页守卫（旧行为，不变）；P1 落点断言追加的第二次
+        # OCR 才是错页特征词表复核（见 TestEnterLandingAssert）。
+        self.assertIn("心动卡", f._ocr_find.call_args_list[0].args)
+        self.assertIn("发送", f._ocr_find.call_args_list[1].args)
 
 
 # ----------------------------------------------------------------------
@@ -706,6 +711,209 @@ class TestReconfirmClickTarget(unittest.TestCase):
         out = f._reconfirm_click_target("藤非", self._oob_node(1731))
         self.assertIsNone(out)
         self.assertEqual(ui.swipes, 1)
+        f._diag_shot.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # P1（2026-10-08）：F9/坑 15 **让位后落点复核**（_verify_relocated_row）
+    # 让位（swipe）会改变列表版式 —— 让位前的坑 15 贴边检查已失效，必须用
+    # 新 dump 复核后再点。
+    # ------------------------------------------------------------------
+    def test_relocate_recheck_skipped_when_knob_off(self):
+        """enter_landing_recheck=false → 让位后不做复核（一键回退旧行为）。"""
+        ui = FakeUI([_robot_list_page(("藤非", 1731)),
+                     _robot_list_page(("藤非", 1300))])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f.wf["enter_landing_recheck"] = False
+        f._find_robot = mock.Mock(return_value=self._oob_node(1300))
+        f._verify_relocated_row = mock.Mock()
+        out = f._reconfirm_click_target("藤非", self._oob_node(1731))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 1300)
+        f._verify_relocated_row.assert_not_called()
+
+    def test_relocate_recheck_aborts_when_row_gone(self):
+        """让位后复核发现目标行消失 → 放弃点击（不返回可点节点）。"""
+        ui = FakeUI([_robot_list_page(("藤非", 1731)),
+                     _robot_list_page(("桑祁", 1300))])
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        f._find_robot = mock.Mock(return_value=self._oob_node(1300))
+        out = f._reconfirm_click_target("藤非", self._oob_node(1731))
+        self.assertIsNone(out)
+        f._diag_shot.assert_called_once_with("enter_relocate_gone")
+
+
+class TestVerifyRelocatedRow(unittest.TestCase):
+    """P1（2026-10-08）：_verify_relocated_row 的四种落点判定（真实逻辑直测）。"""
+
+    def _flow(self, ui):
+        f = make_flow(ui)
+        f._diag_shot = mock.Mock()
+        return f
+
+    def test_row_gone_returns_none(self):
+        ui = FakeUI([_robot_list_page(("桑祁", 1300))])
+        f = self._flow(ui)
+        self.assertIsNone(
+            f._verify_relocated_row("藤非", nd("藤非", 1300, x1=183)))
+        f._diag_shot.assert_called_once_with("enter_relocate_gone")
+
+    def test_still_oob_returns_none(self):
+        ui = FakeUI([_robot_list_page(("藤非", 1731))])
+        f = self._flow(ui)
+        self.assertIsNone(
+            f._verify_relocated_row("藤非", nd("藤非", 1731, x1=183)))
+        f._diag_shot.assert_called_once_with("enter_relocate_oob")
+
+    def test_pinned_ghost_slot_returns_none(self):
+        """让位后被滚入吸顶分类栏下缘残影槽位（坑 15）→ 放弃点击。
+        栏节点 机器人@y1=500 → 栏底 y2=580；行 y1=358 → 358-580 < ROW_PITCH。"""
+        ui = FakeUI([_robot_list_page(("藤非", 358))])
+        f = self._flow(ui)
+        self.assertIsNone(
+            f._verify_relocated_row("藤非", nd("藤非", 358, x1=183)))
+        f._diag_shot.assert_called_once_with("enter_relocate_pinned")
+
+    def test_ok_returns_fresh_coordinates(self):
+        ui = FakeUI([_robot_list_page(("藤非", 1300))])
+        f = self._flow(ui)
+        out = f._verify_relocated_row("藤非", nd("藤非", 900, x1=183))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 1300)          # 用新 dump 的新鲜坐标
+        f._diag_shot.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# P3（2026-10-08）：进台配额探针 —— 「TC 探测 + 配额读屏」合并
+# 免滚探针 _read_ad_ratio(scroll=False) 命中即同时证明「任务行已渲染」
+# 并拿到配额基数 → 跳过 段5 特征探测与 段6 配额读屏两段。
+# ----------------------------------------------------------------------
+class TestQuotaProbe(unittest.TestCase):
+    """P3（2026-10-08）：段5 就绪轮询改**单快照** + 顺手取配额 ——
+    「TC 探测 + 配额读屏」合并，省掉独立的 段6 读屏（实测 ~1.55s/台）。
+    设计要点：**不新增任何 dump**（复用段5 已有的那一次 ui.nodes()）；
+    快照里没有广告行时回落 段6 原链路（零回归）。
+    为什么不做「进台开始就单发一次免滚探针」：实测 段5 中位 ~1.95s 是 H5
+    真实渲染等待，探针在渲染前必然打空 → 只会白加一次 dump（实测否决）。
+    """
+
+    def _f(self, nodes=None, wf_extra=None):
+        ui, f = TestEnterTaskcenter._f(self)
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        ui.nodes.return_value = list(nodes or [])
+        if wf_extra:
+            f.wf.update(wf_extra)
+        return ui, f
+
+    @staticmethod
+    def _ad_row(ratio="3/10", y=1315):
+        """带广告行的任务中心首屏快照（行标题 + X/Y 同 y band）。"""
+        return [nd("每日签到", 600), nd("看视频赚电量", y),
+                nd(ratio, y, x1=900)]
+
+    def test_snapshot_hit_reads_ratio_and_skips_seg6(self):
+        ui, f = self._f(nodes=self._ad_row())
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_entry_ratio, (3, 10))
+        f._read_ad_ratio.assert_not_called()      # 段6 被整体省掉
+
+    def test_snapshot_hit_without_ad_row_falls_back_to_seg6(self):
+        ui, f = self._f(nodes=[nd("每日签到", 600)])
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        # 快照只有任务行、没有广告行 → 回落 段6 原链路
+        f._read_ad_ratio.assert_called_once_with()
+
+    def test_snapshot_denominator_guard_falls_back(self):
+        # 分母 != 日配额（邻近数字串扰）→ 视为读不到 → 回落 段6
+        ui, f = self._f(nodes=self._ad_row(ratio="3/12"))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertIsNone(f._tc_entry_ratio)
+        f._read_ad_ratio.assert_called_once_with()
+
+    def test_knob_off_uses_legacy_poll_and_seg6(self):
+        ui, f = self._f(nodes=self._ad_row(),
+                        wf_extra={"tc_ready_by_quota": False})
+        f._find = mock.Mock(side_effect=lambda t, *a, **k:
+                            nd("每日签到", 600) if t == "每日签到" else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        # 旋钮关 = 旧行为：段5 走 _find 轮询、配额留到 段6 读
+        f._read_ad_ratio.assert_called_once_with()
+        self.assertIsNone(f._tc_entry_ratio)
+
+
+# ----------------------------------------------------------------------
+# P1（2026-10-08）：进台**落点断言** —— 段5 探不到任务行时用 OCR 区分
+# 「H5 慢加载（真任务中心 → 放行）」与「落错页（聊天页/资料卡 → 判失败）」。
+# 实测依据：兜底分支 91 次里仅 6 次真错页，其余 85 次慢加载最终成功 ——
+# 故只允许「命中错页实锤」时收手，不得改成「必须命中任务中心特征」。
+# ----------------------------------------------------------------------
+class TestEnterLandingAssert(unittest.TestCase):
+    def _f(self, fullscreen=(False, False, False), ocr_returns=(None, None),
+           assert_on=True):
+        ui, f = TestEnterTaskcenter._f(self)
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        f._find = mock.Mock(return_value=None)         # 段5 探不到任务行
+        f._fullscreen_scan = mock.Mock(return_value=fullscreen)
+        f._ocr_find = mock.Mock(side_effect=list(ocr_returns))
+        f.wf["enter_landing_assert"] = assert_on
+        return ui, f
+
+    def test_wrong_page_chat_aborts(self):
+        # OCR 命中错页特征（聊天页 发送 / 资料卡）→ 判进入失败 + 现场截图
+        ui, f = self._f(ocr_returns=(None, (540, 1725)))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertFalse(ok)
+        f._diag_shot.assert_called_once_with("enter_landing")
+        # 第二次 OCR 用的是错页特征词表
+        self.assertIn("发送", f._ocr_find.call_args_list[1].args)
+        # 提前 return：段6 配额读屏未执行（P3 合并后配额只从段5 快照取）
+        f._read_ad_ratio.assert_not_called()
+
+    def test_overlay_from_fullscreen_scan_aborts(self):
+        # 单次全屏扫描已判覆盖层（资料卡）→ 直接判失败，不再多跑一次 OCR
+        ui, f = self._f(fullscreen=(False, False, True))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertFalse(ok)
+        f._diag_shot.assert_called_once_with("enter_landing")
+        self.assertEqual(f._ocr_find.call_count, 1)    # 仅心动卡守卫那次
+
+    def test_tc_ocr_hit_keeps_going(self):
+        # OCR 读到任务中心特征 = H5 慢加载 → 放行（与旧行为一致）
+        ui, f = self._f(fullscreen=(True, False, False))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        f._diag_shot.assert_not_called()
+        self.assertEqual(f._ocr_find.call_count, 1)
+
+    def test_no_evidence_keeps_lenient(self):
+        ui, f = self._f(fullscreen=(False, False, False),
+                        ocr_returns=(None, None))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        f._diag_shot.assert_not_called()
+        self.assertEqual(f._ocr_find.call_count, 2)    # 心动卡 + 错页词复核
+
+    def test_knob_off_skips_assertion(self):
+        ui, f = self._f(fullscreen=(False, False, True), assert_on=False)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        f._fullscreen_scan.assert_not_called()
         f._diag_shot.assert_not_called()
 
 
@@ -1215,8 +1423,12 @@ class TestEnterTapPause(unittest.TestCase):
     def test_seg6_stage_logged_after_quota_read(self):
         # P1b 补的段6埋点：_read_ad_ratio 之后必须打一条 [计时] 进台.6配额缓存，
         # 让「段5→进台合计」之间的盲区（实测恒定 1.55s）在日志里可见。
+        # P3（2026-10-08）：本用例验证的是**段6 落点埋点**，故关掉配额探针以
+        # 隔离新变量（探针行为单测见 TestQuotaProbe）—— 否则探针会先调一次
+        # _read_ad_ratio(scroll=False)，段6 被跳过、埋点不可达。
         ui, f = self._f()
         f._stage = mock.Mock(side_effect=lambda t0, tag: t0)
+        f.wf["tc_ready_by_quota"] = False
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
@@ -1224,7 +1436,7 @@ class TestEnterTapPause(unittest.TestCase):
         self.assertIn("进台.6配额缓存", tags)
         self.assertLess(tags.index("进台.5TC加载探测"),
                         tags.index("进台.6配额缓存"))
-        f._read_ad_ratio.assert_called_once()
+        f._read_ad_ratio.assert_called_once_with()
 
 
 if __name__ == "__main__":

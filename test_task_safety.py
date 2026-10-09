@@ -65,19 +65,29 @@ class TestSigninGuard(unittest.TestCase):
 
     def test_success_flow_uses_assert_and_known_coords(self):
         ui, f = self._f()
-        ui.wait_for.return_value = nd("每日免费领", 900)   # 浮层出现
-        ui.find.return_value = nd("我知道了", 1100)        # 成功浮层
+
+        def wait_for(text, *a, **k):
+            # 2026-10-09：_signin 先 wait_for 签到浮层，再 wait_for 成功浮层「我知道了」
+            if text == "我知道了":
+                return nd("我知道了", 1251, x1=186)
+            return nd("每日免费领", 900)
+        ui.wait_for.side_effect = wait_for
+        ui.find.return_value = nd("我知道了", 1100)        # 关浮层前的在屏复核
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._signin()
         self.assertTrue(ok)
-        # 浮层出现断言参数
-        self.assertEqual(ui.wait_for.call_args,
+        # 两次 wait_for：① 签到浮层出现断言（P1 校准）② 成功浮层「我知道了」
+        self.assertEqual(ui.wait_for.call_args_list[0],
                          mock.call("每日免费领", retries=5, interval=1.0))
-        # 点击序列：浮层签到 -> 我知道了 -> 关闭✕（均 trusted=True：F11 放宽
-        # 任务中心页的盲点坐标禁令 —— 这些点位于已确认在屏的签到浮层内）
+        self.assertEqual(ui.wait_for.call_args_list[1],
+                         mock.call("我知道了", retries=5, interval=0.8))
+        # 2026-10-09 版式改版：我知道了 是**真实 dump 节点** → _tap_node 点节点，
+        # 不再点旧固定坐标 (540,1189)（该 y 已落进「再看视频 + 10」按钮区）。
+        n = f._tap_node.call_args_list[-1][0][0]
+        self.assertEqual(n.text, "我知道了")
+        # 坐标 _tap 序列：浮层签到 -> 关闭✕（均 trusted=True：点在已确认在屏的浮层内）
         self.assertEqual(f._tap.call_args_list,
                          [mock.call(301, 1800, trusted=True),
-                          mock.call(540, 1189, trusted=True),
                           mock.call(996, 1143, trusted=True)])
 
     def test_no_modal_means_already_signed_returns_false_with_reset(self):

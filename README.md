@@ -48,7 +48,7 @@ D:\qiandao\
 ├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0) + 进台流程(条件等待/新功能弹窗/心动卡/Y钳位) + 落点断言/F9让位后复核/配额单快照(P1P3 2026-10-08)（84 用例）
 ├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数 + 看广告配额跳过，48 用例）
 ├─ test_3bot_rotate.py      # mock 单测：多机器人轮转场景（进台失败复位/轮转补看 + 滑动窗口 rotate + 4 台补位/连败弃权 + 进台配额缓存复用 TestEntryQuotaCache，31 用例）
-├─ test_signin_ad.py        # mock 单测：签到奖励广告（签到触发/跳过/配置关闭/异常隔离 + 看广告按钮 dump 命中/OCR 兜底/无按钮/sheet_ok 关闭，9 用例）
+├─ test_signin_ad.py        # mock 单测：签到奖励广告（签到触发/跳过/配置关闭/异常隔离 + 「我知道了」节点关层/OCR 兜底 + 「看视频 + 10」/「看广告」按钮 dump 命中（排除任务行「看视频赚电量」）/OCR 兜底/无按钮/sheet_ok 关闭，13 用例）
 ├─ test_u2_backend.py       # mock 单测：u2 backend（Node 解析兼容/dump 三态/TTL/agent 生命周期，13 用例）
 ├─ test_account_switch.py   # mock 单测：多账号切换（切号链路/4 失败分支/顺序漂移按 UIN 定位/
 │                           #   漏号就绪判定/切号落点兜底(资料页/消息页) + 入口复位滑顶/
@@ -58,7 +58,7 @@ D:\qiandao\
 ├─ test_energy.py           # mock 单测：账号级「本流程获得电量」（_read_energy dump/OCR 双路 + 起始/结束读数幂等 + 汇总电量行，15 用例）
 ├─ test_quota_verify.py     # mock 单测：方案 A 收尾配额复核（末支关闭可疑时读屏校准 done，正常路径零额外读屏，9 用例）
 ├─ test_row_ratio.py        # mock 单测：任务行 X/Y 计数解析（/1000 串扰修复 + 分母必须 == 配额，8 用例）
-│                           # → 合计 430/430（1 个环境依赖 ERROR：test_u2_backend tap 用例 wraps 真实 adb，设备 offline 时必失败，与代码无关）
+│                           # → 合计 434/434（1 个环境依赖 ERROR：test_u2_backend tap 用例 wraps 真实 adb，设备 offline 时必失败，与代码无关）
 ├─ test_plan_fullflow.md    # 全流程测试计划文档
 │
 ├─ e2e_ad_once.py           # 真机验证：单机器人看一次广告（RESULT: OK/FAIL）
@@ -139,7 +139,7 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 | `ad_close_max_backs` | 3 | 关闭兜底物理 BACK 封顶 |
 | `ad_times_per_robot` | 10 | 每台每日广告配额 |
 | `ad_rotate` / `ad_rotate_group` | false / 3 | 滑动窗口轮询模式（2026-09-16 组制轮询 → 2026-09-26 滑动窗口）：true=固定 N 台窗口 + 补位队列，某台出窗（配额满/连败 3 次）立即补位，窗口常满员；仅剩 1 台且无待补时回落同机连看。靠换台吸收 60s CD（u2 实测 ~48-49s/支 vs 同机连看 ~89s/支）。`--rotate` 命令行可强制开启 |
-| `signin_ad` | true | 签到奖励广告（2026-09-16）：签到成功后浮层「看广告 +⚡」→ 再看一次 15s 广告拿奖励；失败只记日志不阻断主流程 |
+| `signin_ad` | true | 签到奖励广告（2026-09-16；2026-10-09 版式改版）：签到成功后**先点「我知道了」关掉签到层**（真实 dump 节点，非旧固定坐标），再点浮层底部**「看视频 + 10」**→ 看一次 15s 广告拿奖励；失败只记日志不阻断主流程 |
 | `enter_tap_pause_min/max` | 0.5 / 0.9 | 进台三处 `_tap_node` 后 pause 收紧（2026-09-29）：诊断实测进台 9.5s 里 6.75s（70%）是「点机器人行/点发消息/点个人」后的固定 pause 空等（分布 = uniform(1.5,3.0)）；收窄的秒数折成额外 `wait_for` 轮询 → tap 后**总窗口不短于旧行为**。⚠️ 仅作用于 `_enter_taskcenter` 三处点击，签到/反馈/关广告/退台零变化。设回 `1.5 / 3.0` 即完全回退 |
 | `tc_ready_by_quota` | true | **P3（2026-10-08）**：进台「TC 探测 + 配额读屏」合并 —— 段5 就绪轮询的**同一份 `ui.nodes()` 快照**顺手解析广告行 X/Y，命中即同时证明「任务行已渲染」+ 拿到配额基数 → 跳过 段6 独立读屏（省 ~1.55s，且避免其 `max_scroll=6` 把刚进的页滚走）。**零额外 dump**，快照打空即回落 段6 原链路（零回归）。见「进入任务中心」一节。`false` = 一键回退 |
 | `enter_landing_assert` | true | **P1（2026-10-08）**：进台**落点断言** —— 段5 探不到任务行时做一次 OCR 判别：读到任务中心特征 = H5 慢加载放行；读到**错页特征**（聊天页/资料卡，`_LANDING_WRONG_KEYS`）= 判进入失败交上层复位重试（否则白跑一轮 签到+反馈+广告 ~4min）。⚠️ 判据只能用 OCR —— 这些页对 dump **穿透透明**。成本仅 1.1% 异常分支一次 OCR。`false` = 回退旧行为 |
@@ -217,13 +217,35 @@ py -3.13 main.py --robots "李宥恩,小麦" --ad-times 1
 - `flow._tap(x, y, trusted=False)`：在任务中心页（`_page_tc=True`）**拒绝一切坐标点击**，
   除非显式 `trusted=True`。合法例外仅 3 处：
   1. `_close_ad`：广告页左上角「关闭广告」按钮（OCR 正向定位、非盲点）；
-  2. `_signin`：签到浮层按钮（浮层已由 `wait_for("每日免费领")` / `_find("我知道了")` 确认在屏）；
-  3. `_watch_signin_ad`：签到奖励广告「看广告 +⚡」按钮 OCR 兜底（dump 无该按钮时，
-     限定下半屏 region=(0,1600,1080,1920) 正向定位后点其坐标，非盲点）。
+  2. `_signin`：签到浮层按钮（浮层已由 `wait_for("每日免费领")` 确认在屏）；成功浮层的
+     「我知道了」点**真实 dump 节点**（2026-10-09 版式改版，非盲点）；
+  3. `_watch_signin_ad`：签到奖励广告「看视频 + 10」/「看广告」按钮 OCR 兜底（dump 无该
+     按钮时，限定**底部条带** region=(0,1700,1080,1920) 正向定位后点其坐标，非盲点）。
 - `_signin` 的关闭 ✕ 改为**浮层仍在屏才点**（该坐标在代柯版式里离 banner 顶仅 7px）。
 - `_page_tc` 状态位：进任务中心置 True；退出 / `_nav_robot_list` / `_safe_back_to_robot_list`
   置 False —— 保证**列表页机器人首行（y≈410-500）、联系人页『机器人』分类行（y≈201-352）**
   仍可正常点击（否则导航直接瘫痪）。
+
+## 每日签到 + 签到奖励广告（2026-10-09 版式改版）
+
+签到成功后的浮层已改版，流程随之更新（`_signin` + `_watch_signin_ad`）：
+
+| 步骤 | 动作 | 定位方式 |
+|---|---|---|
+| 1 | 点「每日签到」行 → 弹出「每日免费领」浮层 | dump 行节点 |
+| 2 | 未签到：浮层底部左侧**【签到】**（右侧是**「看视频 + 10」**） | `_tap_node`（未签到时 左半 [72,1728]-[531,1872]） |
+| 3 | 弹出成功浮层「签到领电量 / 恭喜获得 25 ⚡ / 再看视频 + 10 / **我知道了**」 | — |
+| 4 | **先点【我知道了】关掉签到层** | **真实 dump 节点** (186,1251)-(894,1308) → `_tap_node` |
+| 5 | 关层后「每日免费领」仍在屏，点底部**【看视频 + 10】**看签到广告 | dump 文本（`_is_signin_ad_label`）→ `_tap_node` |
+
+> ⚠️ **旧固定坐标 `SUCCESS_KNOW=(540,1189)` 已作废**：新版式下该 y 落在「再看视频 + 10」
+> 按钮区（1071-1218）→ 会**误触奖励广告**而非关层。现改为点「我知道了」**真实 dump 节点**
+> （F11 安全：点节点非盲点）。见 `MEMORY.md` 坑 28。
+>
+> ⚠️ **按钮文案「看广告 +⚡」→「看视频 + 10」**：按钮判定 `_is_signin_ad_label` 要求含
+> `+`（按钮样式），以**排除任务中心行标题「看视频赚电量」**（同含「看视频」但无 `+`；
+> 浮层打开时该行 y≈1653-1710 仍可能 ≥1600 被误选）；取 y 最大的节点（浮层按钮恒在最底）。
+> OCR 兜底只扫底部条带 `region=(0,1700,1080,1920)`（避开上述任务行）。
 
 ## 看广告关闭策略（E 优化链：等待窗口预定位 → 顶条快检直关 → uiautomator → OCR 正向定位 → BACK 封顶兜底）
 
@@ -422,7 +444,7 @@ dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `
 
 ```bash
 # mock 单测（无需设备 / 无 OCR 依赖，任意环境可跑）
-py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 430 用例（1 个环境依赖 ERROR：test_u2_backend tap 用例需真机 adb，设备 offline 时必失败，与代码无关）
+py -3.13 -m unittest discover -p "test_*.py"          # 全量，当前 434 用例（1 个环境依赖 ERROR：test_u2_backend tap 用例需真机 adb，设备 offline 时必失败，与代码无关）
 py -3.13 -m unittest test_flow_ocr_close test_adb_cache test_run_all_flags test_nav_optimize test_task_safety test_3bot_rotate test_signin_ad test_u2_backend test_account_switch test_watch_recover test_energy test_quota_verify test_row_ratio test_summary
 
 # 真机验证（需模拟器在线 + QQ 停在机器人列表）

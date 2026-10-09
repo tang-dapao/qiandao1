@@ -44,10 +44,14 @@ AD_ROW_LABELS = ("看广告", "获取随机", "看视频赚电量")
 # 保证 tap 后**总窗口**不短于旧行为（慢页最坏等待不缩短）。
 ENTER_TAP_PAUSE_REF = 2.25
 # 签到浮层「每日免费领」（1080x1920，实测）
-MODAL_SIGNIN = (301, 1800)     # 左下角【签到】按钮
+MODAL_SIGNIN = (301, 1800)     # 左下角【签到】按钮（未签到态：左半 [72,1728]-[531,1872]）
 MODAL_CLOSE = (996, 1143)      # 右上角 ✕
-# 签到成功浮层「恭喜获得」
-SUCCESS_KNOW = (540, 1189)     # 【我知道了】按钮
+# 签到成功浮层「我知道了」（2026-10-09 版式改版，实测 dump）
+# ⚠️ 旧固定坐标 (540,1189) 已**作废**：新版式下该 y 落在「再看视频 + 10」按钮区
+#   （popup 按钮 y 1071-1218）→ 点它会误触奖励广告而非关层。新版「我知道了」是
+#   **真实 dump 节点**（实测 (186,1251)-(894,1308)）→ 改为 _tap_node 点节点中心
+#   （F11 安全：点真实节点，非盲点坐标）。常量仅留作历史参考，勿再用于 tap。
+SUCCESS_KNOW_LEGACY = (540, 1189)
 # 左上角返回箭头三层路径（1080x1920，实测确认）
 # ⚠️ 已弃用（2026-09-09 起）：退出流程 `_exit_taskcenter` 已全面改用系统 BACK 键
 # （见该文件下层）—— 任务中心顶部 banner「QQ AI好友·常见问题答疑」升级为覆盖
@@ -478,10 +482,11 @@ class Flow:
         真实 dump 节点的 `_tap_node` 天然安全。于是规定：**任务中心页（`_page_tc`）
         拒绝一切坐标点击**，除非调用方显式 `trusted=True`。当前合法例外仅三处：
           1. `_close_ad`：广告页左上角「关闭广告」按钮（OCR 正向定位、非盲点）；
-          2. `_signin`：签到浮层内的固定按钮（浮层已由 `wait_for("每日免费领")` /
-             `_find("我知道了")` 确认在屏，且浮层在任务中心页之上、非 banner）；
-          3. `_watch_signin_ad`：签到奖励广告 OCR 兜底（浮层在屏 + OCR 正向读到
-             「看广告」才放行，同 2 同理，2026-09-16）。
+          2. `_signin`：签到浮层内的固定按钮（浮层已由 `wait_for("每日免费领")` 确认
+             在屏，且浮层在任务中心页之上、非 banner）；成功浮层的「我知道了」改点
+             **真实 dump 节点**（2026-10-09 版式改版，F11 安全：点节点非盲点）；
+          3. `_watch_signin_ad`：签到奖励广告（浮层在屏 + 正向读到「看视频 + 10」/
+             「看广告」才放行；dump 走节点，OCR 兜底才 trusted 坐标，同 2 同理）。
 
         返回是否真正执行了本次点击（被守卫拦截返回 False）。
         """
@@ -1532,10 +1537,25 @@ class Flow:
         # 浮层「每日免费领」-> 点左下 签到 @(301,1800)
         # F11：浮层已在屏（上方 wait_for 已确认）→ trusted=True 放行盲点禁令。
         self._tap(*MODAL_SIGNIN, trusted=True)
-        time.sleep(2.0)
-        # 成功浮层「我知道了」@(540,1189)（节点在屏才点）
-        if self._find("我知道了"):
-            self._tap(*SUCCESS_KNOW, trusted=True)
+        # 成功浮层「我知道了」→ 关掉签到层（2026-10-09 版式改版，实测）。
+        # ⚠️ 新版式下**不能**再点旧固定坐标 SUCCESS_KNOW=(540,1189) —— 该 y 落在
+        #    「再看视频 + 10」按钮区（1071-1218），会误触奖励广告而非关层。新版
+        #    「我知道了」是**真实 dump 节点**（实测 (186,1251)-(894,1308)）→
+        #    _tap_node 点节点中心（F11 安全：点真实节点，非盲点）。出不来再退 OCR。
+        #    关层后 每日免费领 浮层仍在屏、底部显示「看视频 + 10」→ 交 _watch_signin_ad。
+        know = self.ui.wait_for("我知道了", retries=5, interval=0.8)
+        if know is not None and know.x2 > know.x1 and know.y1 > 0:
+            logger.info("签到成功浮层：点击 我知道了 关闭签到层 @ (%d,%d)",
+                        (know.x1 + know.x2) // 2, (know.y1 + know.y2) // 2)
+            self._tap_node(know)
+        else:
+            pos = self._ocr_find("我知道了", retries=2)
+            if pos is not None:
+                logger.info("签到成功浮层：dump 未见节点，OCR 命中 我知道了 @%s", pos)
+                self._tap(*pos, trusted=True)
+            else:
+                logger.info("签到成功浮层未见「我知道了」"
+                            "（版式不同或已自动关层），跳过")
         time.sleep(1.5)
         # 签到奖励广告（2026-09-16 用户需求）：签到成功后浮层底部出现
         # 「看广告 +⚡」→ 看一次 15s 广告拿奖励。失败只记日志不阻断；
@@ -1841,13 +1861,29 @@ class Flow:
         time.sleep(self.t.get("ad_close_wait", 2.0))
         return True
 
-    def _watch_signin_ad(self) -> bool:
-        """签到浮层内的「看广告 +⚡」奖励广告（2026-09-16 用户需求）。
+    @staticmethod
+    def _is_signin_ad_label(text: Optional[str]) -> bool:
+        """签到浮层底部「奖励广告」按钮文案判定（2026-10-09 版式改版，实测）。
 
-        前提：签到成功、「我知道了」已处理、每日免费领浮层在屏。
-        找按钮：① dump 含匹配「看广告」且 y>=1600（浮层底部；y 限制避开
-        dump 穿透读到的背景任务中心行）——实测按钮文本可能带 +⚡ 后缀/拆分，
-        用子串包含而非整词；② OCR 兜底（底部区域），命中坐标点 trusted=True
+        旧文案「看广告 +⚡」→ 新文案「看视频 + 10」。**必须排除任务中心行标题
+        「看视频赚电量」** —— 它同样含「看视频」（实测浮层打开时该行 y≈1653-1710，
+        仍可能 ≥1600 命中），若不加区分会被误选。判据：带 '+'（按钮样式）才算；
+        调用方另以 y>=1600 + 取最底部节点双重收窄。
+        """
+        t = text or ""
+        if "看广告" in t:            # 旧文案（兼容）
+            return True
+        return "看视频" in t and "+" in t
+
+    def _watch_signin_ad(self) -> bool:
+        """签到浮层底部「奖励广告」按钮（2026-09-16 用户需求；2026-10-09 版式改版）。
+
+        前提：签到成功、「我知道了」已关掉签到层、每日免费领浮层仍在屏。
+        找按钮：① dump 命中奖励广告按钮文案（_is_signin_ad_label）且 y>=1600
+        （浮层底部；y 限制避开 dump 穿透读到的背景任务中心行），取**最底部**节点
+        （浮层按钮恒在 y≈1728-1872，高于任务行）；② OCR 兜底：只扫**最底条带**
+        （y>=1700）—— 新版按钮「看视频 + 10」与任务行「看视频赚电量」都含「看视频」，
+        扫 1600 起会被 _ocr_find 按阅读序先命中任务行 → 误点。命中坐标点 trusted=True
         （浮层已确认在屏，同 _signin 现有例外同理）。
         看完复用 _ad_play_and_close()；回来若浮层仍在则关 ✕。
         任何异常只记日志不抛出 —— 奖励广告失败不阻断签到返回值与后续
@@ -1858,16 +1894,17 @@ class Flow:
                 logger.info("签到浮层已不在屏，跳过签到奖励广告")
                 return False
             cands = [n for n in self.ui.nodes()
-                     if "看广告" in (n.text or "") and n.y1 >= 1600]
+                     if self._is_signin_ad_label(n.text) and n.y1 >= 1600]
             btn = max(cands, key=lambda n: n.y1) if cands else None
             if btn is not None:
                 logger.info("签到奖励广告：浮层按钮 @ (%d,%d) 文本=%r",
                             btn.x1, btn.y1, btn.text)
                 self._tap_node(btn)
             else:
-                pos = self._ocr_find("看广告", region=(0, 1600, 1080, 1920))
+                pos = self._ocr_find("看视频", "看广告",
+                                     region=(0, 1700, 1080, 1920))
                 if pos is None:
-                    logger.info("签到浮层未找到 看广告 按钮"
+                    logger.info("签到浮层未找到 看视频/看广告 按钮"
                                 "（已看过或版式不同），跳过奖励广告")
                     return False
                 logger.info("签到奖励广告：dump 未命中，OCR 命中 @ %s", pos)

@@ -3,8 +3,12 @@
 覆盖：
 - _signin 已签到跳过路径不触发奖励广告；真正签到路径触发一次
 - wf.signin_ad=false 不触发
-- _watch_signin_ad：浮层内 dump 含匹配「看广告」按钮 → 节点点击 + 共用播放关闭段
-- 按钮 dump 未命中 → OCR 兜底（trusted 坐标点击）
+- _signin 成功浮层「我知道了」：2026-10-09 版式改版后是**真实 dump 节点** →
+  _tap_node 点节点（不再用旧固定坐标 SUCCESS_KNOW，旧 y 会落进「再看视频 + 10」按钮）；
+  节点未出 → OCR 兜底 trusted 坐标点击
+- _watch_signin_ad：浮层底部按钮 dump 匹配「看视频 + 10」/「看广告」→ 节点点击
+  + 共用播放关闭段；任务行「看视频赚电量」同含「看视频」但无 '+' → 必须被排除
+- 按钮 dump 未命中 → OCR 兜底（**底部条带** y>=1700 的 trusted 坐标点击，避开任务行）
 - 两者都未命中 → 跳过返回 False，不动广告关闭段
 - 奖励广告异常不阻断 _signin 成功返回
 - _ad_play_and_close 从 _watch_ad_once 抽出后的行为回归（经由现有用例覆盖）
@@ -49,16 +53,23 @@ class SigninAdBase(unittest.TestCase):
 
         def find(text, *a, **k):
             if text == "我知道了":
-                return _node("我知道了", 400, 1150, 680, 1230) if know else None
+                return _node("我知道了", 186, 1251, 894, 1308) if know else None
             if text in ("每日免费领", "恭喜获得"):
                 return _node("每日免费领", 40, 1050, 1040, 1900) if sheet else None
             return None
         self.f._find = mock.Mock(side_effect=find)
+
+        def wait_for(text, *a, **k):
+            # 2026-10-09：_signin 改用 wait_for("我知道了") 等成功浮层（版式改版后
+            # 它才是可靠判据）；首行仍 wait_for("每日免费领") 等签到浮层 —— 按 text 分派。
+            if text == "我知道了":
+                return _node("我知道了", 186, 1251, 894, 1308) if know else None
+            return _node("每日免费领", 40, 1050, 1040, 1900)
         self.f.ui = mock.Mock()
-        self.f.ui.wait_for.return_value = _node("每日免费领", 40, 1050,
-                                                1040, 1900)
+        self.f.ui.wait_for = mock.Mock(side_effect=wait_for)
         self.f._tap = mock.Mock(return_value=True)
         self.f._tap_node = mock.Mock()
+        self.f._ocr_find = mock.Mock(return_value=None)
         self.f._reset_after_fail = mock.Mock()
         self.f._watch_signin_ad = mock.Mock(return_value=True)
         self.f._ad_play_and_close = mock.Mock(return_value=True)
@@ -92,6 +103,30 @@ class TestSigninAdTrigger(SigninAdBase):
         self.f._watch_signin_ad = mock.Mock(
             side_effect=RuntimeError("boom"))
         self.assertTrue(self.f._signin())
+
+    def test_know_dismiss_taps_dump_node_not_fixed_coord(self):
+        # 2026-10-09 版式改版：我知道了 是真实 dump 节点 (186,1251)-(894,1308)
+        # → 必须 _tap_node 点节点；不得再点旧固定坐标 (540,1189)（已落在
+        #   「再看视频 + 10」按钮区 → 会误触奖励广告）。
+        self.stub_signin_page(signed=False, know=True, sheet=True)
+        self.assertTrue(self.f._signin())
+        self.f._tap_node.assert_called()
+        n = self.f._tap_node.call_args[0][0]
+        self.assertEqual(n.text, "我知道了")
+        self.assertEqual((n.y1, n.y2), (1251, 1308))
+        # 旧固定坐标 (540,1189) 不再出现在任何 _tap 调用里
+        self.assertNotIn((540, 1189),
+                         [tuple(c.args[:2]) for c in self.f._tap.call_args_list])
+
+    def test_know_absent_ocr_fallback_dismiss(self):
+        # 节点未出（版式不同）→ OCR 兜底 trusted 点 我知道了
+        self.stub_signin_page(signed=False, know=False, sheet=True)
+        self.f._ocr_find = mock.Mock(return_value=(540, 1279))
+        self.assertTrue(self.f._signin())
+        self.assertTrue(any("我知道了" in c.args
+                            for c in self.f._ocr_find.call_args_list))
+        self.assertIn((540, 1279),
+                      [tuple(c.args[:2]) for c in self.f._tap.call_args_list])
 
 
 class TestWatchSigninAd(SigninAdBase):
@@ -134,6 +169,28 @@ class TestWatchSigninAd(SigninAdBase):
         self.assertEqual((args[0], args[1]), (540, 1835))
         self.assertTrue(kwargs.get("trusted") or
                         (len(args) > 2 and args[2] is True))
+
+    def test_new_label_video_plus_10_beats_task_row(self):
+        # 2026-10-09 版式改版：浮层底部按钮变成「看视频 + 10」；任务行标题
+        # 「看视频赚电量」同含「看视频」但**无 '+'** → 必须被排除；取最底部节点。
+        self.f.ui.nodes.return_value = [
+            _node("看视频赚电量", 234, 1653, 513, 1710),   # 任务行（无 '+'，排除）
+            _node("看视频 + 10", 72, 1728, 1008, 1872),    # 浮层底部按钮
+        ]
+        self.assertTrue(self.f._watch_signin_ad())
+        self.f._tap_node.assert_called_once()
+        n = self.f._tap_node.call_args[0][0]
+        self.assertEqual(n.text, "看视频 + 10")
+        self.f._ocr_find.assert_not_called()
+
+    def test_task_row_video_without_plus_not_a_button(self):
+        # 只有任务行「看视频赚电量」（无 '+'）→ 不被当按钮；OCR 也未命中 → 跳过
+        self.f.ui.nodes.return_value = [
+            _node("看视频赚电量", 234, 1653, 513, 1710)]
+        self.f._ocr_find = mock.Mock(return_value=None)
+        self.assertFalse(self.f._watch_signin_ad())
+        self.f._tap_node.assert_not_called()
+        self.f._ad_play_and_close.assert_not_called()
 
     def test_no_button_anywhere_skips_without_ad(self):
         # 已看过（按钮消失）→ 跳过，不碰广告关闭段

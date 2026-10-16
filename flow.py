@@ -43,6 +43,12 @@ AD_ROW_LABELS = ("看广告", "获取随机", "看视频赚电量")
 # 默认 1.5~3.0 的中点）。仅用于把 pause 收窄的秒数折成额外 wait_for 轮询次数，
 # 保证 tap 后**总窗口**不短于旧行为（慢页最坏等待不缩短）。
 ENTER_TAP_PAUSE_REF = 2.25
+# P0（2026-10-12）：段5「提前 OCR 复核」自适应的**信任阈值** —— 连续这么多台
+# 进台的 dump 轮询全程打空，才认定「dump 在本版式下不可靠」并启用提前复核。
+# 取 2：既避免单次抖动（偶发慢加载）误触发，又能在一台之内完成止损。
+# 依据：10-11 起段5>4s 占比 100%（连续 372 台 dump 全打空），单次抖动的
+# 假阳性概率在实测量级下可忽略；旧版式下 dump 会命中 → 计数立即归零。
+TC_DUMP_MISS_TRUST = 2
 # 签到浮层「每日免费领」（1080x1920，实测）
 MODAL_SIGNIN = (301, 1800)     # 左下角【签到】按钮（未签到态：左半 [72,1728]-[531,1872]）
 MODAL_CLOSE = (996, 1143)      # 右上角 ✕
@@ -1262,13 +1268,62 @@ class Flow:
         # **绝不新增任何 dump**（零回归）。
         # false = 一键回退旧行为（段5 走 _find 轮询 + 段6 独立读屏）。
         merge = bool(self.wf.get("tc_ready_by_quota", True))
+        # ---- P0（2026-10-12）：段5「提前 OCR 复核」自适应 -------------------
+        # 官方新版式（任务中心首屏插入心动卡促销卡）下，dump 免滚动单快照
+        # **结构性**读不到任务行：实测 10-11 起段5>4s 占比 7%→100%、段5 中位
+        # 1.9s→7.9s、进台中位 6.0s→11.5s（372 台 ≈ +30min/天），而 OCR 全屏
+        # 扫描仍读得到。旧链在此版式下必然「空轮询满 taskcenter_wait（3.0s）
+        # + 两次全屏 OCR（2×2.7s）」＝纯空耗。
+        # 策略：**先证明 dump 靠不住，再省** —— 只有「上一台进台的 dump 轮询
+        # 全程打空」累计达 TC_DUMP_MISS_TRUST 次，本台才启用提前复核：第
+        # enter_early_ocr_polls 轮仍打空 → 立即做**一次** `_fullscreen_scan4`
+        # （一次截图同时判 任务中心/关闭按钮/覆盖层/心动卡促销）：
+        #   - tc 命中   → 直接放行（省掉剩余轮询）
+        #   - promo 命中 → 上滑重探任务行
+        #   - 全空      → 继续轮询到窗口结束、走原兜底（与旧链等价，不更差）
+        # 旧版式/慢加载下 dump 会命中 → 计数归零 → **提前复核从不触发，成功
+        # 路径零额外开销**（满足「加守卫不得拖慢成功路径」）。false = 一键回退。
+        early_on = bool(self.wf.get("enter_early_ocr", True))
+        miss_streak = int(getattr(self, "_tc_dump_miss", 0))
+        early_live = early_on and miss_streak >= TC_DUMP_MISS_TRUST
+        early_polls = max(1, int(self.wf.get("enter_early_ocr_polls", 4)))
+        pre_scan = None           # 提前复核结果 (tc,pill,overlay,promo)；None=未做
+        probed = False            # 是否已 OCR 复核过（防重复扫）
+        dump_hit = False          # 本台进台的 dump 快照是否命中过
+        # ---- 方案 E（2026-10-12 P1）：段5 dump 就绪判据**对齐 OCR 判据** ----
+        # 旧判据只认「任务行」（每日签到/任务中心/AD_ROW_LABELS）。官方新版式
+        # 下任务行被促销卡顶出可见区 → 在 a11y 树里**结构性缺失**（真机 3/3
+        # 机器人：点「个人」后 6.5s 窗口内一次都没进过 dump），判据必然恒 False
+        # → 100% 走兜底（空轮询 3.0s + 全屏 OCR）。而 TC 外壳特征 0.0~1.48s 即
+        # 进树，且 `收支详情` 本就是 `_TC_KEYS_OCR` 成员（OCR 侧一直拿它当任务
+        # 中心特征）→ 此处把 **dump 侧判据对齐到 OCR 侧**，消除口径不一致。
+        # 收益：段5 回到 ~1s 级且**零 OCR**；P0 的提前 OCR 复核因 dump 命中而
+        # 永不触发（自适应计数归零），连带省掉它那 ~1.8s/台 —— E 与 P0 是分层
+        # 关系：E 命中则 P0 不触发；E 打空（未来版式变化）时 P0 仍兜底。
+        # 慢加载/旧版式行为不变（新词表是旧词表的**超集**，只会更早命中，不会
+        # 更晚）；错页安全性不降级：命中仍要求 TC 特征词，聊天页/资料卡均不含
+        # （逐页取证 3 页 0 命中）。
+        # false = 一键回退旧判据（只认任务行 + 广告行）。
+        shell_ready = bool(self.wf.get("enter_ready_shell_keys", True))
+        ready_keys = tuple(dict.fromkeys(
+            ("每日签到", "任务中心") + tuple(AD_ROW_LABELS)
+            + (self._TC_SHELL_KEYS if shell_ready else ())))
         if not found_tc:
-            for _ in range(max(1, int(self.t.get("taskcenter_wait", 3.5) * 2))):
+            for _i in range(max(1, int(self.t.get("taskcenter_wait", 3.5) * 2))):
                 if merge:
                     cur = self.ui.nodes()
-                    if (any(x.text in ("每日签到", "任务中心") for x in cur)
-                            or any(x.text in AD_ROW_LABELS for x in cur)):
+                    if any(x.text in ready_keys for x in cur):
                         found_tc = True
+                        dump_hit = True
+                        if not any(x.text in ("每日签到", "任务中心")
+                                   or x.text in AD_ROW_LABELS for x in cur):
+                            # 命中的是「TC 外壳特征」而非任务行（新版式下任务行
+                            # 在可见区外）→ 单独打点，便于日志区分两条就绪路径
+                            logger.info(
+                                "段5 dump 命中 TC 外壳特征「%s」（官方新版式任务行"
+                                "在可见区外，判据已对齐 _TC_KEYS_OCR）→ 零 OCR 就绪",
+                                next((x.text for x in cur if x.text in ready_keys),
+                                     ""))
                         self._tc_entry_ratio = self._ad_ratio_from_snapshot(cur)
                         if self._tc_entry_ratio is not None:
                             logger.info(
@@ -1277,10 +1332,33 @@ class Flow:
                                 self._tc_entry_ratio[0],
                                 self._tc_entry_ratio[1])
                         break
-                elif self._find("每日签到") or self._find("任务中心"):
+                elif (self._find("每日签到") or self._find("任务中心")
+                      or (shell_ready
+                          and any(self._find(k) for k in self._TC_SHELL_KEYS))):
+                    # 方案 E：非合并分支（tc_ready_by_quota:false 的旧链路）也
+                    # 补上 TC 外壳判据；`_find` 走 `nodes()` 的 0.8s TTL 缓存，
+                    # 多次调用只付一次 dump，无额外开销。
                     found_tc = True
+                    dump_hit = True
                     break
+                # P0：提前 OCR 复核（仅当 dump 已被连续证不可靠时才启用）
+                if early_live and not probed and (_i + 1) >= early_polls:
+                    probed = True
+                    pre_scan = self._fullscreen_scan4()
+                    if pre_scan[0]:
+                        found_tc = True
+                        logger.info(
+                            "段5 提前 OCR 复核命中任务中心特征（官方新版式 H5，"
+                            "dump 已连续 %d 台打空）→ 跳过剩余轮询", miss_streak)
+                        break
+                    if pre_scan[3]:
+                        logger.info("段5 提前 OCR 复核命中心动卡促销版式"
+                                    "→ 上滑重探任务行")
+                        break
                 time.sleep(0.5)
+        # P0 自适应计数：仅「dump 全程打空」才累加；dump 一旦命中立即归零
+        # （旧版式/慢加载场景提前复核永不触发，无副作用）。
+        self._tc_dump_miss = 0 if dump_hit else miss_streak + 1
         if not found_tc:
             # A（2026-09-10）：dump 窗口内未见任务中心特征时，OCR 一次区分
             # 「H5 版式加载慢（真任务中心）」与「误入错页（心动卡 H5 会员页）」。
@@ -1291,8 +1369,16 @@ class Flow:
             #   进入失败，交上层 _safe_back_to_robot_list 复位重试（最多 3 次）。
             #   OCR 未命中错页（慢加载真任务中心）→ 维持原"版式差异"放行，
             #   由后续任务操作的等待器兜住 —— 行为不变，零影响看广告路径。
-            wrong = self._ocr_find("心动卡", "高级模型", "立即续费", retries=1)
-            if wrong is not None:
+            # P0（2026-10-12）：提前复核若已做过（pre_scan 非 None）→ 直接**复用**
+            # 其 promo 信号，不再单独扫一次全屏 OCR（省 ~2.7s）；未做过才走原
+            # `_ocr_find`（词表与旧实现完全一致，语义不变）。
+            if pre_scan is not None:
+                wrong = None
+                promo_hit = pre_scan[3]
+            else:
+                wrong = self._ocr_find(*self._TC_PROMO_KEYS, retries=1)
+                promo_hit = wrong is not None
+            if promo_hit:
                 # P-心动卡（2026-09-12）：真机现场截图实锤（fail_enter_wrongpage_*
                 # .png）—— 该页并非陌生 H5，而是任务中心顶部插入了「心动卡促销卡」
                 # （返回箭头/收支详情/banner/电量/聊天特权都在），任务行被整体推到
@@ -1301,8 +1387,12 @@ class Flow:
                 # 小麦 3 次 ~5min 全废被跳过）。现改为：上滑（#1 安全左列锚点）
                 # 最多 2 次，每次滑完重探任务行；探到即按正常进入继续；仍探不到
                 # 才判失败（保留旧兜底，防真错页）。
-                logger.info("OCR 命中心动卡促销卡（%s）→ 按任务中心促销版式处理，"
-                            "上滑后重探任务行", wrong)
+                if pre_scan is None:
+                    logger.info("OCR 命中心动卡促销卡（%s）→ 按任务中心促销版式处理，"
+                                "上滑后重探任务行", wrong)
+                else:
+                    logger.info("提前 OCR 复核命中心动卡促销版式"
+                                "→ 上滑后重探任务行")
                 for _ in range(2):
                     self.ui.swipe_up()
                     if (self._find("每日签到") or self._find("任务中心")
@@ -1338,7 +1428,14 @@ class Flow:
                     # （整台机器人白跑一轮签到+反馈+广告 ≈ 4min）。
                     # false = 回退旧行为（一律放行）。
                     if self.wf.get("enter_landing_assert", True):
-                        tc_ocr, _pill, overlay_ocr = self._fullscreen_scan()
+                        # P0（2026-10-12）：提前复核已判「覆盖层」时直接复用
+                        # （覆盖层不会自行消失）；其余情形重扫一次 —— 距提前复核
+                        # 已过 ≥1.5s，页面可能刚就绪。成本与旧链此处唯一的一次
+                        # 全屏 OCR 相同，不新增开销。
+                        if pre_scan is not None and pre_scan[2]:
+                            tc_ocr, _pill, overlay_ocr = (False, pre_scan[1], True)
+                        else:
+                            tc_ocr, _pill, overlay_ocr = self._fullscreen_scan()
                         if tc_ocr:
                             found_tc = True
                             logger.info("落点断言：OCR 读到任务中心特征"
@@ -2054,6 +2151,25 @@ class Flow:
     #   读到的是背景页文本），dump 判据必被欺骗 —— 这是该静默失败的根因。
     _LANDING_WRONG_KEYS = ("发送", "语音通话", "QQ空间", "资料卡",
                            "相册", "听听")
+    # P0（2026-10-12）：官方任务中心**新版式**首屏插入的「心动卡促销卡」特征词。
+    # 实测背景（run.log 10-09~10-12 共 1483 次进台）：10-11 起 dump 免滚动单快照
+    # 的段5 就绪判定 **100% 打空**（段5>4s 占比 7%→100%，进台中位 6.0s→11.5s），
+    # 而 OCR 全屏扫描仍可读到任务中心特征 —— 促销卡占位把「每日签到」等任务行
+    # 推出首屏可见区，dump 读不到、OCR 读得到。
+    # ⚠️ 与 `_LANDING_WRONG_KEYS` 语义相反：命中本词表说明**仍在任务中心**
+    # （只是需要上滑让任务行进入可见区），**绝不能判进入失败**。
+    _TC_PROMO_KEYS = ("心动卡", "高级模型", "立即续费")
+    # 方案 E（2026-10-12 P1）：任务中心的「外壳特征」词表 —— 与「任务行」相对。
+    # 真机实测（probe_e_axtree / probe_e3_firstseen，3/3 机器人）：
+    #   官方新版式（心动卡促销卡占位）把**任务行整体顶出可见区**后，
+    #   `每日签到/任务中心/看广告/获取随机/看视频赚电量` 在点「个人」后
+    #   **6.5s 窗口内一次都没进过 a11y 树**（结构性缺失，不是慢）；
+    #   而 `收支详情`(y=117) / `当前电量` / `去充电` **0.0~1.48s 即进树**。
+    # 逐页取证（probe_e2_markers）确认这三词**只在任务中心出现**：
+    #   机器人列表 / 资料卡(有发消息) / 聊天页(有个人) 三页 **0 命中**。
+    # 注：`收支详情` 本来就是 `_TC_KEYS_OCR` 的成员（OCR 侧早就拿它当任务中心
+    #   特征）—— 段5 的 dump 判据此前未同步该词表，是本方案要消除的口径不一致。
+    _TC_SHELL_KEYS = ("收支详情", "当前电量", "去充电")
     # AI 好友 banner H5：方案 A 实施后被观测到的"OCR 漏读任务中心特征词 →
     # 误 tap (160,152) 命中任务中心顶部 banner"事故（2026-09-10 11:43 实锤）。
     # banner H5 全屏显示「QQ AI好友·常见问题答疑」。**不能**仅凭"常见问题答疑"
@@ -2103,11 +2219,39 @@ class Flow:
             (tc, pill, overlay)：tc=读到任务中心特征词；pill=读到关闭按钮
             （广告未关）；overlay=读到覆盖层特征词（问卷/资料卡等盖屏）。
         """
+        tc, pill, overlay, _promo = self._fullscreen_scan4()
+        return (tc, pill, overlay)
+
+    def _fullscreen_scan4(self) -> Tuple[bool, bool, bool, bool]:
+        """单次全屏 OCR **四合一**判定（P0 2026-10-12 新增，段5 复核专用）。
+
+        在 `_fullscreen_scan` 的「任务中心 / 关闭按钮 / 覆盖层」之上追加第 4 项
+        「心动卡促销版式」（`_TC_PROMO_KEYS`）：**一次**截图 + **一次** tesseract
+        同时拿到 4 个信号，替掉旧段5 兜底链的「`_ocr_find` 心动卡 + 再次
+        `_fullscreen_scan`」**两次**全屏 OCR。
+
+        成本（2026-10-12 真机实测，`probe_f_ocr`）：取图 0.46~0.50s（adb
+        exec-out；方案 F 起改走 u2 原生通道 0.08~0.12s）+ tesseract 全图
+        1080x1920 **1.03s** → 合计 **1.5~2.0s/次**。
+        ⚠️ 旧注释曾写「`ocr.scale: 2.0` 放大两倍」—— 那是 **legacy 脚本**的
+        遗留，现行 flow 的 OCR 路径**直接把 1080x1920 原图喂给 tesseract**，
+        `config.yaml` 的 `ocr.scale` 在当前代码里**不生效**（降采样实测也无收益：
+        0.75x/0.6x/0.5x = 1.17/0.89/0.81s）。
+
+        `_fullscreen_scan` 现委托本方法并只取前 3 项 —— 两个方法的**
+        签名与返回语义完全不变**，既有调用点与单测桩零改动。
+
+        Returns:
+            (tc, pill, overlay, promo)：
+              tc=读到任务中心特征词；pill=读到关闭按钮（广告未关）；
+              overlay=读到覆盖层特征词（问卷/资料卡等盖屏）；
+              promo=读到心动卡促销版式（**仍是任务中心**，需上滑而非判失败）。
+        """
         if not _HAS_OCR:
-            return (False, False, False)
+            return (False, False, False, False)
         img = self._ocr_shot()
         if img is None:
-            return (False, False, False)
+            return (False, False, False, False)
         data = pytesseract.image_to_data(
             img, lang=getattr(self, "_ocr_lang", "chi_sim+eng"),
             output_type=pytesseract.Output.DICT)
@@ -2129,7 +2273,8 @@ class Flow:
 
         pill_keys = ("关闭广告", "关闭", "跳过", "取消")
         overlay_keys = tuple(self._OVERLAY_TOP_KEYS) + tuple(self._PROFILE_KEYS)
-        return (_hit(self._TC_KEYS_OCR), _hit(pill_keys), _hit(overlay_keys))
+        return (_hit(self._TC_KEYS_OCR), _hit(pill_keys), _hit(overlay_keys),
+                _hit(self._TC_PROMO_KEYS))
 
     def _ai_friend_page_visible(self) -> bool:
         """OCR 是否显示 AI 好友 banner H5 误开页（已点中 banner 后全屏放大）。
@@ -2232,19 +2377,62 @@ class Flow:
         共用同一帧，省掉重复 screencap subprocess（每次 ~0.5-1s）。
         失效：界面动作（tap/swipe/back，经 ui.on_action 钩子）、TTL 过期、
         显式 _invalidate_shot_cache()。
+
+        F（2026-10-12 P2）：取图**优先走感知后端原生通道**（u2 的
+        `screenshot_pil`，设备端 :9008 直取 PNG）——实测 0.07~0.17s，对比
+        adb exec-out screencap 的 0.46~0.50s 快约 5x。取图是本项目最高频的
+        I/O（_dismiss_badcase / _close_ad / _fullscreen_scan* / _ocr_find 全
+        经此处），省下的 ~0.4s 按调用次数放大。原生通道不可用（adb 后端 /
+        旋钮关 / 抛异常 / 返回 None）→ **静默回落 `_shot_adb()`**，图像
+        尺寸与色彩空间完全一致（同为 1080x1920 RGB），零行为漂移。
         """
         now = time.time()
         if (self._shot_cache is not None
                 and now - self._shot_ts < self._shot_ttl):
             return self._shot_cache
+        img = self._shot_native()
+        if img is None:
+            img = self._shot_adb()
+        if img is None:
+            return None
+        self._shot_cache = img
+        self._shot_ts = time.time()
+        return img
+
+    def _shot_native(self) -> Optional["Image.Image"]:
+        """F：感知后端原生截屏通道（仅 U2AdbUI 提供，可一键关闭）。
+
+        `workflow.ocr_shot_via_u2: false` → 直接返回 None（回落 adb 原链路）。
+        adb 后端没有 `screenshot_pil` 属性 → getattr 为 None → 同样回落。
+        """
+        # 全程 try 包裹：`Flow.__new__` 形态的测试对象可能连 self.ui / self.wf
+        # 都没有 —— 通道不可用必须**静默回落**，绝不把异常抛给调用方（与
+        # `_shot_adb` 原链路的 try 语义保持一致）。
+        try:
+            if not self.wf.get("ocr_shot_via_u2", True):
+                return None
+            fn = getattr(self.ui, "screenshot_pil", None)
+            if fn is None:
+                return None
+            img = fn()
+            # 必须真的是 PIL 图像才认账：后端返回 None / 异常对象 / 其它格式一律
+            # 视为「通道不可用」→ 回落 adb 原链路。（对 `unittest.mock.Mock` 形态
+            # 的 ui 尤其关键：Mock 会自动生成任意属性，若不校验会让 _ocr_shot 返回
+            # 一个 Mock 图像，污染所有依赖「截图失败返回 None」的用例。）
+            if not isinstance(img, Image.Image):
+                return None
+            return img if img.mode == "RGB" else img.convert("RGB")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("原生截屏通道异常 → 回落 adb screencap: %s", e)
+            return None
+
+    def _shot_adb(self) -> Optional["Image.Image"]:
+        """adb exec-out screencap 取图（原链路，保留为兜底 + adb 后端主路径）。"""
         try:
             out = subprocess.run(
                 [self.ui.adb, "-s", self.ui.device, "exec-out", "screencap", "-p"],
                 capture_output=True, timeout=SHOT_TIMEOUT)
-            img = Image.open(io.BytesIO(out.stdout)).convert("RGB")
-            self._shot_cache = img
-            self._shot_ts = time.time()
-            return img
+            return Image.open(io.BytesIO(out.stdout)).convert("RGB")
         except subprocess.TimeoutExpired:
             logger.warning("截图超时 (> %.0fs)，设备可能无响应", SHOT_TIMEOUT)
             return None

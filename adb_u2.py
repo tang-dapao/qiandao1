@@ -132,3 +132,34 @@ class U2AdbUI(AdbUI):
             self._dump_fail_streak += 1
             time.sleep(0.2)
             return None
+
+    # ----------------------------------------------------------
+    # 截屏替换（方案 F 2026-10-12）：原生 PNG 通道，供 flow._ocr_shot 优先使用
+    # ----------------------------------------------------------
+    def screenshot_pil(self):
+        """原生截屏：设备端 :9008 直取 PNG → PIL.Image（1080x1920 RGB）。
+
+        实测（probe_f_ocr.py，MuMu 1080x1920）：
+            u2 原生通道    0.07 ~ 0.17s
+            adb exec-out   0.46 ~ 0.50s      → 快约 5x
+        取图是本项目**最高频**的 I/O（_dismiss_badcase / _close_ad /
+        _fullscreen_scan* / _ocr_find 全部经 flow._ocr_shot），故省下的
+        0.35~0.40s 会按调用次数放大。
+
+        契约：失败一律返回 None（不抛），调用方（flow._ocr_shot）静默回落
+        adb exec-out 原链路 —— 与 `dump()` 的「失败返回 None + 计数」不同，
+        这里不累计任何状态，因为截图失败不影响 dump 链的卡死判定。
+        """
+        try:
+            img = self._agent().screenshot(format="pillow")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("u2 截屏失败: %s", e)
+            return None
+        if img is None:
+            return None
+        try:
+            if getattr(img, "mode", None) != "RGB":
+                img = img.convert("RGB")
+        except Exception:  # noqa: BLE001
+            return None
+        return img

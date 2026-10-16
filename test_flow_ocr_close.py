@@ -1021,6 +1021,38 @@ class TestFullscreenScan(Base):
         self.assertEqual(self.f._fullscreen_scan(), (False, False, False))
 
 
+class TestFullscreenScan4(Base):
+    """P0（2026-10-12）：`_fullscreen_scan4` 四合一判定 —— 在三合一之上追加
+    「心动卡促销版式」，供段5 提前复核**一次**截图拿到全部信号（替掉旧兜底链
+    的两次全屏 OCR）。`_fullscreen_scan` 委托本方法且只取前 3 项，签名不变。
+    """
+
+    def setUp(self):
+        super().setUp()
+        del self.f._fullscreen_scan      # 移除 Base 桩，测真实委托链
+
+    def _scan_setup(self, words):
+        self.f._ocr_shot = mock.Mock(return_value=mock.Mock())
+        self.fake_pt.image_to_data.return_value = _ocr_data(words)
+
+    def test_promo_hit_returns_four_tuple(self):
+        self._scan_setup([("心动卡", 227, 647, 60, 24)])
+        self.assertEqual(self.f._fullscreen_scan4(),
+                         (False, False, False, True))
+
+    def test_taskcenter_hit_keeps_promo_false(self):
+        self._scan_setup([("每日", 300, 250, 40, 24), ("签到", 345, 250, 40, 24)])
+        self.assertEqual(self.f._fullscreen_scan(),
+                         (True, False, False))          # 旧三合一契约不变
+        self.assertEqual(self.f._fullscreen_scan4(),
+                         (True, False, False, False))
+
+    def test_shot_none_returns_all_false(self):
+        self.f._ocr_shot = mock.Mock(return_value=None)
+        self.assertEqual(self.f._fullscreen_scan4(),
+                         (False, False, False, False))
+
+
 class TestTopStripFastPath(Base):
     """E2（2026-09-14）：`_back_at_taskcenter` 三信号免 dump 快速通道。"""
 
@@ -1190,6 +1222,82 @@ class TestQuickCheckDirectClose(Base):
         f.ui.nodes.return_value = [Node("某文本", 0, 0, 10, 10)]
         self.assertFalse(f._close_ad())
         self.assertTrue(f.ui.nodes.called)                  # 快照已尝试读取
+
+
+class TestOcrShotChannel(Base):
+    """方案 F（2026-10-12 P2）：_ocr_shot 优先走感知后端原生截屏通道。
+
+    真机依据（probe_f_ocr / probe_f_verify / probe_f_color）：
+      u2 原生 screenshot_pil 0.08~0.12s vs adb exec-out screencap 0.43~0.61s
+      （≈5x）；两通道逐像素平均差 0.96/255（圆角抗锯齿），OCR 结论一致。
+    """
+
+    def _f(self, **wf):
+        self.f.ui.adb = "adb"
+        self.f.ui.device = "emulator-5554"
+        self.f.wf = dict(wf)
+        return self.f
+
+    def test_native_channel_preferred(self):
+        from PIL import Image
+        img = Image.new("RGB", (4, 4))
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui.screenshot_pil = mock.Mock(return_value=img)
+        f._shot_adb = mock.Mock(return_value="ADB")
+        self.assertIs(f._ocr_shot(), img)
+        f.ui.screenshot_pil.assert_called_once()
+        f._shot_adb.assert_not_called()
+
+    def test_native_none_falls_back_to_adb(self):
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui.screenshot_pil = mock.Mock(return_value=None)
+        f._shot_adb = mock.Mock(return_value="ADB")
+        self.assertEqual(f._ocr_shot(), "ADB")
+        f._shot_adb.assert_called_once()
+
+    def test_native_exception_falls_back_to_adb(self):
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui.screenshot_pil = mock.Mock(side_effect=RuntimeError("boom"))
+        f._shot_adb = mock.Mock(return_value="ADB")
+        self.assertEqual(f._ocr_shot(), "ADB")
+        f._shot_adb.assert_called_once()
+
+    def test_knob_off_skips_native(self):
+        f = self._f(ocr_shot_via_u2=False)
+        f.ui.screenshot_pil = mock.Mock(return_value="NATIVE")
+        f._shot_adb = mock.Mock(return_value="ADB")
+        self.assertEqual(f._ocr_shot(), "ADB")
+        f.ui.screenshot_pil.assert_not_called()
+
+    def test_backend_without_native_attr_uses_adb(self):
+        # adb 后端（AdbUI）没有 screenshot_pil → 直接走原链路
+        class _Bare:
+            adb = "adb"
+            device = "d"
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui = _Bare()
+        f._shot_adb = mock.Mock(return_value="ADB")
+        self.assertEqual(f._ocr_shot(), "ADB")
+        f._shot_adb.assert_called_once()
+
+    def test_ttl_cache_short_circuits_both_channels(self):
+        from PIL import Image
+        img = Image.new("RGB", (4, 4))
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui.screenshot_pil = mock.Mock(return_value="NATIVE")
+        f._shot_adb = mock.Mock(return_value="ADB")
+        f._shot_cache = img
+        f._shot_ts = flow_mod.time.time()
+        self.assertIs(f._ocr_shot(), img)
+        f.ui.screenshot_pil.assert_not_called()
+        f._shot_adb.assert_not_called()
+
+    def test_native_non_rgb_converted(self):
+        from PIL import Image
+        f = self._f(ocr_shot_via_u2=True)
+        f.ui.screenshot_pil = mock.Mock(return_value=Image.new("L", (4, 4)))
+        got = f._ocr_shot()
+        self.assertEqual(got.mode, "RGB")
 
 
 if __name__ == "__main__":

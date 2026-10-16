@@ -918,6 +918,185 @@ class TestEnterLandingAssert(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# P0（2026-10-12）：段5「提前 OCR 复核」自适应。
+# 官方新版式（任务中心首屏插入心动卡促销卡）下 dump 免滚动单快照**结构性**
+# 读不到任务行：实测 10-11 起段5>4s 占比 7%→100%（段5 中位 1.9s→7.9s、
+# 进台中位 6.0s→11.5s，372 台 ≈ +30min/天），而 OCR 全屏扫描仍读得到。
+# 自适应：连续 TC_DUMP_MISS_TRUST 台 dump 全程打空才启用提前复核；
+# dump 一旦命中即归零 → 旧版式/慢加载下提前复核**永不触发**（零开销）。
+# ----------------------------------------------------------------------
+class TestEnterEarlyOcr(unittest.TestCase):
+    def _f(self, miss=0, scan=(False, False, False, False),
+           ocr_returns=(None, None), wf_extra=None):
+        ui, f = TestEnterTaskcenter._f(self)
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        ui.nodes.return_value = []                     # 快照恒空 = dump 全程打空
+        f._find = mock.Mock(return_value=None)         # 上滑重探也探不到
+        f._fullscreen_scan4 = mock.Mock(return_value=scan)
+        f._fullscreen_scan = mock.Mock(return_value=tuple(scan[:3]))
+        f._ocr_find = mock.Mock(side_effect=list(ocr_returns))
+        f._tc_dump_miss = miss
+        if wf_extra:
+            f.wf.update(wf_extra)
+        return ui, f
+
+    def test_first_miss_only_counts_and_never_probes(self):
+        # miss=0（未达信任阈值）→ 不启用提前复核，仅把计数 +1
+        ui, f = self._f(miss=0)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)                            # 无错页实锤 → 放行
+        self.assertEqual(f._tc_dump_miss, 1)
+        f._fullscreen_scan4.assert_not_called()
+
+    def test_dump_hit_resets_streak_and_never_probes(self):
+        # dump 命中 → 计数归零 + 提前复核永不触发（旧版式/慢加载零开销）
+        ui, f = self._f(miss=9)
+        ui.nodes.return_value = [nd("每日签到", 600)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_dump_miss, 0)
+        f._fullscreen_scan4.assert_not_called()
+
+    def test_early_ocr_hit_tc_stops_remaining_polls(self):
+        # 已信任（miss>=2）+ 第 1 轮仍打空 → 提前复核命中任务中心 → 提前放行
+        ui, f = self._f(miss=2, scan=(True, False, False, False),
+                        wf_extra={"enter_early_ocr_polls": 1})
+        with mock.patch.object(flow_mod.time, "sleep") as sl:
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        f._fullscreen_scan4.assert_called_once()
+        f._diag_shot.assert_not_called()
+        self.assertEqual(sl.call_count, 0)             # 剩余轮询被整体跳过
+        self.assertEqual(f._tc_dump_miss, 3)           # dump 仍打空 → 继续累加
+
+    def test_early_ocr_hit_promo_swipes_and_reuses_scan(self):
+        # 提前复核命中心动卡促销版式 → 上滑重探；且不再单独扫一次 promo OCR
+        ui, f = self._f(miss=2, scan=(False, False, False, True),
+                        wf_extra={"enter_early_ocr_polls": 1})
+        f._find = mock.Mock(side_effect=lambda t, *a, **k:
+                            nd("每日签到", 600) if t == "每日签到" else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(ui.swipe_up.call_count, 1)
+        f._fullscreen_scan4.assert_called_once()
+        f._ocr_find.assert_not_called()                # 复用快照 → 省一次全屏 OCR
+
+    def test_early_ocr_blank_reuses_scan_for_landing_assert(self):
+        # 提前复核全空 → 落点断言复用其信号（不再单扫 promo，只留错页词复核）
+        ui, f = self._f(miss=2, scan=(False, False, False, False),
+                        ocr_returns=((540, 1725),),
+                        wf_extra={"enter_early_ocr_polls": 1})
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertFalse(ok)                           # 错页实锤 → 判进入失败
+        f._diag_shot.assert_called_once_with("enter_landing")
+        self.assertEqual(f._ocr_find.call_count, 1)    # 仅错页词那一次
+        self.assertIn("发送", f._ocr_find.call_args_list[0].args)
+
+    def test_early_ocr_knob_off_never_probes(self):
+        # enter_early_ocr=false → 一键回退：即使计数远超阈值也不提前复核
+        ui, f = self._f(miss=9, scan=(True, False, False, False),
+                        wf_extra={"enter_early_ocr": False})
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        f._fullscreen_scan4.assert_not_called()
+
+
+class TestEnterReadyShellKeys(unittest.TestCase):
+    """方案 E（2026-10-12 P1）：段5 dump 就绪判据对齐 OCR 判据（TC 外壳特征）。
+
+    真机依据：官方新版式下任务行被心动卡促销卡顶出可见区 → a11y 树里结构性
+    缺失（3/3 机器人 6.5s 内零出现）；而 收支详情/当前电量/去充电 0.0~1.48s
+    即进树，且「收支详情」本就是 _TC_KEYS_OCR 成员。
+    """
+
+    def _f(self, miss=0, scan=(False, False, False, False),
+           ocr_returns=(None, None), wf_extra=None):
+        ui, f = TestEnterTaskcenter._f(self)
+        f._at_robot_list = True
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        ui.nodes.return_value = []
+        f._find = mock.Mock(return_value=None)
+        f._fullscreen_scan4 = mock.Mock(return_value=scan)
+        f._fullscreen_scan = mock.Mock(return_value=tuple(scan[:3]))
+        f._ocr_find = mock.Mock(side_effect=list(ocr_returns))
+        f._tc_dump_miss = miss
+        if wf_extra:
+            f.wf.update(wf_extra)
+        return ui, f
+
+    def test_shell_key_hit_ready_and_no_ocr_probe(self):
+        # 快照只含 TC 外壳特征（无任务行）→ 判就绪、计数归零、零 OCR、无空轮询
+        ui, f = self._f(miss=9)
+        ui.nodes.return_value = [nd("收支详情", 120), nd("当前电量", 1500)]
+        with mock.patch.object(flow_mod.time, "sleep") as sl:
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_dump_miss, 0)          # dump 命中 → 计数归零
+        f._fullscreen_scan4.assert_not_called()       # E 命中 → P0 提前复核不触发
+        self.assertEqual(sl.call_count, 0)            # 首轮即命中，零空等
+
+    def test_each_shell_key_alone_suffices(self):
+        # 三个外壳词各自单独出现都能判就绪
+        for key in flow_mod.Flow._TC_SHELL_KEYS:
+            ui, f = self._f(miss=9)
+            ui.nodes.return_value = [nd(key, 1500)]
+            with mock.patch.object(flow_mod.time, "sleep"):
+                ok = f._enter_taskcenter("某机器人")
+            self.assertTrue(ok, key)
+            self.assertEqual(f._tc_dump_miss, 0, key)
+
+    def test_knob_off_ignores_shell_keys(self):
+        # enter_ready_shell_keys=false → 一键回退：外壳词不再算就绪
+        ui, f = self._f(miss=9, wf_extra={"enter_ready_shell_keys": False})
+        ui.nodes.return_value = [nd("收支详情", 120)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)                            # 无错页实锤 → 放行
+        self.assertEqual(f._tc_dump_miss, 10)          # 仍视为打空 → 继续累加
+
+    def test_task_row_still_ready(self):
+        # 旧判据不被削弱：任务行命中照样就绪
+        ui, f = self._f(miss=0)
+        ui.nodes.return_value = [nd("每日签到", 600)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_dump_miss, 0)
+
+    def test_shell_hit_leaves_ratio_none_seg6_falls_back(self):
+        # 外壳命中时快照无广告行 → 配额仍 None → 段6 走原 _read_ad_ratio（不回归）
+        ui, f = self._f(miss=9)
+        ui.nodes.return_value = [nd("收支详情", 120)]
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertIsNone(f._tc_entry_ratio)
+        f._read_ad_ratio.assert_called_once()
+
+    def test_nonmerge_branch_shell_key_ready(self):
+        # tc_ready_by_quota=false 的旧链路也补外壳判据（_find 命中即就绪）
+        ui, f = self._f(miss=9, wf_extra={"tc_ready_by_quota": False})
+        f._find = mock.Mock(side_effect=lambda t, *a, **k:
+                            nd("收支详情", 120) if t == "收支详情" else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        self.assertEqual(f._tc_dump_miss, 0)
+
+    def test_wrong_page_keys_absent_from_ready_set(self):
+        # 安全性：错页特征词（聊天页/资料卡）绝不在就绪词表里
+        ready = flow_mod.Flow._TC_SHELL_KEYS
+        for bad in ("发送", "语音通话", "QQ空间", "资料卡", "相册", "听听"):
+            self.assertNotIn(bad, ready)
+
+
+# ----------------------------------------------------------------------
 # _exit_taskcenter 安全版（P0）：前提校验 + 分层校验 + safe_back 兜底
 # ----------------------------------------------------------------------
 class _TapAdvanceUI(FakeUI):

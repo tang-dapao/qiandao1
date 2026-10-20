@@ -768,12 +768,28 @@ class TestVerifyRelocatedRow(unittest.TestCase):
 
     def test_pinned_ghost_slot_returns_none(self):
         """让位后被滚入吸顶分类栏下缘残影槽位（坑 15）→ 放弃点击。
-        栏节点 机器人@y1=500 → 栏底 y2=580；行 y1=358 → 358-580 < ROW_PITCH。"""
-        ui = FakeUI([_robot_list_page(("藤非", 358))])
+        吸顶栏 y1=201（y2=281）、行 y1=358 → 358-281=77 < ROW_PITCH。
+        （2026-10-19 修正：旧用例误用 _robot_list_page 默认栏 y1=500=未吸顶，
+        且行 y1=358 落在栏**上方**，与真实残影语义相反，导致判据写反仍假绿。）"""
+        ui = FakeUI([_bottom_tabs("联系人")
+                     + [nd("机器人", 201, x1=677, selected=True),
+                        nd("藤非", 358, x1=183)]])
         f = self._flow(ui)
         self.assertIsNone(
             f._verify_relocated_row("藤非", nd("藤非", 358, x1=183)))
         f._diag_shot.assert_called_once_with("enter_relocate_pinned")
+
+    def test_unpinned_bar_not_a_ghost(self):
+        """栏未吸顶（y1=688 >= CAT_BAR_PINNED_Y）时，即使行紧贴栏底（gap=22 <
+        ROW_PITCH）也不是残影槽位 → 正常放行并返回新鲜坐标（与原判据同向）。"""
+        ui = FakeUI([_bottom_tabs("联系人")
+                     + [nd("机器人", 688, x1=677, selected=True),
+                        nd("藤非", 790, x1=183)]])
+        f = self._flow(ui)
+        out = f._verify_relocated_row("藤非", nd("藤非", 900, x1=183))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.y1, 790)            # 用新 dump 的新鲜坐标
+        f._diag_shot.assert_not_called()
 
     def test_ok_returns_fresh_coordinates(self):
         ui = FakeUI([_robot_list_page(("藤非", 1300))])
@@ -1120,8 +1136,10 @@ def _chat_page():
 
 
 class TestExitTaskcenter(unittest.TestCase):
-    def _f(self, ui):
+    def _f(self, ui, wf_extra=None):
         f = make_flow(ui)
+        if wf_extra:
+            f.wf.update(wf_extra)
         f._scroll_to_top_of_taskcenter = mock.Mock()
         return f
 
@@ -1140,15 +1158,42 @@ class TestExitTaskcenter(unittest.TestCase):
         self.assertEqual(f._at_robot_list, True)
 
     def test_early_stop_when_back_to_list_after_first_layer(self):
-        # 第1层 BACK 后已到列表 → 提前结束，不再 BACK 后两层
+        # 逐层链（exit_back_burst=False）下：第1层 BACK 后已到列表 → 提前结束。
+        # ⚠️ 2026-10-19：连发快路径默认开启，本"提前结束"语义只在回退开关下
+        # 存在 —— 全量日志 4155 次退台里第 1 层命中 **0 次**（第 2 层 1 次、
+        # 第 3 层 4154 次），真实世界几乎总是要退满三层。
         pages = [_tc_page(), _list_page()]
         ui = _TapAdvanceUI(pages)
-        f = self._f(ui)
+        f = self._f(ui, wf_extra={"exit_back_burst": False})
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._exit_taskcenter()
         self.assertTrue(ok)
         self.assertEqual(ui.taps, [("BACK",)])
         self.assertEqual(f._at_robot_list, True)
+
+    def test_burst_three_backs_then_single_check(self):
+        """连发快路径（默认）：不逐层校验，发满 3 次 BACK 后只做 1 次强判据。
+
+        这是省时的核心（3.3s → ~0.8s）。用真实 `_looks_like_robot_list`
+        计数，确保没有被逐层链"偷偷"多校验。
+        """
+        pages = [_tc_page(), _chat_page(), _chat_page(), _list_page()]
+        ui = _TapAdvanceUI(pages)
+        f = self._f(ui)
+        checks = []
+        orig = f._looks_like_robot_list
+
+        def _spy():
+            checks.append(1)
+            return orig()
+
+        f._looks_like_robot_list = _spy
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._exit_taskcenter()
+        self.assertTrue(ok)
+        self.assertEqual(len(checks), 1, "连发后只允许 1 次校验")
+        self.assertEqual(len(ui.taps), 3, "必须恰好 3 次 BACK")
+        self.assertTrue(f._at_robot_list)
 
     def test_precondition_fail_on_foreign_page_uses_safe_back(self):
         # 前提校验失败（不在任务中心，如误入浏览器）→ 直接安全返回兜底

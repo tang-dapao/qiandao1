@@ -118,6 +118,17 @@ SHOT_TIMEOUT = 15.0
 # （config 现为 2.5s）是为"整页切换/等待加载"设计的，而物理返回的过渡远快于此，
 # 实测 1.2s 已足够稳定 —— 三层共省约 4s；万一判漏还有 _safe_back_to_robot_list 兜底。
 EXIT_LAYER_WAIT = 1.2
+# P1（2026-10-19）：退台「三层 BACK 连发 + 尾一次校验」的层间 pause 区间。
+# 依据（probe_exit_timing，3 trial）：3 次 BACK 之后 0.07~0.08s 列表即可被
+# `_looks_like_robot_list()` 强判据正确检出；而**前两层** BACK 后 3.5s 窗口内
+# 20 次检查全不命中 —— 说明逐层校验的价值只在最后一层，前两层的
+# pause(0.8~1.2s)+dump 是纯盲等（每层 ~1.1s）。连发把三层压到
+# 3×pause + 1 次 dump ≈ 0.8s（原 3.3s）。
+# 取 0.15~0.30 的抖动区间而非固定值：一是给系统处理 keyevent 的余量，二是
+# 避免完全等间隔的输入节奏（防风控考量，与 C2 坐标抖动一致）。
+# ⚠️ 连发失败（BACK 被吞 / 页面未到位）→ 原样回落下方逐层链，兜底语义不变。
+EXIT_BURST_PAUSE_MIN = 0.15
+EXIT_BURST_PAUSE_MAX = 0.30
 
 
 # ---- 页面结构锚点（1080x1920，实机 uiautomator dump 验证 2026-09-09）----
@@ -188,6 +199,10 @@ class Flow:
     # 即弃），观看周期结束（_close_ad 返回后）由 _watch_ad_once 显式清空 —— 防
     # 旧坐标泄漏到其它调用路径（残留清场等）被当成新广告的关闭按钮误点。
     _prefetch_close = None
+    # P1（2026-10-19）：上次 `_exit_taskcenter` 是否走了「连发快路径」。
+    # True=快路径命中；False=连发失败已回落逐层链；None=未尝试（开关关/未调用）。
+    # 仅供日志/探针统计用，不参与任何判定。
+    _exit_burst_hit = None
     # 多账号配置（2026-09-24）：类级默认空 dict，防 __new__ 绕过 __init__ 时缺属性。
     acc: dict = {}
     # 反馈内容已用集合（2026-09-26 用户方案：5 位随机数 + 持久化防重）。
@@ -274,6 +289,42 @@ class Flow:
         # 反馈内容已用集合（2026-09-26）：None=未从记录文件懒加载；单测可预设
         # 空 set 跳过文件 IO。防重细节见 _new_feedback_text。
         self._fb_used = None
+        # P1 埋点（2026-10-19）：进台落点断言三分支分布 + 放行分支后续失败计数。
+        # 用于收紧「both_false 放行」决策的数据采集（零行为改动，只累加计数）。
+        # 分布：tc_ocr / overlay_wrong / both_false；失败：各放行分支后续
+        # 「未找到广告行」的次数（_watch_ad_once 回填）。汇总见 _log_summary。
+        self._landing_stats = {"tc_ocr": 0, "overlay_wrong": 0, "both_false": 0,
+                               "tc_ocr_fail": 0, "both_false_fail": 0}
+        self._landing_branch = None   # 当前台落点断言分支；None=本台未触发落点断言
+
+    def _landing_stat(self, branch: str) -> None:
+        """P1 埋点（2026-10-19）：落点断言分支计数 + 记录当前台分支。
+
+        懒初始化 `_landing_stats`（兼容 Flow.__new__ 绕过 __init__ 的单测对象），
+        零行为影响 —— 只累加计数 + 记 `_landing_branch`，供 _log_summary 输出
+        分布、供 _note_landing_fail 关联后续「未找到广告行」。"""
+        stats = getattr(self, "_landing_stats", None)
+        if stats is None:
+            stats = self._landing_stats = {
+                "tc_ocr": 0, "overlay_wrong": 0, "both_false": 0,
+                "tc_ocr_fail": 0, "both_false_fail": 0}
+        stats[branch] = stats.get(branch, 0) + 1
+        self._landing_branch = branch
+
+    def _note_landing_fail(self) -> None:
+        """P1 埋点（2026-10-19）：落点断言放行后仍「未找到广告行」→ 回填失败计数。
+
+        仅 tc_ocr / both_false 两个放行分支需要统计（overlay_wrong 直接 return
+        False，不会走到看广告段）。纯计数、零行为影响；对象缺属性时静默跳过
+        （兼容 Flow.__new__ 单测对象）。"""
+        br = getattr(self, "_landing_branch", None)
+        if br not in ("tc_ocr", "both_false"):
+            return
+        stats = getattr(self, "_landing_stats", None)
+        if not stats:
+            return
+        key = br + "_fail"
+        stats[key] = stats.get(key, 0) + 1
 
     # ----------------------------------------------------------
     # 基础：uiautomator 定位（带滚动）
@@ -1012,7 +1063,9 @@ class Flow:
             self._diag_shot("enter_relocate_oob")
             return None
         bar = self._cat_bar_node(cur)
-        if (bar is not None and bar.y1 >= CAT_BAR_PINNED_Y
+        # 吸顶态 = 栏 y1 < CAT_BAR_PINNED_Y（吸顶 y1≈201，未吸顶 y1≈688），
+        # 与 `_reconfirm_click_target` 坑 15 判据同向（2026-10-19 修正曾写反的 >=）。
+        if (bar is not None and bar.y1 < CAT_BAR_PINNED_Y
                 and fresh.y1 - bar.y2 < ROW_PITCH):
             logger.warning("让位后复核：%s 行 @(%d,%d) 被滚入吸顶分类栏下缘残影"
                            "槽位（栏底 y=%d，坑 15）——放弃点击交复位重试",
@@ -1194,6 +1247,7 @@ class Flow:
         t0 = t_start
         # 方案 A：清上次进台的旧配额缓存，避免进台失败时残留值被误复用。
         self._tc_entry_ratio = None
+        self._landing_branch = None   # P1 埋点：清上一台落点断言分支残留
         self._nav_robot_list()
         t0 = self._stage(t0, "进台.1导航列表")
         r = self._find_robot(name)
@@ -1438,11 +1492,13 @@ class Flow:
                             tc_ocr, _pill, overlay_ocr = self._fullscreen_scan()
                         if tc_ocr:
                             found_tc = True
+                            self._landing_stat("tc_ocr")
                             logger.info("落点断言：OCR 读到任务中心特征"
                                         "（H5 慢加载）→ 按正常任务中心继续")
                         elif (overlay_ocr
                               or self._ocr_find(*self._LANDING_WRONG_KEYS,
                                                 retries=1) is not None):
+                            self._landing_stat("overlay_wrong")
                             logger.warning(
                                 "落点断言失败：任务中心特征缺失且 OCR 命中错页"
                                 "特征（资料卡/聊天页）→ 判定进入失败，交上层"
@@ -1450,6 +1506,7 @@ class Flow:
                             self._diag_shot("enter_landing")
                             return False
                         else:
+                            self._landing_stat("both_false")
                             logger.info("落点断言：无错页实锤（疑 H5 慢加载）"
                                         "→ 维持版式差异放行")
                     if not found_tc:
@@ -1507,6 +1564,7 @@ class Flow:
         # F11：退出任务中心 → 关闭 banner 禁点区（回到列表后 y<440 的点击是合法的，
         # 如机器人首行/分类行）；本方法全程只用物理 BACK，不依赖坐标。
         self._page_tc = False
+        self._exit_burst_hit = None      # P1 埋点：本次退台是否走连发快路径
         # 前提校验：当前必须是任务中心页
         # 坑（2026-09-13 小麦事故）：重载动画期 dump 连续超时会把"还在任务中心"
         # 误判成"不在" → 安全返回盲按 BACK 过度返回 → 顶出资料卡浮层卡死后续
@@ -1527,6 +1585,27 @@ class Flow:
         # （校验判据/层数/兜底全不变，仅去掉无谓等待），退台合计 8.9s → ~3.5s。
         # workflow.nav_fast_wait: false 一键回退旧行为。
         fast = self.wf.get("nav_fast_wait", True)
+        # P1（2026-10-19）：连发快路径 —— 3 次 BACK 不校验、尾做 1 次强校验。
+        # 见模块常量 EXIT_BURST_PAUSE_* 的实测依据。失败即回落下方逐层链，
+        # 语义与兜底完全不变（只是多花了连发那 ~0.7s）。
+        if fast and self.wf.get("exit_back_burst", True):
+            t_burst = time.time()
+            for _ in range(3):
+                self.ui.back(pause=random.uniform(EXIT_BURST_PAUSE_MIN,
+                                                  EXIT_BURST_PAUSE_MAX))
+            if self._looks_like_robot_list():
+                self._at_robot_list = True
+                self._exit_burst_hit = True      # 埋点：本次退台走了快路径
+                logger.info("连发 3 次 BACK + 单次校验命中机器人列表"
+                            "（P1 快路径）")
+                logger.info("[计时] 退台.连发快路径 %.1fs", time.time() - t_burst)
+                logger.info("[计时] 退台合计 %.1fs", time.time() - t_start)
+                return True
+            self._exit_burst_hit = False         # 埋点：连发失败，已回落逐层链
+            logger.info("连发 3 次 BACK 未回列表（%.1fs，疑似被吞/页面未到位）"
+                        "→ 回落逐层链兜底", time.time() - t_burst)
+            # 连发消耗的时间不计入逐层链统计，避免污染「退台.第N层」
+            t0 = time.time()
         for layer in (1, 2, 3):
             self.ui.back(pause=random.uniform(0.8, 1.2) if fast
                          else random.uniform(1.2, 1.8))
@@ -1886,6 +1965,7 @@ class Flow:
                 # 40+ 分钟烧掉后续所有机器人）。先用 OCR 认一下"关闭广告"：
                 # 在屏则走关闭链路清场后重试一次；不在屏维持原失败语义。
                 if self._ad_close_pos() is None:
+                    self._note_landing_fail()
                     logger.warning("未找到 看广告/获取随机 行")
                     return False
                 logger.warning("find_row 失败但 OCR 读到关闭广告（广告页残留）"
@@ -1897,6 +1977,7 @@ class Flow:
                 row = self._find_row(AD_ROW_LABELS[0],
                                      alt_labels=AD_ROW_LABELS[1:])
                 if not row:
+                    self._note_landing_fail()
                     logger.warning("清场后仍未找到 看广告/获取随机 行")
                     return False
         else:
@@ -1929,11 +2010,21 @@ class Flow:
         # 定位」的串行定位段（实测 ~3.5-4.8s/次）。不提前 tap，tap 时机与原
         # 行为完全一致；预定位读不到（插屏/加载期版式不同）则不缓存走原链。
         # 设 workflow.ad_prefetch_pos: false 可整体回退。
-        prefetch_at = float(self.wf.get("ad_prefetch_at", 10.0))
-        if self.wf.get("ad_prefetch_pos", True) and wait > prefetch_at + 2.0:
+        prefetch_at = float(self.wf.get("ad_prefetch_at", 13.0))
+        if (self.wf.get("ad_prefetch_pos", True)
+                and wait > prefetch_at + 1.0):
+            _pf_t0 = time.time()
             time.sleep(prefetch_at)
             self._prefetch_ad_close_pos()
-            time.sleep(wait - prefetch_at)
+            # P0-a（2026-10-19，**bug 修复不是优化**）：预定位的 OCR 耗时
+            # （取图 0.08~0.12 + 顶条识别 ~1.0 ≈ 1.1s）必须**从等待窗里扣掉**。
+            # 旧实现是 sleep(prefetch_at) + OCR + sleep(wait - prefetch_at)
+            # ⇒ OCR 落在等待窗之外，实际观看时长恒为 wait + OCR ≈ wait + 1.1s，
+            # 每支白等 1.1s。10-19 实测 447 支、「播放完→关闭确认」p50 5.28s
+            # 里含这段余量。改为按已消耗时间补差，总时长严格 = wait。
+            # 风险：预定位时点更晚 + 扣时后 tap 时机可能提前 ~0（tap 仍由
+            # 等待结束触发，总窗口不变）→ 行为等价，纯省时。
+            time.sleep(max(0.0, wait - (time.time() - _pf_t0)))
         else:
             time.sleep(wait)
         # B 优化（2026-09-13 用户确认）：移除观看等待后的任务中心 OCR 预检。
@@ -3390,6 +3481,18 @@ class Flow:
                 lines.append("电量：%d → %d，本流程获得 +%d" % (es, ee, ee - es))
             else:
                 lines.append("电量：起始 %d，结束读数失败（差额缺失）" % es)
+        # P1 埋点（2026-10-19）：落点断言三分支分布 + 放行分支后续失败计数。
+        # 供收紧「both_false 放行」决策：若 both_false 次数 == both_false_fail
+        # （100% 失败）即可安全收紧。仅在触发过落点断言时输出，避免噪音。
+        ls = getattr(self, "_landing_stats", None)
+        if ls and (ls.get("tc_ocr") or ls.get("overlay_wrong")
+                   or ls.get("both_false")):
+            lines.append("落点断言分布：tc_ocr=%d overlay_wrong=%d both_false=%d"
+                         "（放行后未找到广告行：tc_ocr %d / both_false %d）"
+                         % (ls.get("tc_ocr", 0), ls.get("overlay_wrong", 0),
+                            ls.get("both_false", 0),
+                            ls.get("tc_ocr_fail", 0),
+                            ls.get("both_false_fail", 0)))
         for ln in lines:
             logger.info("%s", ln)
         try:

@@ -442,6 +442,11 @@ accounts:
     - {nick: "唐六爻", uin: "1000000001", enabled: true}
 ```
 
+> **脱敏**：仓库里的 `uin` 全是占位号。真实 QQ 号请放在同目录的
+> `accounts.local.yaml`（已在 `.gitignore` 排除），`main.py: load_config()`
+> 会用它覆盖 `accounts.*`，本地行为与此前完全一致。没有该文件时（他人克隆）
+> 需自行填 `uin`，否则切号定位不到账号。
+
 **生效范围**：仅**完整主流程**（`main.py` 无参 / `--rotate`）。`--ad-only`、
 `--no-ad`、`--robots` 手动指定、`--list` 一律保持单账号旧行为；`--accounts`
 可强制开启，`--only-switch` 只切号不跑（调试用）。每账号**独立记账**，各自

@@ -22,10 +22,52 @@ from flow import Flow
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 本地私密覆盖文件（不提交到 git，见 .gitignore）：
+# 仓库里的 config.yaml 出于脱敏要求把 accounts.list 的 uin 写成了占位号，
+# 真实 QQ 号只保存在本机的 accounts.local.yaml。此机制保证：
+#   - 有该文件（本机）→ 行为与脱敏前**完全一致**；
+#   - 无该文件（他人克隆 / CI）→ 静默跳过，照常能跑，只是需要自己填 uin。
+ACCOUNTS_LOCAL_FILE = "accounts.local.yaml"
+
+# load_config 期间产生的提示（setup_logging 之后才输出，否则 INFO 会丢）
+_LOAD_NOTES: list = []
+
 
 def load_config(path: str) -> dict:
+    """读取 config.yaml，并用同目录的 accounts.local.yaml 覆盖 accounts.*。
+
+    覆盖粒度是「键」：本地文件只写 accounts.list 时，enabled / settle /
+    max_retry / ready_stable / ready_timeout 仍取 config.yaml 的值。
+    """
+    _LOAD_NOTES.clear()
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    local_path = os.path.join(os.path.dirname(os.path.abspath(path)),
+                              ACCOUNTS_LOCAL_FILE)
+    if not os.path.isfile(local_path):
+        return cfg
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            local = yaml.safe_load(f) or {}
+    except Exception as e:  # 覆盖文件写坏不该阻断主流程
+        _LOAD_NOTES.append("WARN 读取 %s 失败，已忽略：%s"
+                           % (ACCOUNTS_LOCAL_FILE, e))
+        return cfg
+
+    local_acc = local.get("accounts")
+    if not isinstance(local_acc, dict) or not local_acc:
+        return cfg
+
+    acc = cfg.get("accounts")
+    if not isinstance(acc, dict):
+        acc = {}
+        cfg["accounts"] = acc
+    acc.update(local_acc)
+    n = len((acc.get("list") or []))
+    _LOAD_NOTES.append("accounts 已由本地 %s 覆盖（%d 个账号）"
+                       % (ACCOUNTS_LOCAL_FILE, n))
+    return cfg
 
 
 def setup_logging(cfg: dict):
@@ -68,6 +110,11 @@ def main():
     cfg = load_config(args.config)
     setup_logging(cfg)
     logger = logging.getLogger("main")
+    for note in _LOAD_NOTES:
+        if note.startswith("WARN "):
+            logger.warning(note[5:])
+        else:
+            logger.info(note)
 
     # 感知层后端选择（阶段2 2026-09-15）：device.backend = adb（默认）| u2
     # u2 = uiautomator2 3.x 设备端常驻 agent，dump 中位 94ms（adb 路径 4021ms，

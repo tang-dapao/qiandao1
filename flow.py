@@ -1526,6 +1526,14 @@ class Flow:
         # P3：段5 快照已含配额时不再重复读屏（省 ~1.55s 的 max_scroll=6 滚动
         # 查找，且避免把刚进的任务中心页面滚走）；未取到才走原链路。
         if self._tc_entry_ratio is None:
+            # P4（2026-10-21 官方版式改版）：任务中心卡片被移到个人页最下面，
+            # 进台初始视口看不到任务行。段5 快照取不到配额 ⟺ 广告行在可见区外
+            # （同一份快照、同一判据）⇒ 直接预滑一次，跳掉 _find_row 里
+            # 「先 dump 空跑 → swipe(pause=1.0) → 再 dump」的前两步。
+            # 实测段6 3.10s → **0.84s**（生产代码 n=5）；滑一次不够时 _find_row 仍会兜底继续滑。
+            # workflow.enter_preswipe_bottom: false 一键回退。
+            if self.wf.get("enter_preswipe_bottom", True):
+                self._preswipe_to_task_row()
             self._tc_entry_ratio = self._read_ad_ratio()
         if self._tc_entry_ratio:
             logger.info("进台配额缓存 %s（屏幕 %d/%d）", name,
@@ -2110,6 +2118,38 @@ class Flow:
         except Exception as e:  # noqa: BLE001
             logger.warning("签到奖励广告异常（不阻断主流程）：%s", e)
             return False
+
+    def _preswipe_to_task_row(self) -> None:
+        """进台后长滑一次到底，把「任务中心」卡片滑进可见区（2026-10-21 版式改版）。
+
+        **背景**：官方 2026-10-21 版式把任务中心卡片移到了个人页**最下面**
+        （上面新增了顶部区/聊天特权卡），进台后的初始视口看不到任务行。
+        实测（n=22~23 进台）：段6 配额读屏 p50 由 1.60s 涨到 **3.10s**，
+        而段5 完全不受影响（外壳特征「收支详情」仍在首屏，p50 0.90s）。
+
+        段6 原来的三步（`_read_ad_ratio` → `_find_row` → `_find_scroll_match`）：
+          ① `nodes()` dump 一次 —— 视口内必然找不到广告行（~1.2s，纯空跑）
+          ② `swipe_up()` —— 固定 800px + **硬等 pause=1.0s**
+          ③ `nodes()` dump 一次 —— 命中（~0.9s）
+        合计 ~3.1s。
+
+        **判定为什么精确**：调用点只在 `_tc_entry_ratio is None` 时才进来，而该值
+        来自段5 的同一份快照、同一判据（`AD_ROW_LABELS` + 分母 `/ad_times_per_robot`）。
+        段5 快照取不到 ⟺ 广告行在可见区外 ⟺ **必然要滑**。因此可以跳过①的空 dump。
+
+        **滑动距离（真机 A/B，2026-10-21，probe_preswipe6/7）**：
+        任务中心在**页面最底部**，800px 一次滑不到位（实测 3/3 仍需内部再滑）。对比：
+          - `swipe_up` ×1（旧实现，800px）：内部又滑 3/3 → 实际退化成 2 次
+          - `swipe_up` ×2（800px×2）    ：预滑 1.59s，段6 p50 1.69s
+          - `swipe_up_far`（1600px，d300/p0.30）：预滑 0.70s，段6 p50 **0.82s**
+        落位三组完全一致（广告行 y=1653-1710 / 1680-1725，cy<1740 均在安全点击区，
+        0/3 越界）—— 过冲被页尾自然钳制，长滑反而比「滑两次」更稳定。
+
+        **兜底**：万一某台顶部区更高、长滑后仍未进入可见区，`_find_row` 会照原
+        逻辑继续双向滑动查找（max_scroll=6），总耗时与改动前持平 —— 最坏不退化。
+        workflow.enter_preswipe_bottom: false 一键回退。
+        """
+        self.ui.swipe_up_far(pause=0.3)
 
     def _read_ad_ratio(self) -> Optional[Tuple[int, int]]:
         """读「获取随机」行的 X/Y 计数（与 _ad_quota_done 同口径）。
@@ -3019,12 +3059,28 @@ class Flow:
         #     （行为与上一版完全一致）。快检命中但确认失败 → 清缓存走既有
         #     巡检 + 兜底链自愈。
         pref_early = self._prefetch_close
-        if (pref_early is not None
-                and time.time() - pref_early[1] <= float(
-                    self.wf.get("ad_prefetch_ttl", 20.0))):
+        _ttl_ok = (pref_early is not None
+                   and time.time() - pref_early[1] <= float(
+                       self.wf.get("ad_prefetch_ttl", 20.0)))
+        # P1-b（2026-10-20）：把 E1 顶条快检扩展到「无预定位」场景。
+        # 实测依据（10-20 全场 448 支，见 .workbuddy/memory/2026-10-20.md）：
+        #   预定位命中 290 支 → 关闭链均值 4.31s（顶条快检直关）
+        #   未命中 158 支   → 落到「全屏守卫 1.68s + uiautomator 1.89s」→ 5.90s
+        # 未命中的根因是「13s 预定位时点关闭按钮尚未渲染」，不是判据问题。
+        # _ad_close_pos 与 E1 用的是**同一个正向判据**（读到「关闭广告/跳过/取消」
+        # 才放行；任务中心顶栏该判据实测 0/10 误报），因此可以安全地前置于
+        # 全屏守卫：读到 → 直关（省掉守卫+uiautomator 共 3.57s）；
+        # 读不到 → 原样落回步骤 0 链路，只多花本次顶条 OCR。
+        # tc_seen=True 时不探（前置 OCR 已读到任务中心特征，顶条必为空 = 纯浪费）。
+        # workflow.ad_close_ocr_first: false 一键回退为「仅预定位命中才快检」。
+        _probe = (pref_early is None and not tc_seen
+                  and self.wf.get("ad_close_ocr_first", True))
+        if _ttl_ok or _probe:
             pos = self._ad_close_pos()
             if pos is not None:
-                logger.info("顶条快检命中关闭按钮 @ %s（E1，跳过全屏守卫）", pos)
+                logger.info("顶条快检命中关闭按钮 @ %s（%s）", pos,
+                            "E1，跳过全屏守卫" if _ttl_ok
+                            else "P1-b 无预定位前探")
                 self._tap(*pos, pause=1.5, trusted=True)
                 time.sleep(ad_close_settle)
                 self._prefetch_close = None      # 快检路径已消费

@@ -335,6 +335,31 @@ class AdbUI:
         self._notify_action()
         time.sleep(pause)
 
+    def swipe_up_far(self, pause: float = 0.3, duration_ms: int = 300):
+        """一次性长滑 1600px（y 1800 → 200），直接把页面拉到底部。
+
+        用途：目标卡片确定在**页面最底部**时，用一次长滑替代「滑 N 次 800px」。
+        实测（2026-10-21，个人页 1600px vs 2×800px，n=3~9）：
+          - 2× `swipe_up(pause=0.3)`  ：预滑 1.59s，段6 合计 1.69s
+          - 1× 本方法（d300/p0.30）   ：预滑 0.70s，段6 合计 **0.82s**
+          - 落位完全一致（广告行 y=1653-1710，均在安全点击区内）
+
+        duration 取 300ms 而非 200ms：200ms 是快速 fling，紧接的 `nodes()` 会
+        撞上滑动收尾动画（读屏 0.17~0.31s 抖动，且有 uiautomator idle 等待
+        长尾风险）；300ms 下有 0.12~0.17s 的稳定读屏。两者总耗时只差 0.05s。
+
+        注意：这不是 `swipe_up` 的替代品。`swipe_up` 的 800px 是「滚一屏」
+        语义（用于翻页查找），本方法是「钉到底」语义，只能在目标位于页尾时用。
+        越界由页面自身钳制，过冲无风险；若目标其实不在页尾，调用方仍须自行
+        双向查找兜底。
+        """
+        self._run("shell", "input", "swipe",
+                  str(SWIPE_X), "1800", str(SWIPE_X), "200",
+                  str(int(duration_ms)))
+        self._invalidate_cache()
+        self._notify_action()
+        time.sleep(pause)
+
     def swipe_down(self, pause: float = 1.0):
         """向下滑（看上方内容）。坐标空间 1080x1920 竖屏。
 

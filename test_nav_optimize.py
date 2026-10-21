@@ -595,6 +595,9 @@ class TestEnterTaskcenter(unittest.TestCase):
                 return nd("每日签到", 300)
             return None
         f._find = mock.Mock(side_effect=fake_find)
+        # P4（2026-10-21）：本用例钉的是「段5 心动卡恢复只滑 1 次」，
+        # 关掉段6 的进台预滑（那是另一处、另一个目的的动作）。
+        f.wf["enter_preswipe_bottom"] = False
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
@@ -617,6 +620,49 @@ class TestEnterTaskcenter(unittest.TestCase):
         # OCR 才是错页特征词表复核（见 TestEnterLandingAssert）。
         self.assertIn("心动卡", f._ocr_find.call_args_list[0].args)
         self.assertIn("发送", f._ocr_find.call_args_list[1].args)
+
+    # ---- P4（2026-10-21 官方版式改版）：段6 前预滑到任务中心 ----
+    def _ok_enter(self, **wf):
+        ui, f = self._f()
+        f._at_robot_list = True
+        f._enter_tap_pause = mock.Mock(
+            return_value=flow_mod.ENTER_TAP_PAUSE_REF)
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        for k, v in wf.items():
+            f.wf[k] = v
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        return ui, f, ok
+
+    def test_preswipe_when_quota_missing(self):
+        # 段5 快照没取到配额（任务行在可见区外）→ 段6 前先长滑到底，
+        # 省掉 _find_row 内部「空 dump(1.2s) + swipe(pause=1.0)」。
+        # 用一次 1600px 长滑（swipe_up_far）而非 2×800px：实测段6 0.82s vs 1.69s。
+        ui, f, ok = self._ok_enter()
+        self.assertTrue(ok)
+        ui.swipe_up_far.assert_called_once_with(pause=0.3)
+        ui.swipe_up.assert_not_called()          # 不再是「滚一屏」语义
+
+    def test_no_preswipe_when_switch_off(self):
+        ui, f, ok = self._ok_enter(enter_preswipe_bottom=False)
+        self.assertTrue(ok)
+        ui.swipe_up_far.assert_not_called()      # 一键回退生效
+
+    def test_no_preswipe_when_snapshot_has_quota(self):
+        # P3 命中（段5 快照已含配额）→ 段6 既不读屏也不预滑
+        ui, f = self._f()
+        f._at_robot_list = True
+        f._enter_tap_pause = mock.Mock(
+            return_value=flow_mod.ENTER_TAP_PAUSE_REF)
+        ui.wait_for.side_effect = [nd("发消息", 900), nd("个人", 700)]
+        ui.nodes.return_value = [nd("收支详情", 800)]
+        f._ad_ratio_from_snapshot = mock.Mock(return_value=(2, 10))
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._enter_taskcenter("某机器人")
+        self.assertTrue(ok)
+        ui.swipe_up.assert_not_called()
+        ui.swipe_up_far.assert_not_called()
+        f._read_ad_ratio.assert_not_called()
 
 
 # ----------------------------------------------------------------------
@@ -991,7 +1037,10 @@ class TestEnterEarlyOcr(unittest.TestCase):
     def test_early_ocr_hit_promo_swipes_and_reuses_scan(self):
         # 提前复核命中心动卡促销版式 → 上滑重探；且不再单独扫一次 promo OCR
         ui, f = self._f(miss=2, scan=(False, False, False, True),
-                        wf_extra={"enter_early_ocr_polls": 1})
+                        wf_extra={"enter_early_ocr_polls": 1,
+                                  # P4（2026-10-21）：本用例钉「段5 心动卡恢复只滑
+                                  # 1 次」，关掉段6 的进台预滑以免串扰计数
+                                  "enter_preswipe_bottom": False})
         f._find = mock.Mock(side_effect=lambda t, *a, **k:
                             nd("每日签到", 600) if t == "每日签到" else None)
         with mock.patch.object(flow_mod.time, "sleep"):

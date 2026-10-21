@@ -615,7 +615,11 @@ class TestCloseAd(Base):
             side_effect=lambda *a, **k: calls.append("ocr") or None)
         f.ui.nodes = mock.Mock(
             side_effect=lambda *a, **k: calls.append("ui") or [])
-        f.wf = {"ad_close_retries": 1}
+        f.wf = {"ad_close_retries": 1,
+                # P1-b（2026-10-20）：本用例钉的是「uiautomator 先于 OCR」的
+                # 旧顺序语义，须显式关掉「无预定位顶条前探」开关；
+                # 开关开启后的新顺序由 TestNoPrefetchOcrProbe 覆盖。
+                "ad_close_ocr_first": False}
         f._close_ad()
         # 步 0：tc OCR 首检 miss → 步 1：uiautomator 直关尝试
         self.assertEqual(calls[:2], ["ocr", "ui"])
@@ -637,6 +641,8 @@ class TestCloseAd(Base):
         f.ui.nodes.return_value = [node]
         f._ocr_find = self._ocr_router(tc=[])          # 任务中心双检均 miss
         f._back_at_taskcenter = mock.Mock(return_value=True)
+        # P1-b：本用例断言「OCR 一次都不跑」，须关掉无预定位顶条前探
+        f.wf["ad_close_ocr_first"] = False
         self.assertTrue(f._close_ad())
         f._tap_node.assert_called_once_with(node, pause=1.5)
         f._tap.assert_not_called()                     # 未走 OCR 坐标点击
@@ -1222,6 +1228,78 @@ class TestQuickCheckDirectClose(Base):
         f.ui.nodes.return_value = [Node("某文本", 0, 0, 10, 10)]
         self.assertFalse(f._close_ad())
         self.assertTrue(f.ui.nodes.called)                  # 快照已尝试读取
+
+
+class TestNoPrefetchOcrProbe(Base):
+    """P1-b（2026-10-20）：无预定位时顶条 OCR 前探，跳过全屏守卫 + uiautomator。
+
+    真机依据（10-20 全场 448 支关闭链实测）：
+      预定位命中 290 支 → 顶条快检直关，均值 4.31s
+      预定位未命中 158 支 → 全屏守卫 1.68s + uiautomator 1.89s，均值 5.90s
+    未命中根因是「13s 预定位时点按钮尚未渲染」，不是判据问题。
+    _ad_close_pos 与 E1 用**同一个正向判据**（读到「关闭广告/跳过/取消」才
+    放行，任务中心顶栏 0/10 误报），故可前置于守卫。
+    """
+
+    def _stub(self, probe_hit=True):
+        f = self.f
+        f.ui = mock.Mock()
+        f.ui.dump_fail_streak = 0
+        f._tap = mock.Mock()
+        f._tap_node = mock.Mock()
+        f._confirm_direct_close = mock.Mock(return_value=True)
+        f._find_close_node = mock.Mock(return_value=None)
+        f._ad_close_pos = mock.Mock(
+            return_value=(120, 152) if probe_hit else None)
+        f._dismiss_badcase = mock.Mock()
+        f._back_at_taskcenter = mock.Mock(return_value=False)
+        f.wf["ad_close_retries"] = 1
+        f.wf["ad_close_ocr_first"] = True
+        f._prefetch_close = None       # 关键前提：没有预定位缓存
+        # 记录「进入步骤 0 全屏守卫那一刻，顶条 OCR 已被调用几次」——
+        # 只有这样才能区分「前探没做」与「前探做了但后续兜底链又调」。
+        f._probe_cnt_at_guard = []
+        f._taskcenter_confirmed_by_ocr = mock.Mock(
+            side_effect=lambda *a, **k: (
+                f._probe_cnt_at_guard.append(f._ad_close_pos.call_count),
+                False)[1])
+        return f
+
+    def test_probe_hit_skips_guard_and_dump(self):
+        f = self._stub(probe_hit=True)
+        self.assertTrue(f._close_ad(tc_seen=False))
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._taskcenter_confirmed_by_ocr.assert_not_called()   # 跳过全屏守卫
+        f._find_close_node.assert_not_called()               # 跳过 uiautomator
+        self.assertEqual(f._ad_close_pos.call_count, 1)      # 只有前探这一次
+
+    def test_probe_miss_falls_back_to_full_chain(self):
+        f = self._stub(probe_hit=False)
+        f._close_ad(tc_seen=False)
+        f._taskcenter_confirmed_by_ocr.assert_called()       # 落回步骤 0 守卫
+        f._find_close_node.assert_called()                   # 走既有定位链
+        # 进守卫之前顶条 OCR 已调用过 1 次 = 确实做了前探
+        self.assertEqual(f._probe_cnt_at_guard[0], 1)
+
+    def test_tc_seen_never_probes(self):
+        # tc_seen=True：前置 OCR 已读到任务中心特征 → 顶条必为空，不做前探
+        f = self._stub(probe_hit=False)
+        f._close_ad(tc_seen=True)
+        self.assertEqual(f._probe_cnt_at_guard[0], 0)
+
+    def test_switch_off_restores_pure_e1(self):
+        f = self._stub(probe_hit=False)
+        f.wf["ad_close_ocr_first"] = False
+        f._close_ad(tc_seen=False)
+        self.assertEqual(f._probe_cnt_at_guard[0], 0)        # 无预定位+开关关=不前探
+
+    def test_prefetch_still_uses_e1_path(self):
+        # 回归保护：有预定位时行为不变（走 E1，日志仍是 E1 语义）
+        f = self._stub(probe_hit=True)
+        f._prefetch_close = ((141, 150), flow_mod.time.time())
+        self.assertTrue(f._close_ad(tc_seen=False))
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        self.assertIsNone(f._prefetch_close)                 # 缓存已消费
 
 
 class TestOcrShotChannel(Base):

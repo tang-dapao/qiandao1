@@ -1297,3 +1297,37 @@ EDF 轮换 + C1/C4 分布抖动 + C5/C6/C7 + E1 量化验收。第 2 批已落�
 5. 若 FAQ/资料/聊天/profile：多点几次 `input keyevent 4` 退回列表。
 6. 若桌面：用 am start 拉回 QQ 再导航。
 7. 确认回到机器人列表后再跑下一步流程。
+
+---
+
+## 坑 32 · 真实 QQ 号已脱敏：`config.yaml` 里是占位号，必须靠 `accounts.local.yaml`
+
+**背景（2026-10-21）**：仓库公开，`config.yaml` / `README.md` / `MEMORY.md` /
+`test_account_switch.py` 曾出现 4 个真实 UIN。已全部替换为占位号，并 `filter-branch`
+重写全部 35 个提交后强推。
+
+### 现行机制（改代码前必读）
+- `config.yaml → accounts.list` 的 `uin` 是**占位号** `1000000001~1000000004`
+  （顺序固定对应 唐六爻 / 王 / 觅夏 / 唐灵）。
+- 真实号只存在**本机** `accounts.local.yaml`（已在 `.gitignore`）。
+- `main.py: load_config()` 读完 config 后，若**同目录**有该文件，执行
+  `cfg["accounts"].update(local["accounts"])` —— **按键覆盖**，所以本地只写
+  `list` 时 `enabled / settle / max_retry / ready_stable / ready_timeout`
+  仍取 `config.yaml`。
+- 提示信息收集在 `_LOAD_NOTES`，`setup_logging()` 之后再输出（否则 INFO 会被吞）。
+
+### ⚠️ 故障特征
+- **换机 / 重装 / 删了 `accounts.local.yaml`** → 切号会用占位号去 dump 里找 UIN 文本
+  → **定位不到账号**，`_switch_account` 失败重试后整轮多账号流程报废。
+  日志里会看到 `accounts 已由本地 accounts.local.yaml 覆盖` **缺失**，以及切号 FAIL。
+- 修复：从备份恢复该文件（4 行 nick + uin 即可，其他键不用写）。
+
+### 相关坑（本次踩到，通用）
+- **bash 内联 `python -c "..."` 里不能出现反引号**：会被 bash 当命令替换**真的执行**。
+  本次因此意外跑了一次 `git filter-branch`（filter 路径不存在 → 立即失败，未改 refs），
+  并留下 `.git-rewrite/` 目录。**长文本一律先 Write 到临时 .md 再读文件追加。**
+- `git add -A` 会吞无关目录（本次吞进 `downloads/` 里 6 个 apk）→
+  `downloads/` 已加入 `.gitignore`；提交前先 `git status --short` 核对。
+- `git filter-repo` 在本机**未安装**；重写历史用
+  `git filter-branch -f --tree-filter "py -3.13 <temp>/redact_uins.py" -- master`
+  （`-- master` 而非 `-- --all`，避免动 `refs/remotes/origin/master`）。

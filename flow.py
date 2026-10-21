@@ -412,6 +412,27 @@ class Flow:
         ratio = self._row_completion(n)
         return btn, n, ratio
 
+    def _find_task_row(self, label: str, alt_labels: Tuple[str, ...] = ()
+                       ) -> Optional[Tuple[Node, Node, Optional[Tuple[int, int]]]]:
+        """找任务中心行（签到/反馈），**未命中时先长滑到底再重找一次**。
+
+        为什么需要（2026-10-21 官方版式改版）：任务中心卡片整体在个人页
+        **最下面**，`_find_row` 的兜底滚动是「800px 一步 + pause=1.0」的通用
+        翻页语义（机器人列表也用它，必须逐步走）。万一进台预滑没到位、或页面
+        中途被重绘/促销卡顶下去，签到/反馈会先空滚 1~2 步（~2.8s）才命中，
+        甚至直接判「未找到行」→ 失败重试（历史 8 次，10-09/10-11 各 4 次）。
+
+        修法只加在**未命中分支**（成功路径零成本）：miss 后补一次
+        `swipe_up_far()`（1600px 钉到页尾，0.45s）再重找 —— 行在页尾时一步到位。
+        workflow.task_row_fallback_far: false 一键回退为「miss 即返回 None」。
+        """
+        row = self._find_row(label, alt_labels=alt_labels)
+        if row is None and self.wf.get("task_row_fallback_far", True):
+            logger.info("未找到 %s 行 → 长滑到底后重找一次", label)
+            self.ui.swipe_up_far(pause=0.3)
+            row = self._find_row(label, alt_labels=alt_labels)
+        return row
+
     # ----------------------------------------------------------
     # 页面卡死检测与诊断（P0：防 dump 连续失败空转 / 盲点乱导航）
     # ----------------------------------------------------------
@@ -1448,7 +1469,12 @@ class Flow:
                     logger.info("提前 OCR 复核命中心动卡促销版式"
                                 "→ 上滑后重探任务行")
                 for _ in range(2):
-                    self.ui.swipe_up()
+                    # P4（2026-10-21）：与段6 预滑同一套语义 —— 任务行在个人页
+                    # **最下面**，一次 1600px 长滑到底即命中；原 800px 要滑 2 次
+                    # （每次还带 pause=1.0，共 ~2.8s）。长滑 2 次共 ~0.9s，
+                    # 且第 2 次已到底（无位移、无害），仍保留「2 次仍探不到才判
+                    # 失败」的兜底语义。
+                    self.ui.swipe_up_far(pause=0.3)
                     if (self._find("每日签到") or self._find("任务中心")
                             or self._find("获取随机") or self._find("看广告")
                             or self._find("看视频赚电量")):
@@ -1700,7 +1726,7 @@ class Flow:
         # 汇总记账辅助位：本次调用是"真签到成功"还是"已签跳过"（True=跳过）。
         # 供 run_robot 区分汇总表里的 成功/已签，不改 bool 返回契约。
         self._signin_already = False
-        row = self._find_row("每日签到")
+        row = self._find_task_row("每日签到")
         if not row:
             logger.warning("未找到 每日签到 行；屏内文本=%s", self._screen_texts())
             return False
@@ -1765,7 +1791,7 @@ class Flow:
         logger.info("== 问题反馈 ==")
         # 汇总记账辅助位：本次调用是"真反馈成功"还是"已反馈跳过"（True=跳过）。
         self._feedback_already = False
-        row = self._find_row("问题反馈")
+        row = self._find_task_row("问题反馈")
         if not row:
             logger.warning("未找到 问题反馈 行；屏内文本=%s", self._screen_texts())
             return False

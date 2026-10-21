@@ -223,6 +223,13 @@ workflow:
   # 兜底：长滑后仍看不到任务行时 _find_row 按原逻辑双向继续滑（最坏与改动前持平）。
   # false = 一键回退（段6 仍能用，只是恢复 3.1s 的空 dump + 硬等）。
   enter_preswipe_bottom: true
+  # 2026-10-21 P4-b：签到/反馈找行**未命中**时的兜底 —— 补一次 1600px 长滑到底
+  # 再重找一次。成功路径零成本（只在 miss 分支付出 0.45s + 一次 dump）。
+  # 依据：任务行在个人页最下面，`_find_row` 的兜底滚动是通用「800px/步 + pause=1.0」
+  # 翻页语义（机器人列表共用，不能整体换成长滑）；miss 后长滑一步基本必中。
+  # 同时段5 心动卡恢复的 2×800px 上滑也一并换成 swipe_up_far（~2.8s → ~0.9s）。
+  # false = 回退为「miss 即返回 None（判失败）」。
+  task_row_fallback_far: true
   # 2026-10-12 P2（方案 F）：OCR 取图**优先走感知后端原生通道** ——
   # u2 的 screenshot_pil（设备端 :9008 直取 PNG）实测 0.07~0.17s，对比
   # adb exec-out screencap 的 0.46~0.50s 快约 5x（probe_f_ocr.py 实测）。

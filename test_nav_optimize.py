@@ -570,14 +570,16 @@ class TestEnterTaskcenter(unittest.TestCase):
         return ui, f
 
     def test_wrongpage_ocr_hit_returns_false(self):
-        # A：OCR 命中心动卡促销卡 → 上滑 2 次重探任务行（P-心动卡），
+        # A：OCR 命中心动卡促销卡 → 长滑 2 次重探任务行（P-心动卡），
         # 仍探不到才判进入失败（交上层复位重试）
         ui, f = self._enter_timeout()
         f._ocr_find.return_value = (540, 300)
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertFalse(ok)
-        self.assertEqual(ui.swipe_up.call_count, 2)
+        # P4-b（2026-10-21）：改为一次 1600px 长滑（行在页尾），不再是 2×800px
+        self.assertEqual(ui.swipe_up_far.call_count, 2)
+        ui.swipe_up.assert_not_called()
         f._diag_shot.assert_called_once_with("enter_wrongpage")
         self.assertFalse(f._at_robot_list)
 
@@ -587,7 +589,8 @@ class TestEnterTaskcenter(unittest.TestCase):
         ui, f = self._enter_timeout()
         f._ocr_find.return_value = (540, 300)
         state = {"swipes": 0}
-        ui.swipe_up.side_effect = lambda *a, **k: state.__setitem__(
+        # P4-b（2026-10-21）：心动卡恢复改用一次 1600px 长滑（swipe_up_far）
+        ui.swipe_up_far.side_effect = lambda *a, **k: state.__setitem__(
             "swipes", state["swipes"] + 1)
 
         def fake_find(text, *a, **k):
@@ -601,7 +604,7 @@ class TestEnterTaskcenter(unittest.TestCase):
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
-        self.assertEqual(ui.swipe_up.call_count, 1)
+        self.assertEqual(ui.swipe_up_far.call_count, 1)
         f._diag_shot.assert_not_called()
         self.assertEqual(f._at_robot_list, False)     # 进入后清快路径状态
 
@@ -663,6 +666,66 @@ class TestEnterTaskcenter(unittest.TestCase):
         ui.swipe_up.assert_not_called()
         ui.swipe_up_far.assert_not_called()
         f._read_ad_ratio.assert_not_called()
+
+
+# ----------------------------------------------------------------------
+# P4-b（2026-10-21）：_find_task_row —— 签到/反馈找行未命中时长滑兜底
+# ----------------------------------------------------------------------
+class TestFindTaskRow(unittest.TestCase):
+    ROW = (nd("每日签到", 900), nd("每日签到", 900), (0, 1))
+
+    def _f(self, wf=None):
+        ui = mock.Mock()
+        f = Flow.__new__(Flow)
+        f._init_cache_state()
+        f.ui = ui
+        f.t = {"click_min": 1.5, "click_max": 3.0, "page_wait": 2.0,
+               "taskcenter_wait": 3.5}
+        f.wf = dict(wf or {})
+        return ui, f
+
+    def test_hit_first_try_no_far_swipe(self):
+        # 命中路径零额外动作（不能给成功路径加成本）
+        ui, f = self._f()
+        f._find_row = mock.Mock(return_value=self.ROW)
+        self.assertEqual(f._find_task_row("每日签到"), self.ROW)
+        ui.swipe_up_far.assert_not_called()
+        self.assertEqual(f._find_row.call_count, 1)
+
+    def test_miss_then_far_swipe_recovers(self):
+        # 首次未命中 → 一次 1600px 长滑到底 → 重找命中
+        ui, f = self._f()
+        f._find_row = mock.Mock(side_effect=[None, self.ROW])
+        self.assertEqual(f._find_task_row("问题反馈"), self.ROW)
+        ui.swipe_up_far.assert_called_once_with(pause=0.3)
+        self.assertEqual(f._find_row.call_count, 2)
+
+    def test_miss_twice_returns_none(self):
+        # 长滑后仍未命中（真错页/版式不同）→ 返回 None，交上层判失败
+        ui, f = self._f()
+        f._find_row = mock.Mock(return_value=None)
+        self.assertIsNone(f._find_task_row("每日签到"))
+        self.assertEqual(ui.swipe_up_far.call_count, 1)
+        self.assertEqual(f._find_row.call_count, 2)
+
+    def test_knob_off_restores_plain_miss(self):
+        # task_row_fallback_far=false → 一键回退：miss 即返回 None，不滑
+        ui, f = self._f({"task_row_fallback_far": False})
+        f._find_row = mock.Mock(return_value=None)
+        self.assertIsNone(f._find_task_row("每日签到"))
+        ui.swipe_up_far.assert_not_called()
+        self.assertEqual(f._find_row.call_count, 1)
+
+    def test_signin_and_feedback_route_through_helper(self):
+        # 签到/反馈都必须改走 _find_task_row（否则拿不到长滑兜底）
+        ui, f = self._f()
+        f._find_task_row = mock.Mock(return_value=None)
+        f._screen_texts = mock.Mock(return_value="")
+        self.assertFalse(f._signin())
+        self.assertEqual(f._find_task_row.call_args[0][0], "每日签到")
+        f._find_task_row.reset_mock()
+        self.assertFalse(f._feedback())
+        self.assertEqual(f._find_task_row.call_args[0][0], "问题反馈")
 
 
 # ----------------------------------------------------------------------
@@ -1046,7 +1109,7 @@ class TestEnterEarlyOcr(unittest.TestCase):
         with mock.patch.object(flow_mod.time, "sleep"):
             ok = f._enter_taskcenter("某机器人")
         self.assertTrue(ok)
-        self.assertEqual(ui.swipe_up.call_count, 1)
+        self.assertEqual(ui.swipe_up_far.call_count, 1)   # P4-b：长滑一次命中
         f._fullscreen_scan4.assert_called_once()
         f._ocr_find.assert_not_called()                # 复用快照 → 省一次全屏 OCR
 

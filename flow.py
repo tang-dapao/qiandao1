@@ -286,6 +286,12 @@ class Flow:
         # 广告页从未打开（未计入）」→ _watch_ads_session 收尾据此决定是否
         # 读屏复核配额（详见 _verify_session_quota）。
         self._ad_close_suspicious = False
+        # N4-a（2026-10-22）：本次「点开广告」是否**根本没打开广告页**
+        # （无 fill / 点击被吞）。与 _ad_close_suspicious 的区别：那个是
+        # 「不确定有没有计入」，这个是「确定什么都没发生」——由
+        # `_ad_landing_is_taskcenter` 三连 dump 判定，命中后
+        # `_watch_ad_once` 会补点一次，且不再白等 16s 等待窗。
+        self._ad_not_opened = False
         # 反馈内容已用集合（2026-09-26）：None=未从记录文件懒加载；单测可预设
         # 空 set 跳过文件 IO。防重细节见 _new_feedback_text。
         self._fb_used = None
@@ -2068,7 +2074,25 @@ class Flow:
                         ratio[0], ratio[1], target)
             return True
         self._tap_node(btn)
-        return self._ad_play_and_close()
+        ok = self._ad_play_and_close()
+        # N4-c（2026-10-22）：广告页压根没打开 → 重取行节点**补点一次**。
+        # 与「发消息 / 个人」被吞同源：QQ 会吞掉一次点击（no-op），补点即可救回
+        # （10-16 探针 60+40 样本实测补点 100% 救回）。这里只在
+        # `_ad_not_opened`（双 dump 确定停在任务中心）时补点；状态未知一律不补，
+        # 避免在「加载慢」时重复开广告。
+        # workflow.ad_open_retry: false 可回退为「不补点，直接算这支失败」。
+        if (not ok and getattr(self, "_ad_not_opened", False)
+                and self.wf.get("ad_open_retry", True)):
+            self._ad_not_opened = False
+            logger.warning("广告未打开 → 重取行节点补点一次")
+            row2 = self._find_row(AD_ROW_LABELS[0],
+                                  alt_labels=AD_ROW_LABELS[1:])
+            if row2:
+                self._tap_node(row2[0])
+                ok = self._ad_play_and_close()
+            else:
+                logger.warning("补点时已找不到广告行（页面已变），放弃本支")
+        return ok
 
     def _ad_play_and_close(self, sheet_ok: bool = False) -> bool:
         """广告点击后的共用段（2026-09-16 从 _watch_ad_once 原样抽出）：
@@ -2085,10 +2109,23 @@ class Flow:
         # 判据 = dump 出现「点击进入」（ad 页 dump 实测 0.05s，探针两次 ≈0.1s，
         # 且时间从 ad_wait 里扣除，**成功路径总时长不变**）。
         t_play0 = time.time()          # 点开广告的时刻（探针/预定位都相对它计时）
+        self._ad_not_opened = False     # N4-a：本支的「没打开」标记，入口重置
         if self.wf.get("ad_minigame", True):
             mg_cta = self._probe_minigame_ad(t_play0)
             if mg_cta is not None:
                 return self._play_minigame_ad(mg_cta, sheet_ok=sheet_ok)
+        # N4-a（2026-10-22）：点开校验 —— 广告页压根没打开就别白等 16s。
+        # 见 `_ad_landing_is_taskcenter` docstring（探针里连续复现「返回 True /
+        # 可疑=True / 配额不动」，即点了广告行什么都没发生）。
+        # 判定窗口 (4.0s, 6.0s) 落在 ad_wait 之内，成功路径**不增加**总时长。
+        # workflow.ad_open_guard: false 可整体回退。
+        if (self.wf.get("ad_open_guard", True)
+                and self._ad_landing_is_taskcenter(t_play0)):
+            logger.warning("点开广告后仍停在任务中心（%.1fs）→ 判定广告未打开"
+                           "（无 fill / 点击被吞），不再空等 %.1fs",
+                           time.time() - t_play0, wait)
+            self._ad_not_opened = True
+            return False
         # E 优化（2026-09-14）：把「关闭按钮预定位」藏进等待窗口。
         # 视频播放期 uiautomator dump 必然失败（UI 不 idle），但 OCR 截屏不依赖
         # idle —— 等待进行到 ad_prefetch_at 秒时用顶条 OCR 预定位「关闭广告」并
@@ -2120,6 +2157,19 @@ class Flow:
         # _close_ad 步骤 0 的双重 OCR 确认兜底（语义等价，且常见路径由原来的
         # "预检 + _close_ad 复检" 2 次 OCR 降为 1 次）；tap 未触发的极端 case
         # 靠下次进台读实际计数自然纠偏（实测 0 例）。
+        # N4-b（2026-10-22）：顶条还挂着「倒计时 Ns」→ 补等再关。
+        # 证据：t≈17s 时倒计时还剩 5s，此时点「关闭广告」→ 弹
+        # 「至少需要观看15秒视频才能获得有效奖励哦」→ 该支**白看** + 多花 11.9s
+        # 走弹窗。读一次 dump（0.05~0.07s）确认没有倒计时才关，成本可忽略。
+        # 上限 ad_countdown_max 秒（默认 12）防异常长的倒计时把整轮拖住。
+        # workflow.ad_countdown_wait: false 可回退。
+        if self.wf.get("ad_countdown_wait", True):
+            left = self._ad_countdown_left()
+            if left > 0:
+                left = min(left, int(self.wf.get("ad_countdown_max", 12)))
+                logger.info("顶条仍显示「倒计时 %ds」→ 补等 %.1fs 再关（防无奖励）",
+                            left, left + 0.6)
+                time.sleep(left + 0.6)
         # 关闭广告：关键！广告页 WebView 文字 uiautomator 读不到（会穿透读到
         # 背景任务中心，导致误判），必须用 OCR 检测「关闭广告」并读取其坐标，
         # 主动点击后再次用 OCR 确认该按钮消失。从实测看「关闭广告」在左上角。
@@ -3188,6 +3238,65 @@ class Flow:
             if "跳过" in t or t.startswith("关闭"):
                 cands.append(n)
         return min(cands, key=lambda n: n.x1) if cands else None
+
+    # ---- N4（2026-10-22）：点开校验 + 倒计时补等 ----
+    # 广告页特征词（任一命中即视为「广告确实打开了」）。注意：任务中心的广告行
+    # 「看视频赚电量」和按钮「获取随机」都**不含**这些词，不会被误认。
+    _AD_OPEN_HINTS = ("关闭广告", "跳过", "倒计时", "关闭声音",
+                      "点击进入", "小游戏体验", "还需体验")
+    _TC_OPEN_KEYS = ("收支详情", "当前电量", "去充电",
+                     "每日签到", "看视频赚电量", "获取随机")
+    _COUNTDOWN_RE = re.compile(r"倒计时\s*([0-9]{1,2})\s*[sS秒]")
+
+    def _ad_landing_is_taskcenter(self, t_play0: float) -> bool:
+        """点开广告后「连续两次 dump 都停在任务中心」→ 判定广告**没打开**。
+
+        N4-a（2026-10-22）。背景：探针里连续出现「`_watch_ad_once` 返回 True、
+        可疑=True、配额不动」—— 广告行点了根本没打开广告（无 fill / 点击被吞），
+        而 `_close_ad` 的 OCR 守卫看到任务中心就返回成功，于是**白等满一个
+        16s 等待窗**。生产 199 支里这类空跑靠坑 25 屏幕真值重锚兜住不丢配额，
+        但时间照赔。
+
+        判据（双 dump 串联，任一环节不成立就按「已打开」保守处理）：
+          - 任一次看到 `_AD_OPEN_HINTS`（关闭广告/跳过/倒计时/关闭声音/…）
+            → 广告页在，正常往下走；
+          - 任一次**既不是广告页也不是任务中心** → 状态未知（加载中/插屏），
+            按已打开处理，绝不在不确定时宣告「没打开」；
+          - 两次都稳定读到 `_TC_OPEN_KEYS` → 判定没打开。
+        时点 (4.0s, 6.0s) 都在 ad_wait 等待窗**之内**，成功路径不增加总时长
+        （探针只多花 0.06s dump）；只有真没打开时才省下剩余的 ~10s。
+
+        timeout 用 2.5s 而不是 0.5s：任务中心是 WebView，u2 dump 可能到 1.9s
+        （坑 20）；超时返回 [] 会让判据恒 False，守卫直接失效。
+        """
+        at_list = self.wf.get("ad_open_guard_at") or (4.0, 6.0)
+        for at in at_list:
+            d = float(at) - (time.time() - t_play0)
+            if d > 0:
+                time.sleep(d)
+            texts = [(n.text or "").strip() for n in self.ui.nodes(timeout=2.5)]
+            texts = [t for t in texts if t]
+            if any(h in t for t in texts for h in self._AD_OPEN_HINTS):
+                return False
+            if not any(t in self._TC_OPEN_KEYS for t in texts):
+                return False
+        return True
+
+    def _ad_countdown_left(self, timeout: float = 0.5) -> int:
+        """顶条「倒计时 Ns」的剩余秒数（0 = 没有倒计时）。
+
+        N4-b（2026-10-22）。证据：探针两次撞到 t≈17s 时顶条仍挂着
+        `倒计时5s`，此时点「关闭广告」会弹
+        「至少需要观看15秒视频才能获得有效奖励哦」→ **这一支白看**，
+        而且关闭链要 11.9s 走弹窗。生产 199 支里出现 1 次（低频但纯亏）。
+        只读 dump（0.05~0.07s）；多个倒计时取**最大**（宁多等不少等）。
+        """
+        left = 0
+        for n in self.ui.nodes(timeout=timeout):
+            m = self._COUNTDOWN_RE.search(n.text or "")
+            if m:
+                left = max(left, int(m.group(1)))
+        return left
 
     def _find_close_node(self, timeout: Optional[float] = None) -> Optional[Node]:
         """uiautomator 定位广告页关闭按钮节点，返回 Node（None = 未命中）。

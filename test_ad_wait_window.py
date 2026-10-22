@@ -52,7 +52,11 @@ def make_flow(wf_extra=None):
             "ad_prefetch_pos": True,
             # N1（2026-10-22）：本文件只测"等待窗扣时"，关掉试玩版式探针以隔离
             # 新变量（否则 mock 的 ui.nodes() 会返回 Mock 导致不可迭代）。
-            "ad_minigame": False}
+            "ad_minigame": False,
+            # N4（2026-10-22）：同理关掉「点开校验」「倒计时补等」——
+            # 否则等待窗会被补等撑长，本文件的严格等式断言失去意义。
+            # 这两项的专门用例见 TestAdOpenGuard / TestAdCountdownWait。
+            "ad_open_guard": False, "ad_countdown_wait": False}
     f.wf.update(wf_extra or {})
     return f
 
@@ -361,6 +365,156 @@ class TestMinigameProbe(unittest.TestCase):
             f._ad_play_and_close()
         self.assertEqual(ui.dump_calls, 0)
         f._play_minigame_ad.assert_not_called()
+
+
+class TestAdOpenGuard(unittest.TestCase):
+    """N4-a（2026-10-22）：点开广告后校验「广告页真的打开了」。
+
+    背景：探针连续复现「_watch_ad_once 返回 True / 可疑=True / 配额不动」——
+    广告行点了根本没打开广告（无 fill / 点击被吞），_close_ad 的 OCR 守卫
+    看到任务中心就返回成功，于是白等满一个 16s 窗口。
+    """
+
+    TC_SCREEN = [nd("收支详情", 120), nd("每日签到", 1218),
+                 nd("看视频赚电量", 1653)]
+    AD_SCREEN = [nd("关闭广告", 104, x1=32), nd("倒计时 14s", 104, x1=702)]
+
+    def _run(self, nodes, wf_extra=None, wait=16.0):
+        clock = _Clock()
+        f = make_flow({"ad_open_guard": True, "ad_open_guard_at": [4.0, 6.0],
+                       "ad_prefetch_pos": False, "ad_countdown_wait": False})
+        f.wf.update(wf_extra or {})
+        f.ui = _ScreenUI(nodes)
+        f._prefetch_ad_close_pos = mock.Mock()
+        f._close_ad = mock.Mock(return_value=True)
+        with mock.patch.object(flow_mod, "time", clock.ns), \
+                mock.patch.object(flow_mod.random, "uniform",
+                                  lambda a, b: wait):
+            start = clock.t
+            ok = f._ad_play_and_close()
+            elapsed = clock.t - start
+        return f, ok, elapsed
+
+    def test_two_tc_dumps_means_not_opened(self):
+        """两次都稳定读到任务中心 → 判没打开，立刻返回 False（不空等 16s）。"""
+        f, ok, elapsed = self._run(self.TC_SCREEN)
+        self.assertFalse(ok)
+        self.assertTrue(f._ad_not_opened)
+        self.assertLess(elapsed, 7.0)       # 只花了两个探针点，没等满 16s
+        f._close_ad.assert_not_called()
+
+    def test_ad_page_seen_proceeds_and_exact_wait(self):
+        """看到广告页特征 → 正常往下走，且总时长仍严格 = wait。"""
+        f, ok, elapsed = self._run(self.AD_SCREEN)
+        self.assertTrue(ok)
+        self.assertFalse(f._ad_not_opened)
+        self.assertAlmostEqual(elapsed, 16.0, places=2)
+
+    def test_unknown_screen_is_treated_as_opened(self):
+        """dump 读不到东西（加载中/超时）→ 不确定 → 按已打开处理，绝不误判。"""
+        f, ok, elapsed = self._run([])
+        self.assertTrue(ok)
+        self.assertFalse(f._ad_not_opened)
+        self.assertAlmostEqual(elapsed, 16.0, places=2)
+
+    def test_knob_off_skips_guard(self):
+        f, ok, elapsed = self._run(self.TC_SCREEN,
+                                   {"ad_open_guard": False})
+        self.assertTrue(ok)
+        self.assertFalse(f._ad_not_opened)
+        self.assertAlmostEqual(elapsed, 16.0, places=2)
+
+
+class TestAdOpenRetry(unittest.TestCase):
+    """N4-c：判定没打开 → 重取行节点补点一次（与「发消息」被吞同源）。"""
+
+    def _f(self, results):
+        f = make_flow()
+        f.wf.update({"ad_times_per_robot": 10})
+        f.ui = _ScreenUI([])
+        f._find_row = mock.Mock(
+            return_value=(mock.Mock(), mock.Mock(), (2, 10)))
+        f._tap_node = mock.Mock()
+        seq = list(results)
+
+        def _pac(**kw):
+            r = seq.pop(0)
+            f._ad_not_opened = r[1]
+            return r[0]
+
+        f._ad_play_and_close = _pac
+        return f
+
+    def test_retries_once_and_succeeds(self):
+        f = self._f([(False, True), (True, False)])
+        self.assertTrue(f._watch_ad_once())
+        self.assertEqual(f._tap_node.call_count, 2)   # 补点一次
+
+    def test_no_retry_when_flag_not_set(self):
+        """只是失败、并非「没打开」→ 不补点（避免重复开广告）。"""
+        f = self._f([(False, False)])
+        self.assertFalse(f._watch_ad_once())
+        self.assertEqual(f._tap_node.call_count, 1)
+
+    def test_gives_up_when_row_gone(self):
+        """补点时已找不到广告行（页面已变）→ 放弃，不盲点。"""
+        f = self._f([(False, True)])
+        f._find_row = mock.Mock(side_effect=[
+            (mock.Mock(), mock.Mock(), (2, 10)), None])
+        self.assertFalse(f._watch_ad_once())
+        self.assertEqual(f._tap_node.call_count, 1)
+
+
+class TestAdCountdownWait(unittest.TestCase):
+    """N4-b：顶条还挂着「倒计时 Ns」就关 → 该支白看，故先补等。"""
+
+    def _run(self, nodes, wf_extra=None, wait=16.0):
+        clock = _Clock()
+        f = make_flow({"ad_open_guard": False, "ad_countdown_wait": True,
+                       "ad_prefetch_pos": False})
+        f.wf.update(wf_extra or {})
+        f.ui = _ScreenUI(nodes)
+        f._prefetch_ad_close_pos = mock.Mock()
+        f._close_ad = mock.Mock(return_value=True)
+        with mock.patch.object(flow_mod, "time", clock.ns), \
+                mock.patch.object(flow_mod.random, "uniform",
+                                  lambda a, b: wait):
+            start = clock.t
+            ok = f._ad_play_and_close()
+            elapsed = clock.t - start
+        return f, ok, elapsed
+
+    def test_countdown_left_parsing(self):
+        f = make_flow()
+        f.ui = _ScreenUI([nd("倒计时5s", 104), nd("倒计时 12s", 104),
+                          nd("关闭广告", 104)])
+        self.assertEqual(f._ad_countdown_left(), 12)      # 取最大
+        f.ui = _ScreenUI([nd("关闭广告", 104)])
+        self.assertEqual(f._ad_countdown_left(), 0)
+
+    def test_countdown_extends_wait(self):
+        _, ok, elapsed = self._run([nd("关闭广告", 104, x1=32),
+                                    nd("倒计时5s", 104, x1=702)])
+        self.assertTrue(ok)
+        self.assertAlmostEqual(elapsed, 16.0 + 5.6, places=1)
+
+    def test_no_countdown_keeps_exact_wait(self):
+        _, ok, elapsed = self._run([nd("关闭广告", 104, x1=32)])
+        self.assertTrue(ok)
+        self.assertAlmostEqual(elapsed, 16.0, places=2)
+
+    def test_countdown_capped_by_knob(self):
+        _, ok, elapsed = self._run(
+            [nd("倒计时 40s", 104, x1=702)],
+            {"ad_countdown_max": 12})
+        self.assertTrue(ok)
+        self.assertAlmostEqual(elapsed, 16.0 + 12.6, places=1)
+
+    def test_knob_off_no_extension(self):
+        _, ok, elapsed = self._run([nd("倒计时5s", 104, x1=702)],
+                                   {"ad_countdown_wait": False})
+        self.assertTrue(ok)
+        self.assertAlmostEqual(elapsed, 16.0, places=2)
 
 
 if __name__ == "__main__":

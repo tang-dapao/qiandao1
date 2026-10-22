@@ -1171,7 +1171,10 @@ class TestPrefetchClose(Base):
                      "ad_times_per_robot": 10, "ad_prefetch_pos": False,
                      # N1（2026-10-22）：本用例只验预定位失效，关掉试玩版式
                      # 探针以隔离新变量（mock 的 ui.nodes() 不可迭代）。
-                     "ad_minigame": False})
+                     "ad_minigame": False,
+                     # N4（2026-10-22）：同理关掉点开校验/倒计时补等
+                     # （各自有专门用例覆盖）。
+                     "ad_open_guard": False, "ad_countdown_wait": False})
         f._find_row = mock.Mock(
             return_value=(mock.Mock(), mock.Mock(), (2, 10)))
         f._tap_node = mock.Mock()

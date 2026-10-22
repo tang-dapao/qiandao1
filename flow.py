@@ -2253,6 +2253,7 @@ class Flow:
         # 退出：反复点「返回」dump 节点，最多 ad_minigame_backs 次。
         # 实测需 2 次：授权页 →（返回）→ 奖励页 →（返回）→ 任务中心。
         backs = int(self.wf.get("ad_minigame_backs", 3))
+        exit_confirmed = False
         for i in range(1, backs + 1):
             node = self._find("返回", timeout=self._MINIGAME_DUMP_TIMEOUT)
             if not node:
@@ -2262,14 +2263,39 @@ class Flow:
             self._tap_node(node, pause=1.5)
             if self._at_taskcenter_by_dump():
                 logger.info("已回到任务中心（dump 确认）")
+                exit_confirmed = True
                 break
             if self._minigame_reward_visible():
                 logger.info("已到试玩奖励页（恭喜获得奖励）→ 继续退一层")
         self._prefetch_close = None      # 与 E 优化同款：本观看周期的预定位作废
         logger.info("[计时] 试玩链路（点进→等→退）%.1fs", time.time() - t0)
-        t_close0 = time.time()
-        closed = self._close_ad(sheet_ok=sheet_ok)
-        logger.info("[计时] 试玩后关闭确认 %.1fs", time.time() - t_close0)
+        # N2 优化（2026-10-22，10-22 真机实锤）：退出循环**已经用 dump 确认回到
+        # 任务中心**时，跳过 _close_ad。
+        # 证据：觅夏账号 9 支试玩，链路末尾日志已打「已回到任务中心（dump 确认）」，
+        # 代码却仍然完整跑一遍 _close_ad —— 此时页面上**根本没有广告可关**，
+        # 于是 top-strip OCR 读不到关闭按钮 → 落兜底轮询，白花 4.3~13.3s
+        # （p50 4.50 / 均值 7.19，其中两条 12.3/13.3 是「OCR 未在顶部条带读到
+        # 关闭按钮 → 兜底轮询」）。跳过它不改变任何成功判据：_close_ad 在
+        # 「已在任务中心」时唯一会做的事就是自己再确认一遍（并置可疑标记）。
+        # 语义等价保证：
+        #   - exit_confirmed 为 True 只可能来自 `_at_taskcenter_by_dump()`
+        #     （精确匹配 TC 外壳特征 ∪ 任务行，奖励页/授权页零重叠）；
+        #   - `_ad_close_suspicious` 显式置 False —— 与「点到了关闭按钮」的
+        #     直关路径同款，不触发收尾配额复核（本次确实没点任何关闭按钮，
+        #     但试玩链路是「点进 + 等满 15s + 逐层返回」，不存在 tap 未触发的
+        #     虚报风险，且退出过程已 dump 双证）。
+        #   - 唯一没做的事：sheet_ok 的浮层终态判定。浮层场景由调用方
+        #     `_watch_signin_ad` 在返回后自行关 ✕，与旧行为一致。
+        # workflow.ad_minigame_skip_close: false 一键回退旧链路。
+        if exit_confirmed and self.wf.get("ad_minigame_skip_close", True):
+            self._ad_close_suspicious = False
+            closed = True
+            logger.info("[计时] 试玩后关闭确认 0.0s（dump 已确认回任务中心，"
+                        "跳过冗余关闭链）")
+        else:
+            t_close0 = time.time()
+            closed = self._close_ad(sheet_ok=sheet_ok)
+            logger.info("[计时] 试玩后关闭确认 %.1fs", time.time() - t_close0)
         if not closed:
             logger.error("试玩广告退出后仍未确认回到任务中心")
             return False
@@ -3129,6 +3155,40 @@ class Flow:
         else:
             self._prefetch_close = None
 
+    def _ad_close_node_top(self, timeout: float = 0.5) -> Optional[Node]:
+        """顶条关闭按钮的 **dump 版快检**（N3，2026-10-22）——比 OCR 版快 11~15x。
+
+        真机取证（P-slow 探针，5 支，视频**播放中**取样）：
+            dump 顶条节点 = '关闭广告'(32,104)-(250,196)
+                             '倒计时5s'(702,104)-(923,196)
+                             '关闭声音'(950,104)-(1048,196)
+        两个关键事实：
+          1. 「关闭广告」是**有 text 的真实节点**，不依赖 OCR 识字；
+             同一支上 OCR 给出 (120,152)，dump 给出同一盒子的中心 (141,150)。
+          2. 广告页（原生 View）dump 只要 **0.05~0.06s**，而 `_ad_close_pos`
+             的顶条 OCR 要 ~1.5s。生产里 43~58% 的广告 OCR 漏读 → 落到
+             「全屏 OCR 守卫 + uiautomator 定位」的 7.2s 慢路径，根因不是
+             ✕ 没渲染，而是**定位手段选错了**。
+        与 `_find_close_node` 的差异（不能直接复用）：
+          - 只认顶条（y2 <= 400），避免把页面中部的「关闭广告」弹窗按钮
+            （Badcase 对话框 @ y=1096）当成顶条 ✕；
+          - **排除「关闭声音」** —— 同条带、同「关闭」前缀，点了只会静音；
+          - 多个候选取最左（✕ 恒在 x≈32，静音在 x≈950）。
+        未命中返回 None（页面可能是任务中心/插屏）→ 调用方回落原 OCR 链路。
+        """
+        cands = []
+        for n in self.ui.nodes(timeout=timeout):
+            t = (n.text or "").strip()
+            if not t or n.y2 > 400:
+                continue
+            if t == "关闭广告":
+                return n                      # 最强判据，直接返回
+            if "关闭声音" in t:
+                continue
+            if "跳过" in t or t.startswith("关闭"):
+                cands.append(n)
+        return min(cands, key=lambda n: n.x1) if cands else None
+
     def _find_close_node(self, timeout: Optional[float] = None) -> Optional[Node]:
         """uiautomator 定位广告页关闭按钮节点，返回 Node（None = 未命中）。
 
@@ -3296,12 +3356,27 @@ class Flow:
         _probe = (pref_early is None and not tc_seen
                   and self.wf.get("ad_close_ocr_first", True))
         if _ttl_ok or _probe:
-            pos = self._ad_close_pos()
-            if pos is not None:
-                logger.info("顶条快检命中关闭按钮 @ %s（%s）", pos,
-                            "E1，跳过全屏守卫" if _ttl_ok
-                            else "P1-b 无预定位前探")
-                self._tap(*pos, pause=1.5, trusted=True)
+            _fast_tag = ("E1，跳过全屏守卫" if _ttl_ok
+                         else "P1-b 无预定位前探")
+            # N3 优化（2026-10-22）：dump 快检**前置**，OCR 只做兜底。
+            # 实测依据见 `_ad_close_node_top` docstring：广告页 dump 0.06s、
+            # OCR 1.5s，且 OCR 漏读是慢路径的唯一根因。命中走 `_tap_node`
+            # （F11 认可的节点点击），比 OCR 坐标盲点更稳。
+            # 未命中 → 原 OCR 快检照跑（只多花一次 0.06s dump）。
+            # workflow.ad_close_dump_probe: false 一键回退为「纯 OCR 快检」。
+            _fast_node = (self._ad_close_node_top()
+                          if self.wf.get("ad_close_dump_probe", True) else None)
+            pos = None if _fast_node is not None else self._ad_close_pos()
+            if _fast_node is not None:
+                logger.info("顶条 dump 快检命中关闭按钮 @ %s（%s）",
+                            _fast_node.center, _fast_tag)
+            elif pos is not None:
+                logger.info("顶条快检命中关闭按钮 @ %s（%s）", pos, _fast_tag)
+            if _fast_node is not None or pos is not None:
+                if _fast_node is not None:
+                    self._tap_node(_fast_node, pause=1.5)
+                else:
+                    self._tap(*pos, pause=1.5, trusted=True)
                 time.sleep(ad_close_settle)
                 self._prefetch_close = None      # 快检路径已消费
                 if self._confirm_direct_close(ad_close_dump_timeout,

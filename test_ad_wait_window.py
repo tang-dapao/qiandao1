@@ -179,7 +179,8 @@ class TestMinigameAdFlow(unittest.TestCase):
         f, ui, tapped = self._f([AUTH, REWARD, TC])
         self.assertTrue(self._run(f))
         self.assertEqual(tapped, ["点击进入", "返回", "返回"])
-        f._close_ad.assert_called_once()          # 收尾仍走原关闭确认
+        # N2（2026-10-22）：退出时已 dump 确认回任务中心 → 不该再跑 _close_ad
+        f._close_ad.assert_not_called()
         self.assertEqual(f._prefetch_close, None)
 
     def test_never_taps_continue_details(self):
@@ -212,10 +213,81 @@ class TestMinigameAdFlow(unittest.TestCase):
         self._run(f)
         self.assertEqual(tapped.count("返回"), 2)
 
-    def test_close_fail_returns_false(self):
-        f, ui, tapped = self._f([AUTH, REWARD, TC])
+    def test_close_fail_returns_false_when_landing_unconfirmed(self):
+        """退出过程**没能** dump 确认回任务中心 → 仍走 _close_ad，失败则返回 False。"""
+        f, ui, tapped = self._f([AUTH, REWARD, REWARD, REWARD])
         f._close_ad = mock.Mock(return_value=False)
         self.assertFalse(self._run(f))
+        f._close_ad.assert_called_once()
+
+
+class TestMinigameSkipClose(unittest.TestCase):
+    """N2（2026-10-22）：试玩退出已 dump 确认 → 跳过冗余 _close_ad。
+
+    背景（10-22 觅夏 9 支真机实测）：链路末尾已打「已回到任务中心（dump 确认）」，
+    代码却又完整跑一遍 _close_ad —— 没有广告可关，top-strip OCR 读不到 →
+    兜底轮询，白花 4.3~13.3s（p50 4.50 / 均值 7.19）。
+    """
+
+    def _f(self, states, extra=None):
+        wf = {"ad_minigame": True}
+        wf.update(extra or {})
+        f = make_flow(wf)
+        ui = _ScreenUI(LANDING)
+        f.ui = ui
+        tapped = []
+        queue = list(states)
+
+        def _tap(node, pause=None):
+            tapped.append(node.text)
+            if queue:
+                ui.cur = list(queue.pop(0))
+
+        f._tap_node = mock.Mock(side_effect=_tap)
+        f._close_ad = mock.Mock(return_value=True)
+        f._prefetch_ad_close_pos = mock.Mock()
+        return f, ui, tapped
+
+    def _run(self, f):
+        with mock.patch.object(flow_mod.time, "sleep", lambda s: None):
+            return f._play_minigame_ad(f._minigame_cta_node())
+
+    def test_confirmed_tc_skips_close_ad(self):
+        """dump 确认回任务中心 → 一次 _close_ad 都不跑，且直接判成功。"""
+        f, _, _ = self._f([AUTH, REWARD, TC])
+        self.assertTrue(self._run(f))
+        f._close_ad.assert_not_called()
+
+    def test_skip_clears_suspicious_flag(self):
+        """跳过关闭链 ≠ 可疑路径：必须把 _ad_close_suspicious 置 False，
+        否则会触发收尾的配额复核（多一次读屏）。"""
+        f, _, _ = self._f([AUTH, REWARD, TC])
+        f._ad_close_suspicious = True          # 上一支遗留的脏状态
+        self._run(f)
+        self.assertFalse(f._ad_close_suspicious)
+
+    def test_skip_logs_zero_timer(self):
+        """日志仍打「试玩后关闭确认 0.0s」+ 显式标注跳过 —— 便于日志分析口径连续。"""
+        f, _, _ = self._f([AUTH, REWARD, TC])
+        with self.assertLogs("flow", level="INFO") as cm:
+            self._run(f)
+        joined = "\n".join(cm.output)
+        self.assertIn("试玩后关闭确认 0.0s", joined)
+        self.assertIn("跳过冗余关闭链", joined)
+
+    def test_knob_off_restores_close_ad(self):
+        """ad_minigame_skip_close: false → 一键回退旧链路。"""
+        f, _, _ = self._f([AUTH, REWARD, TC],
+                          extra={"ad_minigame_skip_close": False})
+        self.assertTrue(self._run(f))
+        f._close_ad.assert_called_once()
+
+    def test_unconfirmed_landing_keeps_close_ad(self):
+        """退出 3 次仍停在奖励页 → 不确认 → 必须交 _close_ad 兜底。"""
+        f, _, tapped = self._f([AUTH, REWARD, REWARD, REWARD])
+        self.assertTrue(self._run(f))
+        f._close_ad.assert_called_once()
+        self.assertNotIn("关闭广告", tapped)
 
 
 class TestMinigameProbe(unittest.TestCase):

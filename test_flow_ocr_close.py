@@ -1108,6 +1108,9 @@ class TestPrefetchClose(Base):
         f = self.f
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
+        # N3（2026-10-22）：顶条快检已改为「dump 优先」——本类只测 OCR 那一段，
+        # 故让 dump 恒空（`_ad_close_node_top` → None），行为与旧版完全一致。
+        f.ui.nodes.return_value = []
         f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=False)
         f._tap = mock.Mock()
         f._tap_node = mock.Mock()
@@ -1185,6 +1188,7 @@ class TestQuickCheckDirectClose(Base):
         f = self.f
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
+        f.ui.nodes.return_value = []   # N3：dump 快检恒空 → 只测 OCR 段
         f._taskcenter_confirmed_by_ocr = mock.Mock(return_value=False)
         f._tap = mock.Mock()
         f._tap_node = mock.Mock()
@@ -1248,6 +1252,7 @@ class TestNoPrefetchOcrProbe(Base):
         f = self.f
         f.ui = mock.Mock()
         f.ui.dump_fail_streak = 0
+        f.ui.nodes.return_value = []   # N3：dump 快检恒空 → 只测 OCR 前探
         f._tap = mock.Mock()
         f._tap_node = mock.Mock()
         f._confirm_direct_close = mock.Mock(return_value=True)
@@ -1379,6 +1384,115 @@ class TestOcrShotChannel(Base):
         f.ui.screenshot_pil = mock.Mock(return_value=Image.new("L", (4, 4)))
         got = f._ocr_shot()
         self.assertEqual(got.mode, "RGB")
+
+
+# ======================================================================
+# N3（2026-10-22）：顶条关闭按钮快检「dump 优先、OCR 兜底」
+#
+# 真机取证（P-slow 探针，视频播放中取样，5 支）：
+#   dump 顶条 = '关闭广告'(32,104)-(250,196) / '倒计时5s' / '关闭声音'(950,104)-(1048,196)
+#   ⇒ 「关闭广告」是有 text 的真实节点；dump 0.05~0.06s vs 顶条 OCR ~1.5s，
+#     且生产里 43~58% 的广告 OCR 漏读 → 落到 7.2s 慢路径。
+# ======================================================================
+def _n(text, y1=104, x1=32, y2=None, x2=None):
+    y2 = (y1 + 92) if y2 is None else y2
+    x2 = (x1 + 218) if x2 is None else x2
+    return Node(text, x1, y1, x2, y2)
+
+
+class TestAdCloseNodeTop(Base):
+    """`_ad_close_node_top` 自身的判据（只读 dump，不触发任何点击）。"""
+
+    def _f(self, nodes):
+        f = self.f
+        f.ui = mock.Mock()
+        f.ui.nodes.return_value = list(nodes)
+        return f
+
+    def test_exact_close_ad_wins(self):
+        f = self._f([_n("倒计时5s", x1=702), _n("关闭广告"),
+                     _n("关闭声音", x1=950)])
+        got = f._ad_close_node_top()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.text, "关闭广告")
+
+    def test_mute_button_never_selected(self):
+        """「关闭声音」同条带、同「关闭」前缀 —— 点它只会静音，必须排除。"""
+        f = self._f([_n("关闭声音", x1=950), _n("倒计时5s", x1=702)])
+        self.assertIsNone(f._ad_close_node_top())
+
+    def test_mid_page_dialog_button_ignored(self):
+        """页面中部的「关闭广告」弹窗按钮（Badcase 对话框 y≈1096）不是顶条 ✕。"""
+        f = self._f([_n("至少需要观看15秒视频才能获得有效奖励哦", y1=893, x1=339),
+                     _n("关闭广告", y1=1096, x1=339),
+                     _n("继续观看", y1=1096, x1=739)])
+        self.assertIsNone(f._ad_close_node_top())
+
+    def test_skip_fallback_picks_leftmost(self):
+        """无「关闭广告」时认「跳过」，多个候选取最左（✕ 恒在 x≈32）。"""
+        f = self._f([_n("跳过 3", x1=900), _n("跳过 5s", x1=40)])
+        got = f._ad_close_node_top()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.text, "跳过 5s")
+
+    def test_taskcenter_top_bar_returns_none(self):
+        """任务中心顶条（当前电量/去充电/时间）不得被认成关闭按钮。"""
+        f = self._f([_n("14:06", y1=11, x1=12), _n("当前电量", y1=111, x1=90),
+                     _n("去充电", y1=111, x1=759)])
+        self.assertIsNone(f._ad_close_node_top())
+
+    def test_dump_unavailable_returns_none(self):
+        f = self._f([])
+        self.assertIsNone(f._ad_close_node_top())
+
+
+class TestCloseAdDumpFirst(Base):
+    """快检段：dump 命中就直关（不跑 OCR），未命中回落 OCR。"""
+
+    def _stub(self, nodes, ocr_close=None, wf=None):
+        f = self.f
+        f.wf = dict(wf or {})
+        f._find = mock.Mock(return_value=None)
+        f.ui = mock.Mock()
+        f.ui.nodes.return_value = list(nodes)
+        f._tap_node = mock.Mock()
+        f._tap = mock.Mock()
+        f._back_at_taskcenter = mock.Mock(return_value=True)
+        f._dismiss_badcase = mock.Mock(return_value=True)
+        f._ocr_find = mock.Mock(return_value=ocr_close)
+        return f
+
+    def test_dump_hit_taps_node_and_skips_ocr_entirely(self):
+        """dump 命中 → 走 _tap_node（F11 节点点击），且一次 OCR 都不跑。"""
+        f = self._stub([_n("关闭广告"), _n("倒计时5s", x1=702),
+                        _n("关闭声音", x1=950)])
+        self.assertTrue(f._close_ad())
+        f._tap_node.assert_called_once()
+        self.assertEqual(f._tap_node.call_args[0][0].text, "关闭广告")
+        f._tap.assert_not_called()
+        f._ocr_find.assert_not_called()
+
+    def test_dump_miss_falls_back_to_ocr_tap(self):
+        f = self._stub([], ocr_close=(120, 152))
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap_node.assert_not_called()
+
+    def test_knob_off_restores_ocr_only(self):
+        """ad_close_dump_probe: false → 一键回退纯 OCR 快检（dump 不再参与）。"""
+        f = self._stub([_n("关闭广告")], ocr_close=(120, 152),
+                       wf={"ad_close_dump_probe": False})
+        self.assertTrue(f._close_ad())
+        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap_node.assert_not_called()
+
+    def test_dump_hit_but_confirm_fails_goes_badcase(self):
+        """dump 命中但确认失败 → 走巡检 + 兜底（与原快检路径同款处置）。"""
+        f = self._stub([_n("关闭广告")])
+        f._back_at_taskcenter = mock.Mock(return_value=False)
+        f.wf = {"ad_close_retries": 1, "ad_close_max_backs": 1}
+        f._close_ad()
+        f._dismiss_badcase.assert_called()       # 快检段与兜底段各巡检一次
 
 
 if __name__ == "__main__":

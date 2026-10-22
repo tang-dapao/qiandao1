@@ -53,6 +53,10 @@ class QuotaVerifyBase(unittest.TestCase):
         self.f._ad_quota_done = mock.Mock(return_value=False)
         self.f._back_at_taskcenter = mock.Mock(return_value=True)
         self.f._tc_entry_ratio = None      # None → 会话首检走 _read_ad_ratio
+        # N3（2026-10-22）：`_close_ad` 的顶条快检已改为「dump 优先」，
+        # 需要一个可迭代的 nodes()（否则 Mock 不可迭代）。恒空 = 只走 OCR 段。
+        self.f.ui = mock.Mock()
+        self.f.ui.nodes.return_value = []
         self._sleep = mock.patch.object(flow_mod.time, "sleep")
         self._sleep.start()
         self.addCleanup(self._sleep.stop)

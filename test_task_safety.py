@@ -322,6 +322,86 @@ class TestDismissNewfeatPopup(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(f._tap_node.call_count, 2)  # 重试一次，共 2 次点击
 
+    # ---- A+B（2026-10-22）：标题文案会变，锚点必须走词表 --------------
+    def test_new_title_variant_closed(self):
+        """新版标题「全新玩法已上线」（少一个「经」）也必须能关。
+
+        回归背景：旧锚点是单串 `"已经上线"` 子串匹配，对这张新弹窗恒不成立 →
+        静默跳过 → 段5 探不到任务行 → 3 次进台全败 → 轮换判本组弃权。
+        """
+        ui, f = self._f()
+        screen = "全新玩法已上线"
+        ui.find.side_effect = [nd("关闭", 774, x1=897), None]
+        ui.find_contains.side_effect = lambda kw: (nd(kw, 807)
+                                                  if kw in screen else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertTrue(ok)
+        f._tap_node.assert_called_once()
+
+    def test_cta_anchor_closed(self):
+        """标题一个字都读不到，仅靠专属 CTA「去体验」也要能关（B 锚点独立生效）。"""
+        ui, f = self._f()
+        screen = "去体验"
+        ui.find.side_effect = [nd("关闭", 774, x1=897), None]
+        ui.find_contains.side_effect = lambda kw: (nd(kw, 1600)
+                                                  if kw in screen else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertTrue(ok)
+        f._tap_node.assert_called_once()
+
+    def test_old_anchor_only_ignores_new_title(self):
+        """回退旋钮：newfeat_anchors=["已经上线"] 时，新文案不再被认（=09-25 行为）。"""
+        ui, f = self._f()
+        f.wf["newfeat_anchors"] = ["已经上线"]
+        screen = "全新玩法已上线去体验"
+        ui.find.return_value = nd("关闭", 774, x1=897)
+        ui.find_contains.side_effect = lambda kw: (nd(kw, 807)
+                                                  if kw in screen else None)
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertFalse(ok)
+        f._tap_node.assert_not_called()
+
+    def test_anchor_scanned_only_after_close_node(self):
+        """无「关闭」节点时**短路**，不扫锚点词表（无弹窗时零额外动作/零额外 dump）。"""
+        ui, f = self._f()
+        ui.find.return_value = None
+        with mock.patch.object(flow_mod.time, "sleep"):
+            ok = f._dismiss_newfeat_popup()
+        self.assertFalse(ok)
+        ui.find_contains.assert_not_called()
+
+
+class TestNewfeatAnchorConfig(unittest.TestCase):
+    """config.yaml 与代码的旋钮名/词表一致性（防「代码在 ≠ 生效」）。"""
+
+    def test_config_knob_present_and_covers_both_variants(self):
+        import os
+        import yaml
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "config.yaml")
+        with open(path, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+        anchors = cfg["workflow"].get("newfeat_anchors")
+        self.assertIsInstance(anchors, list)
+        # 旧版式（09-25「…的玩法已经上线」）+ 新版式（10-22「全新玩法已上线」）
+        # 必须都被覆盖，外加专属 CTA 兜底
+        self.assertIn("已经上线", anchors)
+        self.assertIn("已上线", anchors)
+        self.assertIn("去体验", anchors)
+
+    def test_flow_reads_same_knob(self):
+        """代码侧读取的键名必须是 newfeat_anchors（改名即失效的经典坑）。"""
+        ui = mock.Mock()
+        ui.nodes.return_value = []
+        f = make_flow(ui)
+        f.wf["newfeat_anchors"] = ["自定义词"]
+        self.assertEqual(f._newfeat_anchors(), ("自定义词",))
+        del f.wf["newfeat_anchors"]
+        self.assertEqual(f._newfeat_anchors(), Flow._NEWFEAT_ANCHORS)
+
 
 # ----------------------------------------------------------------------
 # P1 校准: 看广告已达目标次数跳过

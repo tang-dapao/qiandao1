@@ -1209,29 +1209,72 @@ class Flow:
     #   - 弹窗结构：标题「XX的玩法已经上线」+ 右上角「关闭」按钮（dump 节点
     #     实测 (897,774)-(1056,909)）+ 底部「去体验」大按钮（**绝不可点**，
     #     点击会跳转新功能页破坏流程）；弹窗盖在任务中心 H5 之上，任务行全遮挡。
+    #   - 2026-10-22 第二次实见（用户截图，新版式）：标题「全新玩法已上线」，
+    #     副标「剧场 / 剧本小剧场 | 互动剧情 | 你的专属内容」+ 大图，底部仍是
+    #     紫色「去体验」，右上角仍是 ✕。→ 标题文案会随版本变，**不能只锚一个串**。
     #   - 稳定特征 = 「关闭」节点 与 「已经上线」文案 **同屏**（双特征确认，
     #     防误关其它含「关闭」的界面；任务中心/签到浮层/广告页/心动卡促销的
     #     历史 dump 均无「已经上线」）。若官方日后改模板致检测失效，退化为
     #     现状（进台失败重试跳过），不会更糟。
-    _NEWFEAT_KEY = "已经上线"
+    #
+    # A+B 适配（2026-10-22，用户截图：任务中心上盖「全新玩法已上线 / 剧场」弹窗）：
+    #   ⚠️ 旧锚点 `"已经上线"` 是**子串**匹配，而新版标题是「全新玩法**已上线**」
+    #   （少一个「经」）→ 双特征恒不成立 → 旧实现会**静默跳过**（连日志都没有）：
+    #   段5 探不到任务行 → 3 次进台重试全败 → 轮换链 `s["fail"]=max_fail` 判本组
+    #   弃权，该台本轮 10 支配额全丢。故把标题锚点改成**词表**（A），并补上这套
+    #   推广弹窗的专属 CTA「去体验」当第二锚点（B，比标题文案抗改版：标题会换、
+    #   行动按钮语义不会变；任务中心/签到浮层/广告页 dump 均无此词）。
+    #   判据仍为「精确『关闭』节点」**且**（标题词任一 **或** CTA）→ 防误关性质不变；
+    #   点击仍走 `_tap_node`（dump 节点），**不引入任何坐标盲点**。
+    #   ⚠️ ✕ 的 text/content-desc 尚未真机确认（按截图推算其中心 ≈(960,833)，
+    #   与 09-25 旧版「关闭」节点 (897,774)-(1056,909) 几乎重合，很可能同一控件）。
+    #   若日后实测发现 dump 里读不到「关闭」，只会在**日志**里看到「锚点命中但无
+    #   关闭节点」，退化为现状，不会误点。
+    #   回退：config `workflow.newfeat_anchors: ["已经上线"]` 即恢复 09-25 行为。
     _NEWFEAT_CLOSE = "关闭"
+    # 锚点词表：标题词在前（09-25 已实测可用、命中更早），专属 CTA 兜底在后。
+    _NEWFEAT_ANCHORS = ("已经上线", "已上线", "全新玩法", "玩法上线", "去体验")
+
+    def _newfeat_anchors(self) -> Tuple[str, ...]:
+        """锚点词表（`workflow.newfeat_anchors` 可覆盖；缺省用类常量）。
+
+        空列表 = 只认「精确关闭节点」不认文案 —— 不建议（等于放弃防误关）。
+        """
+        cfg = self.wf.get("newfeat_anchors")
+        if cfg is None:
+            return self._NEWFEAT_ANCHORS
+        return tuple(str(x).strip() for x in cfg if str(x).strip())
+
+    def _newfeat_anchor_hit(self) -> Optional[str]:
+        """返回屏上命中的锚点词（None = 该弹窗的文案特征一个都没读到）。
+
+        纯内存遍历 `ui.nodes()`（0.8s TTL 内复用同一份 dump），零额外 dump。
+        """
+        for kw in self._newfeat_anchors():
+            if self.ui.find_contains(kw):
+                return kw
+        return None
 
     def _dismiss_newfeat_popup(self) -> bool:
-        """检测并关闭「新功能上线」弹窗。返回是否执行了关闭。
+        """检测并关闭「新功能/新玩法上线」弹窗。返回是否执行了关闭。
 
         双特征确认才点（_tap_node 走 dump 节点，不涉坐标盲点）；正常路径
-        仅 +1 次 dump（u2 ~0.1s，有缓存期内复用），无弹窗时零额外动作。
+        仅 +1 次 dump（u2 ~0.1s，有缓存期内复用），无弹窗时零额外动作
+        （先查「关闭」节点，缺失即短路，不扫锚点词表）。
         """
         close = self._find(self._NEWFEAT_CLOSE)
-        if not close or not self.ui.find_contains(self._NEWFEAT_KEY):
+        if not close:
             return False
-        logger.info("检测到新功能上线弹窗 → 关闭（屏文=%s）",
-                    self._screen_texts(8))
+        anchor = self._newfeat_anchor_hit()
+        if not anchor:
+            return False
+        logger.info("检测到新功能/新玩法弹窗 → 关闭（锚点=%s，屏文=%s）",
+                    anchor, self._screen_texts(8))
         self._tap_node(close)
         time.sleep(1.5)
         # 确认消失；仍在（动画/双弹窗）再点一次，最多重试 1 次
         close = self._find(self._NEWFEAT_CLOSE)
-        if close and self.ui.find_contains(self._NEWFEAT_KEY):
+        if close and self._newfeat_anchor_hit():
             logger.warning("新功能弹窗关闭后仍在屏，重试一次")
             self._tap_node(close)
             time.sleep(1.5)

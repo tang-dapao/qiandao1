@@ -44,6 +44,9 @@ D:\qiandao\
 │
 ├─ test_flow_ocr_close.py   # mock 单测：广告关闭（快路径/预定位直关/顶条快检E1/全屏三合一扫描E2/页面快照E3）+ ymax + F8 正向定位不盲点 + F11 banner 盲点禁令 + 覆盖层闸门 + 跨词元拼接 + BACK 封顶 + 条带高度上限 + dump 复核补强(dump_fallback) + BACK 退穿保护（99 用例）
 ├─ test_adb_cache.py        # mock 单测：dump 缓存 TTL 失效 + subprocess 超时看门狗（27 用例）
+├─ test_ad_wait_window.py   # mock 单测：广告等待窗扣时(P0-a) + 「试玩小游戏」版式分流
+│                           #   (N1 2026-10-22：双特征探针/点击进入→等15s→返回×2 全链、
+│                           #   普通广告总时长严格不变、下载类 CTA 不误判，17 用例)
 ├─ test_run_all_flags.py    # mock 单测：run_all 各 flag 组合 + 单会话连看 + 首轮广告 + 配额收尾 + 白名单（29 用例）
 ├─ test_nav_optimize.py     # mock 单测：导航优化(A1事件驱动) + 心动卡错页守卫 + 机器人列表滚动收集 + 列表强判据单快照(P0) + 进台流程(条件等待/新功能弹窗/心动卡/Y钳位) + 落点断言/F9让位后复核/配额单快照(P1P3 2026-10-08)（84 用例）
 ├─ test_task_safety.py      # mock 单测：任务安全（A3 Badcase 守卫顺序 + 签到浮层断言 + 行内 X/Y 计数 + 看广告配额跳过，48 用例）

@@ -1165,7 +1165,10 @@ class TestPrefetchClose(Base):
         f = self.f
         f.ui = mock.Mock()
         f.wf.update({"ad_wait_min": 0.01, "ad_wait_max": 0.02,
-                     "ad_times_per_robot": 10, "ad_prefetch_pos": False})
+                     "ad_times_per_robot": 10, "ad_prefetch_pos": False,
+                     # N1（2026-10-22）：本用例只验预定位失效，关掉试玩版式
+                     # 探针以隔离新变量（mock 的 ui.nodes() 不可迭代）。
+                     "ad_minigame": False})
         f._find_row = mock.Mock(
             return_value=(mock.Mock(), mock.Mock(), (2, 10)))
         f._tap_node = mock.Mock()

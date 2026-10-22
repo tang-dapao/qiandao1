@@ -2079,6 +2079,16 @@ class Flow:
         返回 True=广告已关闭；False=多次尝试仍未关闭。"""
         wait = random.uniform(self.wf["ad_wait_min"], self.wf["ad_wait_max"])
         logger.info("广告播放 %.1f 秒", wait)
+        # N1（2026-10-22）：先分流「试玩小游戏」广告版式（官方新上线）。
+        # 必须在等待窗**之前**判定：这类广告点开后停在落地页，视频根本不播，
+        # 白等 ad_wait 纯浪费；且它真正的 15s 是在小程序页里计时的。
+        # 判据 = dump 出现「点击进入」（ad 页 dump 实测 0.05s，探针两次 ≈0.1s，
+        # 且时间从 ad_wait 里扣除，**成功路径总时长不变**）。
+        t_play0 = time.time()          # 点开广告的时刻（探针/预定位都相对它计时）
+        if self.wf.get("ad_minigame", True):
+            mg_cta = self._probe_minigame_ad(t_play0)
+            if mg_cta is not None:
+                return self._play_minigame_ad(mg_cta, sheet_ok=sheet_ok)
         # E 优化（2026-09-14）：把「关闭按钮预定位」藏进等待窗口。
         # 视频播放期 uiautomator dump 必然失败（UI 不 idle），但 OCR 截屏不依赖
         # idle —— 等待进行到 ad_prefetch_at 秒时用顶条 OCR 预定位「关闭广告」并
@@ -2090,8 +2100,8 @@ class Flow:
         prefetch_at = float(self.wf.get("ad_prefetch_at", 13.0))
         if (self.wf.get("ad_prefetch_pos", True)
                 and wait > prefetch_at + 1.0):
-            _pf_t0 = time.time()
-            time.sleep(prefetch_at)
+            _pf_t0 = t_play0        # 起点=点开广告（N1 探针已消耗的时间一并扣除）
+            time.sleep(max(0.0, prefetch_at - (time.time() - _pf_t0)))
             self._prefetch_ad_close_pos()
             # P0-a（2026-10-19，**bug 修复不是优化**）：预定位的 OCR 耗时
             # （取图 0.08~0.12 + 顶条识别 ~1.0 ≈ 1.1s）必须**从等待窗里扣掉**。
@@ -2103,7 +2113,7 @@ class Flow:
             # 等待结束触发，总窗口不变）→ 行为等价，纯省时。
             time.sleep(max(0.0, wait - (time.time() - _pf_t0)))
         else:
-            time.sleep(wait)
+            time.sleep(max(0.0, wait - (time.time() - t_play0)))
         # B 优化（2026-09-13 用户确认）：移除观看等待后的任务中心 OCR 预检。
         # 09-13 全流程 97 次广告预检 0 命中（无自动关闭、无未触发），纯开销
         # ~3s/次（一轮 174 次 ≈ 9min）。广告自动结束/仍在任务中心的场景由
@@ -2123,6 +2133,147 @@ class Flow:
             logger.error("多次尝试后广告仍未关闭")
             return False
         logger.info("广告已关闭，回到任务中心")
+        time.sleep(self.t.get("ad_close_wait", 2.0))
+        return True
+
+    # ------------------------------------------------------------------
+    # N1（2026-10-22）：官方新增「试玩小游戏」广告版式
+    # ------------------------------------------------------------------
+    # 实测链路（古禹 2026-10-22 11:29~11:30，全程 dump 取证；**页面节点全部可读**，
+    # 不需要 OCR、不需要任何坐标盲点）：
+    #   ① 落地页：`小游戏体验`(0,0)-(1080,1920，页面级) / `还需体验 15 秒`
+    #      / `15 秒更快拿奖` / `点击进入`(174,1218)-(906,1389) / `返回`(60,144)-(204,276)
+    #   ② 点「点击进入」→ 微信小程序授权页（模拟器未装微信）：
+    #      `授权使用微信小程序`(333,66)-(747,201) / `返回`(0,66)-(119,201) / `去官网下载`
+    #   ③ 等 15s：页面**完全静止**（无自动返回、`还需体验 15 秒` 文案不变）
+    #   ④ 点「返回」→ **试玩奖励页**：`恭喜获得奖励` / `已完成试玩 15 秒，提前获得奖励`
+    #      / `继续了解详情` / `返回`(60,144)-(204,276)
+    #      ⚠️ **这页没有「关闭广告」** → 原 `_close_ad` 在它上面恒失败（只能靠物理
+    #      BACK 兜底），既拿不到 +电量也可能多按 BACK，这才是必须适配的原因。
+    #   ⑤ 再点「返回」→ 回到任务中心：配额 1/10→2/10、`恭喜获得 16 电量`（实测）
+    #
+    # ⚠️ **必须点「点击进入」**（用户确认 + 实测双向验证）：
+    #   - 在落地页干等 18s，`还需体验 15 秒` 纹丝不动 → 计时只在跳转后才走；
+    #   - 不点「点击进入」直接按「返回」→ 直接回任务中心，**没有奖励页**（无 +电量）。
+    #   ⇒ 所以「点开→等→关闭」这套原逻辑对这类广告必然白跑。
+    #
+    # 安全边界：
+    #   - 只点 `点击进入` 和 `返回`（都是 dump 节点）；**`继续了解详情`/`去官网下载`
+    #     绝不点**（会跳外部页面）。
+    #   - 普通版式行为**一字不改**：探针读不到「点击进入」即原链路继续。
+    #   - 成本：ad 页 dump 实测 0.05s（与任务中心 0.06s 同量级），探针 2 次 ≈0.1s，
+    #     且探针耗时从 ad_wait 里扣除（t_play0 起算）→ 成功路径总时长不变。
+    #   - 回退：`workflow.ad_minigame: false` 即恢复旧行为（试玩广告回到 BACK 兜底）。
+    _MINIGAME_CTA = "点击进入"
+    _MINIGAME_PAGE_KEYS = ("小游戏体验", "还需体验", "15 秒更快拿奖")
+    _MINIGAME_REWARD_KEYS = ("恭喜获得奖励", "已完成试玩")
+    # 探针时点（秒，相对点开广告）：两次，防首帧未渲染漏判
+    _MINIGAME_PROBE_AT = (1.5, 4.0)
+    _MINIGAME_DUMP_TIMEOUT = 1.5
+
+    def _minigame_cta_node(self) -> Optional[Node]:
+        """dump 判定是否「试玩小游戏」落地页；是则返回「点击进入」节点。
+
+        **双特征确认**（单次 dump，不额外取节点）：
+          ① 页面标识词任一命中（`小游戏体验` / `还需体验 15 秒` / `15 秒更快拿奖`）；
+          ② 且存在含「点击进入」的节点。
+        为什么不能只看「点击进入」：普通广告也有「点击卡片下载游戏 / 点击卡片
+        立即安装」这类按钮，且「点击进入」作为子串可能出现在「点击进入详情页
+        下载」等文案里 —— 单特征会把普通广告误判成试玩版式（单测已覆盖该
+        反例）。页面标识词在普通广告页实测 0 命中，作为第二特征能干净区分。
+
+        ⚠️ 试玩**奖励页**同样带 `小游戏体验`（页面级容器节点 (0,0)-(1080,1920)），
+        但那时「点击进入」已消失 → 本方法返回 None，不会误触发补点。
+        """
+        nodes = list(self.ui.nodes(timeout=self._MINIGAME_DUMP_TIMEOUT))
+        texts = [(n.text or "") for n in nodes]
+        if not any(k in t for t in texts for k in self._MINIGAME_PAGE_KEYS):
+            return None
+        for n in nodes:
+            if self._MINIGAME_CTA in (n.text or ""):
+                return n
+        return None
+
+    def _probe_minigame_ad(self, t_play0: float) -> Optional[Node]:
+        """在 `_MINIGAME_PROBE_AT` 时点探测试玩版式，命中返回 CTA 节点。
+
+        时点相对 **t_play0（点开广告那一刻）** 计算 —— 调用方随后以同一 t_play0
+        扣减 ad_wait，保证「点开→关闭」总时长与旧版严格一致。
+        """
+        for at in self._MINIGAME_PROBE_AT:
+            d = at - (time.time() - t_play0)
+            if d > 0:
+                time.sleep(d)
+            node = self._minigame_cta_node()
+            if node is not None:
+                return node
+        return None
+
+    def _minigame_reward_visible(self) -> bool:
+        """当前是否停在「试玩奖励页」（恭喜获得奖励 / 已完成试玩 15 秒…）。"""
+        for n in self.ui.nodes(timeout=self._MINIGAME_DUMP_TIMEOUT):
+            t = n.text or ""
+            if any(k in t for k in self._MINIGAME_REWARD_KEYS):
+                return True
+        return False
+
+    def _at_taskcenter_by_dump(self) -> bool:
+        """dump 判定是否已回任务中心（外壳特征 ∪ 任务行）。
+
+        与 `_back_at_taskcenter()` 的区别：**纯 dump、不 OCR**（0.06s），仅用于
+        试玩链路退出后的落点确认；破坏性动作前的强判据仍走原 OCR 版。
+        """
+        keys = set(self._TC_SHELL_KEYS) | {"每日签到", "看视频赚电量",
+                                           "获取随机", "任务中心"}
+        for n in self.ui.nodes(timeout=self._MINIGAME_DUMP_TIMEOUT):
+            if (n.text or "") in keys:
+                return True
+        return False
+
+    def _play_minigame_ad(self, cta: Node, sheet_ok: bool = False) -> bool:
+        """试玩小游戏广告专用链路：点进 → 等 15s → 返回×N → 关闭确认。
+
+        返回 True 表示最终已回到任务中心（广告关闭），语义与 `_close_ad` 一致。
+        """
+        t0 = time.time()
+        logger.info("识别到「试玩小游戏」广告版式（CTA=「%s」@%s）→ 走试玩链路",
+                    cta.text, cta.center)
+        self._tap_node(cta, pause=1.5)
+        # 跳转确认：落地页的「点击进入」应当消失（换成授权页/小程序页）。
+        # 仍在 = 点击被吞（与「发消息」被吞同源现象）→ 补点一次再往下走，
+        # 避免一次被吞就整支作废。
+        if self._minigame_cta_node() is not None:
+            logger.warning("「点击进入」后仍停在落地页 → 补点一次")
+            node = self._minigame_cta_node()
+            if node is not None:
+                self._tap_node(node, pause=1.5)
+        wait = float(self.wf.get("ad_minigame_wait", 15.5))
+        logger.info("试玩计时 %.1fs（页面静止，仅等待）", wait)
+        time.sleep(wait)
+        # 退出：反复点「返回」dump 节点，最多 ad_minigame_backs 次。
+        # 实测需 2 次：授权页 →（返回）→ 奖励页 →（返回）→ 任务中心。
+        backs = int(self.wf.get("ad_minigame_backs", 3))
+        for i in range(1, backs + 1):
+            node = self._find("返回", timeout=self._MINIGAME_DUMP_TIMEOUT)
+            if not node:
+                logger.info("第 %d 次退出：屏上无「返回」节点 → 停止退出", i)
+                break
+            logger.info("第 %d 次点「返回」@%s", i, node.center)
+            self._tap_node(node, pause=1.5)
+            if self._at_taskcenter_by_dump():
+                logger.info("已回到任务中心（dump 确认）")
+                break
+            if self._minigame_reward_visible():
+                logger.info("已到试玩奖励页（恭喜获得奖励）→ 继续退一层")
+        self._prefetch_close = None      # 与 E 优化同款：本观看周期的预定位作废
+        logger.info("[计时] 试玩链路（点进→等→退）%.1fs", time.time() - t0)
+        t_close0 = time.time()
+        closed = self._close_ad(sheet_ok=sheet_ok)
+        logger.info("[计时] 试玩后关闭确认 %.1fs", time.time() - t_close0)
+        if not closed:
+            logger.error("试玩广告退出后仍未确认回到任务中心")
+            return False
+        logger.info("试玩广告已完成（含奖励），回到任务中心")
         time.sleep(self.t.get("ad_close_wait", 2.0))
         return True
 

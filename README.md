@@ -483,6 +483,52 @@ dump**（一层校验 3 次 dump ≈ 7.2s）。现改为**单快照**：一次 `
 - **已知缺口**：签到/反馈按钮点击后仍会随机弹 Badcase（操作触发，非停留触发），以及普通推广
   广告（无"关闭广告"文字）签到后随机弹 —— 详见待办（尚未实现完整兜底）。
 
+## 异常自探测与微信告警（2026-10-23 新增）
+
+官方版式/活动/广告样式变动无法第一时间人工知晓 → 程序在跑的时候自己识别「和预期不一样」，
+记录到 `logs/anomaly.jsonl` + `screenshots/anomaly/`，并实时推到微信（企业微信群机器人）。
+
+**四个探测点**（全部复用现有判据，**不新增 dump/截图**，截图只在真告警时取一张）：
+
+| 探测器 | 挂接位置 | 触发条件 | 说明 |
+|---|---|---|---|
+| `popup` | `_dismiss_newfeat_popup` 命中锚点 | 立即（按文案去重 30min） | 官方推了新活动/新玩法弹窗，自动关闭并上报 |
+| `popup_unknown` | `_dismiss_newfeat_popup`「有『关闭』但文案不认识」 | 立即 | **最有价值**：旧逻辑静默 `return False`，人根本不知道弹窗存在（历史坑：10-22「全新玩法已上线」少个「经」字恒不匹配） |
+| `enter_block` | `run_robot` 3 次进台全失败 | 连续 2 台 | 任务中心版式变了 / 新弹窗没关掉 |
+| `ad\|norow` / `ad\|notopen` / `ad\|fail` | `_watch_ad_once` | 连续 3 支 | 广告入口文案变了 / 点了不开 / 关不掉（广告样式改动） |
+| `task\|signin` / `task\|feedback` | `run_robot` 签到/反馈结果 | 连续 3 次 | 任务行入口或按钮文案变了 |
+
+**账号级进度推送**（2026-10-23 用户需求）：多账号模式**每个账号跑完立刻推一条**——
+耗时、本账号获得电量、机器人/签到/反馈/广告计数；单账号模式收尾推一条。
+这类消息是「统计」不是「异常」，所以**不走同类去重**（每次都必须发），但仍受
+`max_per_hour` 约束。`notify.account_summary: false` 一键关闭（异常告警不受影响）。
+
+**设计约束**（改动时别破坏）：
+- 所有钩子 `if self._watch:` 守卫 + 内部 try/except 全吞 → 单测 `Flow.__new__` 与告警故障都零影响；
+- 发送在后台守护线程，`alert()` 入队即返回，**绝不阻塞点击链路**；
+- 同类事件按 `dedup_key` 去重（默认 1800s，跨进程持久化）+ 每小时上限 40 条；
+- 成功一次即清零对应计数（防「一天里偶发 3 次」被误判成版式变化）。
+
+**配置**（`config.yaml`）：
+```yaml
+notify: { enabled: true, channel: "wecom_bot", account_summary: true, dedup_window: 1800, max_per_hour: 40 }
+watch:  { enabled: true, enter_block: 2, ad_fail: 3, task_fail: 3, popup_shot: true }
+```
+凭据不在仓库里：`notify.local.yaml`（已 gitignore，含 wecom_bot webhook / pushplus token 等）。
+
+**自检**：
+```bash
+py -3.13 notify.py --check    # 校验通道凭据
+py -3.13 notify.py --test     # 真发一条测试消息
+py -3.13 notify.py --ip       # 打印公网 IP（自建应用配「企业可信IP」时用）
+```
+
+踩过的坑（2026-10-23 实测）：
+- 自建应用 `message/send` 报 **60020** → 需配「企业可信IP」，而配可信 IP 前置条件是
+  「可信域名」或「接收消息服务器URL」→ 无自有域名时**此路不通**，已改用群机器人；
+- 群机器人 webhook 刚创建时可能返回 **93000 invalid webhook url**（实测等约 1 分钟后自动生效）；
+- 「企业全员群」与「外部群/客户群」**都不支持群机器人**，只有纯内部普通群支持。
+
 ## 测试
 
 ```bash

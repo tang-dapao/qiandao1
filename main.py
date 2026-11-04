@@ -14,9 +14,11 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 import yaml
 
+import notify
 from adb_ui import AdbUI
 from flow import Flow
 
@@ -102,6 +104,12 @@ def main():
     parser.add_argument("--accounts", action="store_true",
                         help="强制启用多账号模式（覆盖 config accounts.enabled；"
                              "仅完整主流程生效）")
+    parser.add_argument("--only-account", metavar="NICK_OR_UIN",
+                        help="只跑指定账号（昵称或 UIN，用于单账号实测/补跑余量）；"
+                             "其余账号本轮跳过，不影响账号列表配置")
+    parser.add_argument("--from-account", metavar="NICK_OR_UIN",
+                        help="从指定账号开始跑（含该账号，按 accounts.list 顺序"
+                             "跑完剩余账号；用于中断后续跑，前面已跑完的不再重跑）")
     parser.add_argument("--only-switch", action="store_true",
                         help="调试：只按 config accounts.list 逐个切号并校验，"
                              "不跑主流程")
@@ -155,6 +163,40 @@ def main():
     acc_list = [a for a in (acc_cfg.get("list") or [])
                 if a.get("uin") and a.get("enabled", True)]
 
+    # --only-account（2026-10-29）：单账号实测 / 补跑余量。
+    # 只过滤**本轮目标**，不改账号列表配置 —— 比临时改 accounts.local.yaml
+    # 安全（不会跑完忘了恢复，也不会影响次日全量跑批）。
+    if getattr(args, "only_account", None):
+        _kw = str(args.only_account).strip()
+        _picked = [a for a in acc_list
+                   if _kw in (str(a.get("nick") or ""), str(a.get("uin") or ""))]
+        if not _picked:
+            logger.error("--only-account %r 未匹配到 accounts.list 中的账号（%s）",
+                         _kw, [a.get("nick") for a in acc_list])
+            return
+        logger.info("--only-account：本轮只跑 %s（%s），其余 %d 个账号跳过",
+                    _picked[0].get("nick"), _picked[0].get("uin"),
+                    len(acc_list) - len(_picked))
+        acc_list = _picked
+
+    # --from-account（2026-10-30）：从某个账号开始跑完剩余（含自己）。
+    # 用途 = 中途中断/单账号实测后**续跑**，前面已跑完的账号不再重复跑。
+    # 与 --only-account 的区别：这个保留列表**顺序与余量**，只砍掉前缀。
+    if getattr(args, "from_account", None):
+        _kw2 = str(args.from_account).strip()
+        _idx = next((i for i, a in enumerate(acc_list)
+                     if _kw2 in (str(a.get("nick") or ""),
+                                 str(a.get("uin") or ""))), None)
+        if _idx is None:
+            logger.error("--from-account %r 未匹配到 accounts.list 中的账号（%s）",
+                         _kw2, [a.get("nick") for a in acc_list])
+            return
+        _skipped = [a.get("nick") for a in acc_list[:_idx]]
+        acc_list = acc_list[_idx:]
+        logger.info("--from-account：从 %s 开始，本轮跑 %s（跳过前 %d 个：%s）",
+                    _kw2, [a.get("nick") for a in acc_list], len(_skipped),
+                    _skipped or "无")
+
     # --only-switch：只切号验证（调试用，不跑主流程）
     if args.only_switch:
         targets = [a for a in acc_list if a.get("enabled", True)]
@@ -185,6 +227,13 @@ def main():
         flow.run_all_accounts(acc_list, do_signin, do_feedback, ad_times,
                               rotate=rotate, group=group,
                               whitelist=wl or None)
+        # 2026-10-27 方案 A：「最后一个账号的完成告警丢失」修复。
+        # 账号告警走 notify 后台 daemon 线程；进程退出时 atexit 只有 3s
+        # 等待窗口。最后一个账号（唐灵固定 4/4）的告警发出后主流程常
+        # ~1ms 就结束，推送被退出竞态丢弃（实测 10-26 12:35 / 10-27
+        # 13:56 均无「告警已推送」确认行，企微收不到电量结果）。
+        # 此处显式等待队列清空并给足 8s；前三个账号耗时零影响。
+        notify.flush(8.0)
         logger.info("多账号全自动流程结束")
         return
 
@@ -235,12 +284,18 @@ def main():
                 ad_times if ad_times is not None else "默认",
                 ("滑动窗口(%d台)" % group) if rotate else "同机连看")
     try:
+        t_single = time.time()          # 2026-10-23：单账号模式耗时（推送用）
         flow.run_all(robots, do_signin, do_feedback, ad_times,
                      rotate=rotate, group=group)
     finally:
         # 运行汇总（2026-09-22 用户需求）：每台机器人 签到/反馈 是否成功 +
         # 本次看广告支数；放 finally —— 中途异常也保证出汇总（含日志+文件）。
         flow._log_summary(do_signin=do_signin, do_feedback=do_feedback)
+        # 2026-10-23 用户需求：跑完推一条「电量 + 耗时」到微信。
+        # 多账号模式的推送在 run_all_accounts 内部逐账号触发，这里只覆盖
+        # 单账号路径（--robots / --ad-only / accounts.enabled=false）。
+        flow._push_account_summary("单账号模式", "", 1, 1,
+                                   time.time() - t_single, True, robots)
     logger.info("全自动流程结束")
 
 

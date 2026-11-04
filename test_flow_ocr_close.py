@@ -507,7 +507,7 @@ class TestCloseAd(Base):
         self.assertTrue(f._close_ad())
         # F11：广告页关闭按钮由 OCR 正向定位（非盲点），显式 trusted=True 放行
         # 任务中心页的盲点坐标禁令。
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._tap_node.assert_not_called()
         f.ui.tap.assert_not_called()
         f.ui.back.assert_not_called()
@@ -542,7 +542,7 @@ class TestCloseAd(Base):
         self.assertTrue(f._close_ad())
         # F11：广告页关闭按钮由 OCR 正向定位（非盲点），显式 trusted=True 放行
         # 任务中心页的盲点坐标禁令。
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
 
     def test_ocr_close_fail_triggers_selfheal_then_auto_ended(self):
         # 正向直关 tap 后仍未回任务中心 → 先巡检一次 Badcase/AI 好友（F5 自愈）
@@ -555,7 +555,7 @@ class TestCloseAd(Base):
         self.assertTrue(f._close_ad())
         # F11：广告页关闭按钮由 OCR 正向定位（非盲点），显式 trusted=True 放行
         # 任务中心页的盲点坐标禁令。
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._dismiss_badcase.assert_called_once()   # 直关失败 → 巡检一次
 
     def test_direct_close_confirm_retry_avoids_fallback(self):
@@ -566,7 +566,7 @@ class TestCloseAd(Base):
         f._ocr_find = self._ocr_router(close=[(120, 152)])
         f._back_at_taskcenter = mock.Mock(side_effect=[False, True])
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._dismiss_badcase.assert_not_called()    # 重试救回 → 无需自愈巡检
         self.assertEqual(f._back_at_taskcenter.call_count, 2)  # 首次+重试各一次
 
@@ -583,7 +583,11 @@ class TestCloseAd(Base):
     def test_fallback_uiautomator_path(self):
         # OCR 读不到关闭按钮 → uiautomator 找到「关闭广告」节点
         # → tap_node 关闭成功（正向定位路径之一）
+        # P6（2026-10-28）注：顶条 dump 前探（N3 的 ad_close_dump_probe +
+        # P1-b 的 ad_close_ocr_first）默认会抢先命中同一节点，本用例要测的是
+        # **步骤 1 uiautomator 定位**这条路径，故显式关掉两个前探开关。
         f = self._stub()
+        f.wf = {"ad_close_dump_probe": False, "ad_close_ocr_first": False}
         node = Node("关闭广告", 0, 140, 200, 164)
         f.ui.nodes.return_value = [node]
         f._ocr_find = self._ocr_router()
@@ -674,7 +678,7 @@ class TestCloseAd(Base):
         self.assertTrue(f._close_ad())
         # F11：广告页关闭按钮由 OCR 正向定位（非盲点），显式 trusted=True 放行
         # 任务中心页的盲点坐标禁令。
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._tap_node.assert_not_called()
         f.ui.tap.assert_not_called()
 
@@ -1126,7 +1130,7 @@ class TestPrefetchClose(Base):
         f = self._stub()
         f._prefetch_close = ((141, 150), flow_mod.time.time())
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(141, 150, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(141, 150, pause=0.35, trusted=True)
         f._find_close_node.assert_not_called()   # 跳过 dump 定位段
         self.assertIsNone(f._prefetch_close)     # 用完即弃
 
@@ -1208,7 +1212,7 @@ class TestQuickCheckDirectClose(Base):
         f._ad_close_pos = mock.Mock(return_value=(120, 152))
         f._prefetch_close = ((120, 152), flow_mod.time.time())
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._taskcenter_confirmed_by_ocr.assert_not_called()  # 跳过全屏守卫
         self.assertIsNone(f._prefetch_close)
 
@@ -1227,7 +1231,7 @@ class TestQuickCheckDirectClose(Base):
         f._ad_close_pos = mock.Mock(return_value=None)
         f._prefetch_close = ((141, 150), flow_mod.time.time())
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(141, 150, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(141, 150, pause=0.35, trusted=True)
         f._taskcenter_confirmed_by_ocr.assert_called()      # 走了全屏守卫
 
     def test_back_cap_logs_page_snapshot(self):
@@ -1279,7 +1283,7 @@ class TestNoPrefetchOcrProbe(Base):
     def test_probe_hit_skips_guard_and_dump(self):
         f = self._stub(probe_hit=True)
         self.assertTrue(f._close_ad(tc_seen=False))
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._taskcenter_confirmed_by_ocr.assert_not_called()   # 跳过全屏守卫
         f._find_close_node.assert_not_called()               # 跳过 uiautomator
         self.assertEqual(f._ad_close_pos.call_count, 1)      # 只有前探这一次
@@ -1309,7 +1313,7 @@ class TestNoPrefetchOcrProbe(Base):
         f = self._stub(probe_hit=True)
         f._prefetch_close = ((141, 150), flow_mod.time.time())
         self.assertTrue(f._close_ad(tc_seen=False))
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         self.assertIsNone(f._prefetch_close)                 # 缓存已消费
 
 
@@ -1478,7 +1482,7 @@ class TestCloseAdDumpFirst(Base):
     def test_dump_miss_falls_back_to_ocr_tap(self):
         f = self._stub([], ocr_close=(120, 152))
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._tap_node.assert_not_called()
 
     def test_knob_off_restores_ocr_only(self):
@@ -1486,7 +1490,7 @@ class TestCloseAdDumpFirst(Base):
         f = self._stub([_n("关闭广告")], ocr_close=(120, 152),
                        wf={"ad_close_dump_probe": False})
         self.assertTrue(f._close_ad())
-        f._tap.assert_called_once_with(120, 152, pause=1.5, trusted=True)
+        f._tap.assert_called_once_with(120, 152, pause=0.35, trusted=True)
         f._tap_node.assert_not_called()
 
     def test_dump_hit_but_confirm_fails_goes_badcase(self):
@@ -1496,6 +1500,31 @@ class TestCloseAdDumpFirst(Base):
         f.wf = {"ad_close_retries": 1, "ad_close_max_backs": 1}
         f._close_ad()
         f._dismiss_badcase.assert_called()       # 快检段与兜底段各巡检一次
+
+
+class TestCloseSettle(Base):
+    """P6（2026-10-28）：关闭链 tap 后的沉降等待参数化。
+
+    旧行为 = tap(pause=1.5) + sleep(ad_close_settle=1.0)（共 2.5s 纯空等）；
+    新行为 = tap(pause=0.35) + sleep(ad_close_settle=1.0)（共 1.35s），
+    并由确认链的 gap 重试兜住沉降不足。开关必须可一键回退。
+
+    注：曾计划用 dump 探针轮询「药丸消失」，因 u2 的 dump(timeout) 不吃
+    timeout、任务中心 WebView dump 实测 1.89s（坑 20）而否决 —— 别再加。
+    """
+
+    def test_knob_off_restores_legacy_pause(self):
+        self.f.wf = {"ad_close_fast_settle": False}
+        self.assertEqual(self.f._close_tap_pause(), 1.5)
+
+    def test_default_pause_is_fast(self):
+        self.f.wf = {}
+        self.assertEqual(self.f._close_tap_pause(), 0.35)
+
+    def test_fast_pause_keeps_settle_intact(self):
+        # 沉降窗口仍保留 settle（页面就绪余量），只是第一段被压缩
+        self.f.wf = {"ad_close_tap_pause": 0.4, "ad_close_settle": 1.0}
+        self.assertEqual(self.f._close_tap_pause(), 0.4)
 
 
 if __name__ == "__main__":

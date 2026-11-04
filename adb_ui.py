@@ -377,6 +377,88 @@ class AdbUI:
         self._notify_action()
         time.sleep(pause)
 
+    def home(self, pause: float = 1.0):
+        """回桌面（KEYCODE_HOME）。
+
+        P8（2026-10-29）：`am start` 在「目标 App 的 task 已存在、但被另一个
+        task（系统设置/桌面）压在下面」时只会输出
+        `Warning: Activity not started, its current task has been brought to
+        the front` 而**实际前台仍是那个压着的 task**（真机实测：桌面→am start
+        →前台仍是 com.android.settings）。先 HOME 清掉压顶 task 再 am start
+        才能稳定拉回。
+        """
+        self._run("shell", "input", "keyevent", "3")
+        self._invalidate_cache()
+        self._notify_action()
+        time.sleep(pause)
+
+    def foreground_package(self, timeout: float = 8.0) -> Optional[str]:
+        """读前台 Activity 的**包名**；读不到返回 None（2026-10-29，P8）。
+
+        用途：判断「QQ 是否还在前台」。`_safe_back_to_robot_list` 的兜底链
+        曾经在 QQ 主壳上继续物理 BACK → 把 QQ 直接退出到桌面/系统设置，之后
+        每台机器人都导航失败并连败弃权（2026-10-29 实测：38/100 支）。
+
+        **刻意只做包名，不判断具体 Activity**：本流程只关心「是不是 QQ」，
+        QQ 自己内部的 SplashActivity / 聊天页 / 任务中心都算「还在 QQ」，
+        判断 Activity 会引入无谓的版本脆弱性。
+
+        实现：解析 `dumpsys activity activities` 里
+        `topResumedActivity=ActivityRecord{... u0 <pkg>/<act> t75}` 那一行的
+        `pkg/` 前缀（也在 mResumedActivity 上兜底）。只按「含点的第一段
+        token + /」取，避开 `ActivityRecord{5868051` / `u0` 这类无点 token。
+
+        成本：一次 dumpsys ≈ 0.1~0.3s。**只在兜底路径调用**，成功路径零成本。
+        """
+        try:
+            txt = self._run("shell", "dumpsys", "activity", "activities",
+                            timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return None
+        for line in txt.splitlines():
+            if ("topResumedActivity" not in line
+                    and "mResumedActivity" not in line):
+                continue
+            m = re.search(r"([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)/", line)
+            if m:
+                return m.group(1)
+        return None
+
+    def am_start(self, component: str, timeout: float = 20.0) -> bool:
+        """`am start -n <component>` 拉起/前置目标 App；成功返回 True。
+
+        注意：不保证一定到前台（见 `home()` 的 docstring），调用方需自己用
+        `foreground_package()` 复核。
+        """
+        try:
+            self._run("shell", "am", "start", "-n", component, timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return False
+        self._invalidate_cache()
+        self._notify_action()
+        return True
+
+    def swipe_from_to(self, x1: int, y1: int, x2: int, y2: int,
+                      duration_ms: int = 600, pause: float = 1.0):
+        """任意起止点的滑动（2026-10-30 新增，供「账号面板内小幅上滑」用）。
+
+        **为什么不能用 `swipe_up()`**：`swipe_up` 是「整屏翻页」语义 ——
+        固定 y 1500→700（跨 800px）。实测在「切换账号」面板（居中对话框，
+        5 个账号时列表视口 y≈582~1270）上，起点 y=1500 落在对话框**外**，
+        整条手势会被当成「点外部关闭」→ 面板直接消失（2026-10-30 真机
+        v2/v4/v7b 探针各复现一次）。必须在**列表视口内部**做 200~300px 的
+        短距离拖动才能只滚列表、不关面板。
+
+        `duration_ms` 宁慢勿快：600~700ms 是「拖」不是「甩」，松手后没有
+        惯性过冲，落位可预期（v8 探针：700ms/300px 稳定，一次把第 5 个
+        账号的 UIN 拖进视口）。
+        """
+        self._run("shell", "input", "swipe",
+                  str(x1), str(y1), str(x2), str(y2), str(duration_ms))
+        self._invalidate_cache()
+        self._notify_action()
+        time.sleep(pause)
+
     def input_text(self, text: str, pause: float = 0.8):
         """向当前焦点输入框注入文本（adb input text）。
 

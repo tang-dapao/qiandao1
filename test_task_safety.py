@@ -746,7 +746,12 @@ class TestScrollToTopDumpReduction(unittest.TestCase):
         pages += [[nd(f"行{i}", 300 + 30 * i)] for i in range(1, depth + 1)]
         ui = FakeUI(pages)
         ui.pos = depth
-        return make_flow(ui), ui
+        f = make_flow(ui)
+        # F3（2026-11-02）：滑顶新增「是否真在任务中心」前置校验，命中才滑。
+        # 本类是**滑动计数**回归（隔轮查锚点），页面帧里只有「行N」没有外壳
+        # 特征 → 用 `_page_tc` 语义位声明「就在任务中心」，否则会被 guard 挡掉。
+        f._page_tc = True
+        return f, ui
 
     def test_already_at_top_no_swipe(self):
         f, ui = self._flow(depth=0)

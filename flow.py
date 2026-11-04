@@ -18,6 +18,11 @@ from typing import Callable, List, Optional, Tuple
 
 from adb_ui import AdbUI, Node
 
+try:  # 2026-10-23 自探测：异常聚合层（只记账+告警，不做任何页面操作）
+    from watch import get_watch
+except Exception:  # noqa: BLE001  缺模块时降级为无探测，绝不阻断主流程
+    get_watch = None
+
 try:
     from PIL import Image
     import pytesseract
@@ -208,6 +213,19 @@ class Flow:
     # 反馈内容已用集合（2026-09-26 用户方案：5 位随机数 + 持久化防重）。
     # 类级默认 None（懒加载标记），防 __new__ 绕过 __init__ 时缺属性。
     _fb_used = None
+    # 2026-10-23 自探测：异常聚合器。类级默认 None → 直接调 watch 的钩子点
+    # 全部以 `if self._watch:` 守卫（单测 Flow.__new__ 时零影响）。
+    _watch = None
+    # P8（2026-10-29）：退穿自愈的递归闸门。`_safe_back_to_robot_list` 拉回 QQ
+    # 后要调 `_nav_robot_list()`，而后者在 dump 卡死分支会回调本函数 —— 置位
+    # 期间嵌套调用只走旧的纯 BACK 行为，避免无限递归。类级默认值同样是为了
+    # 兜住 `Flow.__new__` 绕过 __init__ 的单测用法。
+    _nav_recovering = False
+    # 2026-10-31：最近一支广告的**结束时刻**与所在机器人名 —— 供「回落同机连看
+    # 前补等 CD」用（`_wait_same_device_cd`）。类级默认值同样是给
+    # `Flow.__new__` 绕过 __init__ 的单测用法兜底（getattr 拿不到就是默认）。
+    _last_ad_ts = 0.0
+    _last_ad_robot = None
 
     def __init__(self, config: dict, ui: AdbUI, ocr=None):
         self.cfg = config
@@ -273,6 +291,17 @@ class Flow:
         #      等待器/重确认，风险有界。
         self._init_cache_state()
         ui.on_action = self._invalidate_shot_cache
+        # 2026-10-23 自探测（用户需求）：把「和预期不一样」的现场聚合成微信告警。
+        # 只做判定与聚合，**不新增任何 dump/截图**（截图仅在真正告警时取一次），
+        # 且所有钩子内部全吞异常 —— 告警系统自身不允许影响签到主流程。
+        # 依赖缺失（无 watch.py / 无 notify 凭据）时静默降级为「只记日志」。
+        if get_watch is not None:
+            try:
+                self._watch = get_watch(config)
+                self._watch.bind(self)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("探测层初始化失败（已忽略，流程照常）：%s", e)
+                self._watch = None
 
     def _init_cache_state(self):
         """初始化截图/OCR 结果缓存状态（A2/A3）。独立方法便于 __new__ 绕过
@@ -292,6 +321,12 @@ class Flow:
         # `_ad_landing_is_taskcenter` 三连 dump 判定，命中后
         # `_watch_ad_once` 会补点一次，且不再白等 16s 等待窗。
         self._ad_not_opened = False
+        # 2026-11-03 用户报的计数 bug：`_watch_ad_once` 在「屏幕已是 X/10 且
+        # X>=target」时直接 `return True`（跳过），调用方把它当「看完一支」
+        # 无条件 +1 → **满额机器人白记 1 支**（11-02 续跑时首轮计数虚高即此因）。
+        # 用一次性标记把「跳过」和「真看了」区分开：`_watch_ad_once` 入口置
+        # False，命中跳过分支置 True，调用方据此决定是否记账。
+        self._ad_skipped_full = False
         # 反馈内容已用集合（2026-09-26）：None=未从记录文件懒加载；单测可预设
         # 空 set 跳过文件 IO。防重细节见 _new_feedback_text。
         self._fb_used = None
@@ -302,6 +337,12 @@ class Flow:
         self._landing_stats = {"tc_ocr": 0, "overlay_wrong": 0, "both_false": 0,
                                "tc_ocr_fail": 0, "both_false_fail": 0}
         self._landing_branch = None   # 当前台落点断言分支；None=本台未触发落点断言
+        # 试玩广告「奖励页」埋点（2026-11-03，坑 44）：坑 41 已证「奖励页出现
+        # ⇔ 电量到账」，全期 26 样本零例外（有奖励页 18/18 到账、无奖励页 0/8）。
+        # 自 2026-11-01 03:39 起试玩创意整体不发奖励页，且 11-03 试玩占比从
+        # 11-02 的 0% 跳到 ~70% ⇒ 需要常态化计数才能在日志/汇总里看见损失。
+        # 纯计数 + 连续告警，**零行为改动**；汇总见 _log_summary。
+        self._minigame_stats = {"total": 0, "reward": 0}
 
     def _landing_stat(self, branch: str) -> None:
         """P1 埋点（2026-10-19）：落点断言分支计数 + 记录当前台分支。
@@ -467,8 +508,16 @@ class Flow:
 
     def _dump_stuck(self) -> bool:
         """导航上下文：页面连续 dump 完全失败(>=3 次调用)视为卡死（如误入
-        浏览器/动画页无法 idle），应中止当前导航转恢复，不再空转重试。"""
-        return self.ui.dump_fail_streak >= 3
+        浏览器/动画页无法 idle），应中止当前导航转恢复，不再空转重试。
+
+        2026-10-30：加类型容错。单测里 `ui` 是 `unittest.mock.Mock`，
+        `Mock() >= 3` 直接 TypeError —— 与 `_safe_back_to_robot_list` 内
+        `_dump_failing()` 的口径保持一致：读不到计数就当作「读屏正常」。
+        """
+        try:
+            return int(self.ui.dump_fail_streak) >= 3
+        except (TypeError, ValueError):
+            return False
 
     def _find_scroll(self, text: str, max_scroll: int = 10,
                      down_first: bool = True,
@@ -761,6 +810,128 @@ class Flow:
         nw = float(self.t.get("nav_wait", 8.0))
         return max(nw, pw)
 
+    # ----------------------------------------------------------
+    # P8（2026-10-29）：退穿自愈 —— QQ 被 BACK 退出到桌面/设置后拉回来
+    # ----------------------------------------------------------
+    def _qq_package(self) -> str:
+        """QQ 包名（config.yaml `app.package`），取不到回退硬编码默认值。"""
+        app = (getattr(self, "cfg", None) or {}).get("app") or {}
+        return app.get("package") or "com.tencent.mobileqq"
+
+    def _qq_component(self) -> str:
+        """QQ 的 `am start -n` component（config.yaml `app.package/activity`）。"""
+        app = (getattr(self, "cfg", None) or {}).get("app") or {}
+        pkg = app.get("package") or "com.tencent.mobileqq"
+        act = app.get("activity") or "com.tencent.mobileqq.activity.SplashActivity"
+        return "%s/%s" % (pkg, act)
+
+    def _foreground_package(self):
+        """读前台包名；**拿不到可信字符串一律返回 None**（2026-10-29 P8）。
+
+        为什么要 isinstance 校验：`ui` 在大量单测里是 `unittest.mock.Mock`，
+        对任意属性/方法都会自动生成 Mock 对象而非报错 —— 不校验的话
+        `Mock() != "com.tencent.mobileqq"` 恒为 True，会把每个用例都判成
+        「脱离 QQ」并触发拉回，导致假红（同 MEMORY 坑 18 的教训）。
+        自定义 fake（无该方法）同样返回 None → 保持旧行为。
+        """
+        fn = getattr(self.ui, "foreground_package", None)
+        if fn is None:
+            return None
+        try:
+            val = fn()
+        except Exception:  # noqa: BLE001
+            return None
+        return val if isinstance(val, str) else None
+
+    def _settle_after_am_start(self) -> bool:
+        """`am start` 拉回 QQ 后，等 a11y 树真正反映 QQ 页面（F1，2026-11-02）。
+
+        **为什么必须等**（11-02 事故：唐灵 3 台 + 凌津渡整号报废）：
+        `ui.nodes()` 有 0.8s TTL 缓存，而 `am start` 走 `adb shell`、**不经过
+        UI 类**，不会失效缓存 → 拉回后立刻做的判据吃的是「桌面那次 dump」：
+        `_on_qq_main_shell()` 于是判 False，兜底继续物理 BACK；而 QQ 在
+        联系人/消息页按一次 BACK 就是**退出 App** → 又退穿 → 死循环
+        （当天 `安全返回` 被调用 10 次全失败）。日志实测：`am start` 之后
+        **仅 0.7s** 就开始判，正好落在 TTL 窗口内。
+
+        做法：① 强制失效节点缓存；② 轮询 `_on_qq_main_shell()`，命中即返回
+        （正常 0.2~0.6s）；超时返回 False 但**不改变调用方语义** —— 调用方
+        仍按原逻辑继续，不因这里没等到就判失败。
+        只在异常分支付钱，成功路径零开销（不进这个函数）。
+        """
+        inv = getattr(self.ui, "_invalidate_cache", None)
+        if inv is not None:
+            try:
+                inv()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("失效节点缓存异常（忽略）：%s", e)
+        try:
+            timeout = float(self.wf.get("am_start_settle", 3.0))
+        except (TypeError, ValueError):
+            timeout = 3.0
+        ok = self._wait_until(self._on_qq_main_shell, max(0.0, timeout),
+                              desc="QQ 主壳就绪")
+        if ok:
+            logger.info("am start 后就绪确认：dump 已反映 QQ 主壳")
+        else:
+            logger.warning("am start 后 %.1fs 内 dump 未反映 QQ 主壳"
+                           "（继续按原逻辑兜底）", timeout)
+        return ok
+
+    def _recover_qq_foreground(self) -> bool:
+        """把被退穿的 QQ 拉回前台；成功返回 True。
+
+        **为什么需要**（2026-10-29 真机事故，38/100 支广告报废）：
+        `_safe_back_to_robot_list` 的兜底链在「QQ 主壳但停在动态 tab」时按
+        觅夏事故防御（2026-09-30）继续物理 BACK —— 但那时 QQ 已没有内部可退
+        的层，BACK 等于「退出 App」：桌面 launcher → 系统设置。之后所有导航
+        都在桌面上执行，每台机器人 3 次失败 → 9 台连环弃权。
+        **BACK 只在「还在 QQ 内部」时安全**，脱离后唯一正确的动作是
+        `am start` 拉回。
+
+        **为什么先 HOME 再 am start**：目标 App 的 task 已存在、但被另一个
+        task（系统设置/桌面）压在上面时，`am start -n` 只会打印
+        `Warning: Activity not started, its current task has been brought to
+        the front`，**前台仍然是那个压顶的 task**（本机实测）。先 KEYCODE_HOME
+        清掉压顶 task 再 start 才能稳定拉回。
+
+        成本：仅兜底路径。每次 2 次 dumpsys + 最多 2 次 am start，约 5~8s。
+        """
+        pkg = self._qq_package()
+        comp = self._qq_component()
+        tries = max(1, int(self.wf.get("escape_recover_tries", 2)))
+        for i in range(tries):
+            started = getattr(self.ui, "am_start", None)
+            if started is not None:
+                try:
+                    started(comp)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("am start 异常：%s", e)
+            time.sleep(2.5)
+            fg = self._foreground_package()
+            if fg == pkg:
+                logger.info("QQ 已拉回前台（am start 第 %d/%d 次，前台=%s）",
+                            i + 1, tries, fg)
+                # F1（2026-11-02）：前台=QQ 不代表 dump 已跟上（TTL 0.8s 缓存
+                # 不吃 am start）→ 先失效缓存并等主壳进树，再交回调用方判断。
+                self._settle_after_am_start()
+                return True
+            logger.warning("am start 后前台仍是 %s（非 QQ）→ 回桌面清压顶 task "
+                           "后重试（第 %d/%d 次）", fg, i + 1, tries)
+            home = getattr(self.ui, "home", None)
+            if home is not None:
+                try:
+                    home(pause=1.0)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("回桌面异常：%s", e)
+        fg = self._foreground_package()
+        if fg == pkg:
+            logger.info("QQ 已拉回前台（末次复核，前台=%s）", fg)
+            self._settle_after_am_start()     # F1，同上
+            return True
+        logger.error("QQ 拉回失败：%d 轮 am start 后前台=%s（非 QQ）", tries, fg)
+        return False
+
     def _safe_back_to_robot_list(self, max_back: int = 6) -> bool:
         """把设备安全带回「机器人列表」（P0 + F1/F4）。
 
@@ -786,6 +957,30 @@ class Flow:
                        max_back)
         # F11：离开任务中心语义 → 关闭 banner 禁点区（列表页 y<440 的点击合法）
         self._page_tc = False
+
+        # P8（2026-10-29）：进来先确认 QQ 还在前台。若已脱离（桌面/系统设置），
+        # 下面的物理 BACK 只会把设备带得更远，必须先把 QQ 拉回来。
+        # `_nav_recovering` 防递归：拉回后要调 `_nav_robot_list()`，而它在
+        # dump 卡死分支会**回调本函数**（flow._nav_robot_list ~ L900）——
+        # 不加闸门就是无限递归。置位期间嵌套调用只走旧的纯 BACK 行为。
+        escape_tries = 0
+        if self.wf.get("escape_recover", True) and not self._nav_recovering:
+            fg0 = self._foreground_package()
+            if fg0 is not None and fg0 != self._qq_package():
+                logger.warning(
+                    "安全返回前置检查：QQ 已不在前台（前台=%s，疑似被过度 BACK "
+                    "退穿到桌面/系统设置）→ 不做物理 BACK，先 am start 拉回", fg0)
+                escape_tries += 1
+                if self._recover_qq_foreground():
+                    self._nav_recovering = True
+                    try:
+                        self._nav_robot_list()
+                    finally:
+                        self._nav_recovering = False
+                    if self._looks_like_robot_list():
+                        self._at_robot_list = True
+                        logger.info("拉回 QQ 后已直接回到机器人列表")
+                        return True
 
         def _dump_failing() -> bool:
             # dump 连续失败 = 读屏盲区（Mock ui 的 dump_fail_streak 不可 int 转换
@@ -831,6 +1026,33 @@ class Flow:
                     return False
             else:
                 blind = 0
+            # P8（2026-10-29）：BACK 前再确认一次「还在不在 QQ」。
+            # 在 QQ 内部子页上 BACK 是安全的（唯一能清掉 dump 不可见覆盖层的
+            # 动作，见上面觅夏防御）；一旦前台已不是 QQ（桌面 launcher / 系统
+            # 设置），BACK 只会把设备越带越远 —— 2026-10-29 实测连按 6 次直接把
+            # QQ 退穿到桌面，之后 9 台机器人导航全失败连环弃权。
+            if (self.wf.get("escape_recover", True)
+                    and not self._nav_recovering
+                    and escape_tries < max(1, int(
+                        self.wf.get("escape_recover_tries", 2)))):
+                fg = self._foreground_package()
+                if fg is not None and fg != self._qq_package():
+                    escape_tries += 1
+                    logger.warning(
+                        "安全返回途中检测到已脱离 QQ（第 %d 步，前台=%s）→ "
+                        "停止物理 BACK，am start 拉回（第 %d 次自愈）",
+                        i + 1, fg, escape_tries)
+                    if self._recover_qq_foreground():
+                        self._nav_recovering = True
+                        try:
+                            self._nav_robot_list()
+                        finally:
+                            self._nav_recovering = False
+                        if self._looks_like_robot_list():
+                            self._at_robot_list = True
+                            logger.info("拉回 QQ 后已回到机器人列表")
+                            return True
+                    continue     # 消耗一次迭代，不盲按 BACK
             self.ui.back(pause=1.5)
             time.sleep(1.0)
         self._at_robot_list = False
@@ -1273,9 +1495,19 @@ class Flow:
             return False
         anchor = self._newfeat_anchor_hit()
         if not anchor:
+            # 2026-10-23 自探测：有「关闭」节点但文案不在锚点表 —— 官方弹窗
+            # 换了标题（历史：2026-10-22「全新玩法已上线」少了「经」字导致
+            # 恒不匹配、静默跳过）。旧逻辑只 return False，人是不知道的；
+            # 这里上报一次「未知弹窗」+ 现场截图，词表该补就能立刻补。
+            if self._watch:
+                self._watch.popup(unknown=True)
             return False
         logger.info("检测到新功能/新玩法弹窗 → 关闭（锚点=%s，屏文=%s）",
                     anchor, self._screen_texts(8))
+        # 2026-10-23 自探测：已知弹窗也上报（信息量低但能看出官方推新频率），
+        # 按锚点文案去重，30 分钟内同文案只推一次。
+        if self._watch:
+            self._watch.popup(anchor)
         self._tap_node(close)
         time.sleep(1.5)
         # 确认消失；仍在（动画/双弹窗）再点一次，最多重试 1 次
@@ -1734,6 +1966,39 @@ class Flow:
             logger.warning("三层返回后未见机器人列表（可能仍在子页），转安全返回兜底")
         return self._safe_back_to_robot_list()
 
+    def _in_taskcenter_now(self) -> bool:
+        """当前是否**真在**任务中心（F3，2026-11-02）。
+
+        **为什么需要**（11-02 事故）：退台链第 2 轮兜底在「三层返回未达列表
+        且 `_on_qq_main_shell()` 为假」时会「滑到顶再补退一轮」，但那时页面
+        早就不在任务中心（广告页/试玩页/资料卡）—— 8 次 swipe 白烧 15s，
+        还把这页滑得更远，随后 3 次物理 BACK 直接把 QQ 退穿到桌面。
+        滑顶动作只在**任务中心**有语义，别处做纯属帮倒忙。
+
+        判据取并集（任一命中即算「在任务中心」）：
+          ① F11 的 `_page_tc` 语义位；
+          ② 任务中心外壳特征 `_TC_SHELL_KEYS`（收支详情/当前电量/去充电）；
+          ③ 任务行「每日签到」；
+          ④ 广告行标题「看视频赚电量」（`AD_ROW_LABELS` 系，靠页面下半部，
+             任务中心被滚下去时它比 ① ② ③ 更容易还在屏）。
+        全无才判「不在任务中心」。方向刻意偏保守：**宁可多滑**（多滑一次
+        无害，少判一次才是事故），所以读屏异常/控件为 Mock 时一律按
+        「在任务中心」处理，保持旧行为。
+        ⚠️ 刻意**不**收「任务中心」四个字：个人资料卡上也有「任务中心」入口
+        （我们正是从那里进台的），收它会把资料卡误判成任务中心 —— 而那正是
+        本判据要挡的页面之一。
+        """
+        if getattr(self, "_page_tc", False):
+            return True
+        for key in tuple(getattr(self, "_TC_SHELL_KEYS", ()) or ()) + \
+                ("每日签到", "看视频赚电量"):
+            try:
+                if self._find(key):
+                    return True
+            except Exception:  # noqa: BLE001
+                return True
+        return False
+
     def _scroll_to_top_of_taskcenter(self):
         """下滑直至任务中心顶部（返回箭头出现）。
 
@@ -1746,6 +2011,12 @@ class Flow:
         末尾记录实际 swipe/dump 次数，供真机跑分对比。
         """
         logger.info("滑动到任务中心顶部")
+        # F3（2026-11-02）：不在任务中心就别滑。11-02 事故里在广告/子页上盲滑
+        # 8 次（白烧 15s）并把页面推得更远，随后 3 次 BACK 把 QQ 退穿到桌面。
+        if self.wf.get("tc_scroll_guard", True) and not self._in_taskcenter_now():
+            logger.warning("跳过滑顶：当前不在任务中心（页面已切走，"
+                           "盲滑无意义且会加剧退台失控）")
+            return
         n_swipes = 0
         n_checks = 0
         do_check = True            # 首轮预检，其后每 2 次 swipe 查一次
@@ -1833,8 +2104,50 @@ class Flow:
         else:
             logger.info("签到浮层已消失，跳过关闭 ✕ 盲点（F11 防 banner 误触）")
         time.sleep(1.5)
+        # D1（2026-10-28 用户需求）：签到**是否真的生效**回读（只检测+告警）。
+        self._verify_signin_effective()
         logger.info("签到流程完成")
         return True
+
+    def _verify_signin_effective(self) -> None:
+        """D1（2026-10-28 用户需求）：签到回读 —— 任务行应变成 n/n。
+
+        为什么需要：`_signin` 现在的成功判据只有「点签到后弹出了每日免费领
+        浮层」。浮层出现 ≠ 签到生效（点击被吞 / 服务端未记账时，浮层都可能
+        照弹）。用户 10-28 截图确认了终态：任务行「每日签到 1/1」+ 按钮
+        「连签50天」。
+
+        判据：重读任务行 ratio ——
+          - `n/n`（含 1/1）→ 生效，正常；
+          - `0/n`（比值未达标）→ 明确未生效，进 `signin_verify` 连续计数告警；
+          - 读不到行 / 行内无计数 → **跳过不判**（新版式任务行常被顶出可见区，
+            坑 17；把「读不到」当失败就是误报）。
+
+        只做检测与告警，**不改 `_signin` 返回值** —— 上层已有 task_ok/task_fail
+        记成功失败，这里再改返回值会打乱重试与汇总口径。
+        """
+        if not self.wf.get("signin_verify", True):
+            return
+        row = self._find_task_row("每日签到")
+        if not row:
+            logger.info("签到回读：未找到任务行（版式/可见区差异），跳过校验")
+            return
+        _btn, _label, ratio = row
+        if not ratio or ratio[1] <= 0:
+            logger.info("签到回读：任务行无计数，跳过校验")
+            return
+        if ratio[0] >= ratio[1]:
+            logger.info("签到回读 ✓：任务行 %d/%d", ratio[0], ratio[1])
+            if self._watch:
+                self._watch.signin_verify("signin_row", True)
+            return
+        logger.warning("签到回读 ✗：任务行仍 %d/%d（已点过签到，疑似未生效）",
+                       ratio[0], ratio[1])
+        if self._watch:
+            self._watch.signin_verify(
+                "signin_row", False,
+                detail="签到后任务行仍是 %d/%d。可能：点「签到」被吞、浮层按钮"
+                       "位置变了、或服务端未记账。" % (ratio[0], ratio[1]))
 
     def _feedback(self) -> bool:
         logger.info("== 问题反馈 ==")
@@ -2026,6 +2339,8 @@ class Flow:
 
     def _watch_ad_once(self, row=None) -> bool:
         logger.info("看一次广告")
+        # 满额跳过标记入口重置（2026-11-03 计数修复，见 _init_cache_state 注释）
+        self._ad_skipped_full = False
         # 2026-09-09 观察确认：任务中心不会自动弹问卷 —— 之前的「Badcase 反馈
         # 问卷」是 _close_ad 盲点 (160,152) 在广告已自动关闭、画面回到任务中心
         # 后误点顶部「QQ AI好友·常见问题答疑」banner 打开的。
@@ -2050,11 +2365,15 @@ class Flow:
                 if self._ad_close_pos() is None:
                     self._note_landing_fail()
                     logger.warning("未找到 看广告/获取随机 行")
+                    if self._watch:
+                        self._watch.ad_result(False, no_row=True)
                     return False
                 logger.warning("find_row 失败但 OCR 读到关闭广告（广告页残留）"
                                "→ 走关闭链路清场后重试")
                 if not self._close_ad():
                     logger.error("广告残留清场失败")
+                    if self._watch:
+                        self._watch.ad_result(False)
                     return False
                 time.sleep(self.t.get("ad_close_wait", 2.0))
                 row = self._find_row(AD_ROW_LABELS[0],
@@ -2062,6 +2381,8 @@ class Flow:
                 if not row:
                     self._note_landing_fail()
                     logger.warning("清场后仍未找到 看广告/获取随机 行")
+                    if self._watch:
+                        self._watch.ad_result(False, no_row=True)
                     return False
         else:
             logger.info("使用 CD 窗口预取的行节点（D 优化，省一次 dump）")
@@ -2070,7 +2391,11 @@ class Flow:
         # （run_all 会按"完成"计 1 次，目标未到继续下次轮转；目标到了自然停）
         target = self.wf.get("ad_times_per_robot", 10)
         if ratio and ratio[0] >= target:
-            logger.info("看广告已达目标次数（%d/%d 目标 %d），跳过",
+            # 2026-11-03 计数修复：这里**什么都没看**，不能算一支。置标记让
+            # 调用方（首轮 / 轮换）不要 +1 —— 旧版一律 return True + 调用方无条件
+            # 记账，导致满额机器人白记 1 支（11-02 续跑 100 虚报的成因之一）。
+            self._ad_skipped_full = True
+            logger.info("看广告已达目标次数（%d/%d 目标 %d），跳过（不计入支数）",
                         ratio[0], ratio[1], target)
             return True
         self._tap_node(btn)
@@ -2092,6 +2417,9 @@ class Flow:
                 ok = self._ad_play_and_close()
             else:
                 logger.warning("补点时已找不到广告行（页面已变），放弃本支")
+        # 2026-10-23 自探测：本支广告的最终结果（成功即清零对应计数）
+        if self._watch:
+            self._watch.ad_result(ok, not_opened=getattr(self, "_ad_not_opened", False))
         return ok
 
     def _ad_play_and_close(self, sheet_ok: bool = False) -> bool:
@@ -2304,6 +2632,8 @@ class Flow:
         # 实测需 2 次：授权页 →（返回）→ 奖励页 →（返回）→ 任务中心。
         backs = int(self.wf.get("ad_minigame_backs", 3))
         exit_confirmed = False
+        # 坑 44（2026-11-03）：奖励页是否出现过。只做统计，不改变退出逻辑。
+        reward_seen = False
         for i in range(1, backs + 1):
             node = self._find("返回", timeout=self._MINIGAME_DUMP_TIMEOUT)
             if not node:
@@ -2312,11 +2642,21 @@ class Flow:
             logger.info("第 %d 次点「返回」@%s", i, node.center)
             self._tap_node(node, pause=1.5)
             if self._at_taskcenter_by_dump():
+                # 坑 44：命中任务中心时原逻辑直接 break，不会再看奖励页。
+                # 这里补读一次（`ui.nodes()` 有 0.8s TTL 缓存，读到的是上一行
+                # `_at_taskcenter_by_dump()` 的同一份快照 ⇒ 零额外开销），
+                # 只为把「奖励页到底出现过没有」记准，不影响任何分支。
+                if not reward_seen and self._minigame_reward_visible():
+                    reward_seen = True
                 logger.info("已回到任务中心（dump 确认）")
                 exit_confirmed = True
                 break
             if self._minigame_reward_visible():
+                reward_seen = True
                 logger.info("已到试玩奖励页（恭喜获得奖励）→ 继续退一层")
+        # 坑 44：链路末尾记一次统计（零成本）。**刻意放在关闭确认之前** ——
+        # 奖励页是广告 SDK 打出来的，与后续是否走 _close_ad 无关。
+        self._record_minigame_reward(reward_seen)
         self._prefetch_close = None      # 与 E 优化同款：本观看周期的预定位作废
         logger.info("[计时] 试玩链路（点进→等→退）%.1fs", time.time() - t0)
         # N2 优化（2026-10-22，10-22 真机实锤）：退出循环**已经用 dump 确认回到
@@ -2353,6 +2693,67 @@ class Flow:
         time.sleep(self.t.get("ad_close_wait", 2.0))
         return True
 
+    def _record_minigame_reward(self, seen: bool) -> None:
+        """试玩广告「奖励页」计数 + 连续告警（坑 44，2026-11-03）。
+
+        为什么值得单独计数（证据见 MEMORY.md 坑 41 / 坑 44）：
+          - `logs/run.log` 全期 251 支签到广告回溯：「经过试玩奖励页」18/18 到账，
+            「未过奖励页」0/8 到账 ⇒ **26 样本零例外**。奖励页是可零成本读到的
+            **到账先行信号**，不必等 D2 的 2s 电量重读。
+          - 2026-11-01 03:39 起试玩创意整体不出奖励页；11-03 试玩占比又从 11-02
+            的 0% 跳到 ~70%（7 支广告 5 支试玩）⇒ 时间照花、电量 0，但此前日志里
+            看不到任何汇总，损失只能靠人工翻屏文。
+
+        ⚠️ 口径边界（别过度解读）：
+          - `seen=False` 只表示**没读到** `_MINIGAME_REWARD_KEYS` 关键词，等价于
+            「大概率不到账」；**是否真的到账仍以 D2（`_verify_signin_ad_reward`
+            的电量差）为准**。文案若被官方改版，这里会误报 ✗ —— 所以它只能当
+            观测指标，不能当唯一判据去做补偿/重看决策。
+          - 普通激励视频走不到这里（只有试玩版式才进 `_play_minigame_ad`）。
+
+        回退：`workflow.minigame_reward_track: false` 整体关闭（含计数与告警）。
+        """
+        if not self.wf.get("minigame_reward_track", True):
+            return
+        stats = getattr(self, "_minigame_stats", None)
+        if stats is None:
+            stats = self._minigame_stats = {"total": 0, "reward": 0}
+        stats["total"] = stats.get("total", 0) + 1
+        if seen:
+            stats["reward"] = stats.get("reward", 0) + 1
+            logger.info("试玩奖励页 ✓（到账信号正常，累计 %d/%d 支）",
+                        stats["reward"], stats["total"])
+            notify = getattr(self, "_watch", None)
+            if notify is not None:
+                try:
+                    notify.signin_verify("minigame_reward", True)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("试玩奖励页计数重置异常（忽略）：%s", e)
+            return
+        stats["no_reward"] = stats.get("no_reward", 0) + 1
+        logger.warning("试玩奖励页 ✗（无奖励页关键词 ⇒ 大概率不到账；累计 %d/%d 支，"
+                       "是否真到账以电量差为准）", stats["no_reward"], stats["total"])
+        notify = getattr(self, "_watch", None)
+        if notify is None:
+            return
+        try:
+            notify.signin_verify(
+                "minigame_reward", False,
+                detail="试玩广告没出现奖励页（恭喜获得奖励 / 已完成试玩）。"
+                       "坑 41/44 实证：奖励页缺失时电量 100%% 不到账"
+                       "（有奖励页 18/18 到账、无奖励页 0/8，26 样本零例外）。"
+                       "本支已计入统计，累计 %d/%d 支无奖励页。"
+                       "⇒ 优先怀疑官方试玩创意停发奖励，而非点击路径问题"
+                       "（同一版式 10-30 全成功）。"
+                       % (stats["no_reward"], stats["total"]),
+                name="",
+                # 2026-11-03 用户反馈：11-03 一天推了 7 条同类告警，太吵。
+                # once=True → 本轮跑批只在第一次达标时推一条，后续只计数。
+                # 回退：workflow.minigame_reward_alert_once: false（回到旧行为）。
+                once=self.wf.get("minigame_reward_alert_once", True))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("试玩奖励页告警异常（忽略）：%s", e)
+
     @staticmethod
     def _is_signin_ad_label(text: Optional[str]) -> bool:
         """签到浮层底部「奖励广告」按钮文案判定（2026-10-09 版式改版，实测）。
@@ -2366,6 +2767,110 @@ class Flow:
         if "看广告" in t:            # 旧文案（兼容）
             return True
         return "看视频" in t and "+" in t
+
+    def _find_signin_ad_button(self):
+        """定位签到浮层底部「奖励广告」按钮（2026-10-28 抽取，供补点复用）。
+
+        返回 `(node, pos)`，两者互斥；都没命中 → `(None, None)`。
+        判据与 `_is_signin_ad_label` 一致：dump 只认 y>=1600（浮层底部，避开
+        背景任务中心行）并取**最底部**节点；OCR 只扫最底条带 y>=1700。
+        """
+        cands = [n for n in self.ui.nodes()
+                 if self._is_signin_ad_label(n.text) and n.y1 >= 1600]
+        btn = max(cands, key=lambda n: n.y1) if cands else None
+        if btn is not None:
+            return btn, None
+        pos = self._ocr_find("看视频", "看广告", region=(0, 1700, 1080, 1920))
+        return None, pos
+
+    def _tap_signin_ad_button(self) -> bool:
+        """点签到奖励广告按钮（dump 节点优先，OCR 兜底）。返回是否点到了。
+
+        抽出来的唯一原因：D3 补点要在「点击被吞」时**重新取节点**再点一次，
+        不能复用上次的坐标快照（与「发消息被吞→重取节点补点」同一条经验：
+        被吞时页面结构没变、但旧快照可能已过期）。
+        """
+        btn, pos = self._find_signin_ad_button()
+        if btn is not None:
+            logger.info("签到奖励广告：浮层按钮 @ (%d,%d) 文本=%r",
+                        btn.x1, btn.y1, btn.text)
+            self._tap_node(btn)
+            return True
+        if pos is not None:
+            logger.info("签到奖励广告：dump 未命中，OCR 命中 @ %s", pos)
+            self._tap(*pos, trusted=True)
+            return True
+        return False
+
+    def _verify_signin_ad_reward(self, before: Optional[int]) -> None:
+        """D2（2026-10-28 用户需求）：签到奖励广告**到账**校验。
+
+        为什么必须做（与坑 25 同源）：任务中心广告有「屏幕真值重锚」核对到账，
+        签到广告**一次都没有**——792 次「签到奖励广告完成」全部只证明「广告页
+        关掉了」，加没加那 10 点电量无人知晓。广告服务端未记账 / 播放未满 15s
+        提前关 / 到账延迟，现有日志一条都看不出来。
+
+        判据：点广告前读一次电量、关闭后读一次，差值 >= `signin_ad_reward`
+        （默认 10，即浮层按钮文案「看视频 + 10」的承诺值）。
+        读数缺失（浮层遮挡 / 版式差异 / OCR 失败）→ **跳过不判**，绝不把
+        「读不到」当成「没到账」（误报比漏报更贵，会让告警失去信任）。
+
+        宽限期重读（2026-10-29 首日实测后补，**关键**）：
+            10-29 全天 40 次校验 = 25 次 +10 / 15 次 **恰好 +0**，失败均匀散在
+            10 台机器人上（每台 1~2 次）、差值只有 0 和 10 两档、播放时长都
+            达标（16.5s）。「恰好 +0」+ 随机分布 = 强烈的**电量显示未刷新**
+            嫌疑（任务中心是 H5，电量走接口轮询，缓存几十秒很常见），而不是
+            真漏账。故首次 +0 不直接判定，先等 `signin_ad_grace` 秒重读最多
+            `signin_ad_reread` 次：
+              - 重读拿到 +10 → 记「延迟到账」，按通过处理（不告警）
+              - 重读仍 +0   → 才判「确实未到账」并告警
+            代价只在失败分支（+2s × 约 15 次 ≈ 30s/天），成功路径零开销。
+            跑一天后看三档比例即可定性：延迟档多 = 判据问题（已修）；
+            确实未到账仍多 = 真漏账，去查广告服务端记账。
+        """
+        if not self.wf.get("signin_verify", True):
+            return
+        want = int(self.wf.get("signin_ad_reward", 10))
+        after = self._read_energy()
+        if before is None or after is None:
+            logger.info("签到广告到账校验跳过：电量读数缺失（前=%s 后=%s）",
+                        before, after)
+            return
+        gained = after - before
+        if gained >= want:
+            logger.info("签到广告到账校验 ✓：%d → %d（+%d）",
+                        before, after, gained)
+            if self._watch:
+                self._watch.signin_verify("signin_ad", True)
+            return
+        # 首次未达承诺值 → 宽限期重读（见 docstring）
+        grace = float(self.wf.get("signin_ad_grace", 2.0))
+        reread = max(0, int(self.wf.get("signin_ad_reread", 1)))
+        for _i in range(reread):
+            time.sleep(grace)
+            again = self._read_energy()
+            if again is None:
+                continue
+            g2 = again - before
+            if g2 >= want:
+                logger.info("签到广告到账校验 ✓（延迟 %.1fs 到账）：%d → %d（+%d）"
+                            "—— 首读 %d 未刷新，电量显示有延迟",
+                            grace * (_i + 1), before, again, g2, after)
+                if self._watch:
+                    self._watch.signin_verify("signin_ad", True)
+                return
+            after, gained = again, g2
+        logger.warning("签到广告到账校验 ✗：%d → %d（+%d，期望 ≥+%d，"
+                       "重读 %d 次 / 共 %.1fs 后仍未到账）"
+                       "—— 可能未播满 15s / 服务端未记账 / 抠量",
+                       before, after, gained, want, reread, grace * reread)
+        if self._watch:
+            self._watch.signin_verify(
+                "signin_ad", False,
+                detail="电量 %d → %d（+%d，期望 ≥+%d），且重读 %d 次（间隔 %.1fs）"
+                       "仍无变化 ⇒ 已排除「电量显示未刷新」，优先怀疑服务端"
+                       "未记账或抠量。"
+                       % (before, after, gained, want, reread, grace))
 
     def _watch_signin_ad(self) -> bool:
         """签到浮层底部「奖励广告」按钮（2026-09-16 用户需求；2026-10-09 版式改版）。
@@ -2385,29 +2890,41 @@ class Flow:
             if not (self._find("每日免费领") or self._find("恭喜获得")):
                 logger.info("签到浮层已不在屏，跳过签到奖励广告")
                 return False
-            cands = [n for n in self.ui.nodes()
-                     if self._is_signin_ad_label(n.text) and n.y1 >= 1600]
-            btn = max(cands, key=lambda n: n.y1) if cands else None
-            if btn is not None:
-                logger.info("签到奖励广告：浮层按钮 @ (%d,%d) 文本=%r",
-                            btn.x1, btn.y1, btn.text)
-                self._tap_node(btn)
-            else:
-                pos = self._ocr_find("看视频", "看广告",
-                                     region=(0, 1700, 1080, 1920))
-                if pos is None:
-                    logger.info("签到浮层未找到 看视频/看广告 按钮"
-                                "（已看过或版式不同），跳过奖励广告")
-                    return False
-                logger.info("签到奖励广告：dump 未命中，OCR 命中 @ %s", pos)
-                self._tap(*pos, trusted=True)
+            # D2（2026-10-28）：点击前读一次电量，作为到账校验的基线。
+            # 图证（用户 10-28 截图）：浮层「每日免费领」展开时顶部
+            # 「当前电量 3477」仍完整可读，dump/OCR 都能拿到。
+            e0 = (self._read_energy()
+                  if self.wf.get("signin_verify", True) else None)
+            if not self._tap_signin_ad_button():
+                logger.info("签到浮层未找到 看视频/看广告 按钮"
+                            "（已看过或版式不同），跳过奖励广告")
+                return False
             ok = self._ad_play_and_close(sheet_ok=True)
+            # D3（2026-10-28 用户需求）：点击被吞（判定「广告没打开」）→
+            # 重取节点补点一次。与「发消息被吞→补点」同一条经验：被吞时
+            # 页面结构没变，但必须重取节点、不能复用旧快照。
+            # 旧行为：not_opened 与「关不掉」共用一条 warning（措辞还是
+            # 「未正常关闭」），不补点、不告警 ⇒ 每天可能白等 16s 而无人知晓。
+            if not ok and getattr(self, "_ad_not_opened", False):
+                logger.warning("签到奖励广告点击未生效（判定广告未打开）"
+                               "→ 重取按钮补点一次")
+                if self._tap_signin_ad_button():
+                    ok = self._ad_play_and_close(sheet_ok=True)
+                if not ok:
+                    logger.warning("签到奖励广告补点后仍未打开"
+                                   "（签到广告入口控件/点击拦截可能变了）")
+                    if self._watch:
+                        self._watch.signin_verify(
+                            "signin_ad", False,
+                            detail="点击「看视频 + 10」后广告页没打开（含补点一次）")
             # 看完可能回到浮层（而非任务中心）→ 浮层仍在则关 ✕（F11：在屏才点）
             if self._find("每日免费领") or self._find("恭喜获得"):
                 self._tap(*MODAL_CLOSE, trusted=True)
                 time.sleep(1.5)
             if ok:
                 logger.info("签到奖励广告完成")
+                # D2：浮层已收起，此时读电量最干净
+                self._verify_signin_ad_reward(e0)
             else:
                 logger.warning("签到奖励广告未正常关闭（不阻断主流程）")
             return ok
@@ -3239,6 +3756,28 @@ class Flow:
                 cands.append(n)
         return min(cands, key=lambda n: n.x1) if cands else None
 
+    def _close_tap_pause(self) -> float:
+        """关闭按钮 tap 后的固定暂停（P6，2026-10-28）。
+
+        旧值 1.5s 是「点完就干等」的保守值，与随后的 `ad_close_settle`（1.0）
+        串行叠加成 2.5s 纯空等；10-28 全场 408/408 支走顶条快检直关，关闭链
+        p50 3.60s 里这 2.5s 一分钱不产出。压到 0.35s 后总沉降仍保留 1.35s，
+        真不够时 `_confirm_direct_close` 的 gap 重试（1.2s）会兜住 —— 最坏
+        3.95s（比现状 +0.25s），成功则省 1.15s/支。
+
+        设 workflow.ad_close_fast_settle: false 一键回退旧行为。
+
+        **为什么不做「dump 探针轮询药丸消失」**（曾在同日试写过，已否决）：
+        u2 后端的 `dump(timeout)` 是**接口兼容参数、实际不生效**（adb_u2.py:
+        114），广告页 dump 0.06s 但切到任务中心后是 WebView，实打实 1.89s
+        （MEMORY 坑 20 实测）。探针最后一次采样必然付这 1.89s，却只替代
+        0.3~1.0s 的 sleep ⇒ 结构性负优化。WebView 页上「用 dump 换等待」是
+        反的，别再试。
+        """
+        if not self.wf.get("ad_close_fast_settle", True):
+            return 1.5
+        return float(self.wf.get("ad_close_tap_pause", 0.35))
+
     # ---- N4（2026-10-22）：点开校验 + 倒计时补等 ----
     # 广告页特征词（任一命中即视为「广告确实打开了」）。注意：任务中心的广告行
     # 「看视频赚电量」和按钮「获取随机」都**不含**这些词，不会被误认。
@@ -3345,7 +3884,12 @@ class Flow:
         if self._back_at_taskcenter(timeout=timeout) or (
                 sheet_ok and self._signin_sheet_visible()):
             return True
-        for _ in range(max(0, retries)):
+        for _i in range(max(0, retries)):
+            # P6（2026-10-28）观测点：这行日志 = 「沉降不足」。日跑批里
+            # count(直关确认首次未命中) / count(关闭链) 就是新增的重试率，
+            # 用来判断 ad_close_settle + ad_close_tap_pause 是否已经压到底。
+            logger.info("直关确认首次未命中（沉降不足/页面未就绪）→ %.1fs 后重试"
+                        "（第 %d/%d 次）", gap, _i + 1, retries)
             time.sleep(gap)
             if self._back_at_taskcenter(timeout=timeout) or (
                     sheet_ok and self._signin_sheet_visible()):
@@ -3483,9 +4027,10 @@ class Flow:
                 logger.info("顶条快检命中关闭按钮 @ %s（%s）", pos, _fast_tag)
             if _fast_node is not None or pos is not None:
                 if _fast_node is not None:
-                    self._tap_node(_fast_node, pause=1.5)
+                    self._tap_node(_fast_node, pause=self._close_tap_pause())
                 else:
-                    self._tap(*pos, pause=1.5, trusted=True)
+                    self._tap(*pos, pause=self._close_tap_pause(),
+                              trusted=True)
                 time.sleep(ad_close_settle)
                 self._prefetch_close = None      # 快检路径已消费
                 if self._confirm_direct_close(ad_close_dump_timeout,
@@ -3536,7 +4081,7 @@ class Flow:
                     self.wf.get("ad_prefetch_ttl", 20.0))):
             logger.info("使用等待窗口预定位的关闭按钮 @ %s（E 优化，跳过 dump 定位）",
                         pref[0])
-            self._tap(*pref[0], pause=1.5, trusted=True)
+            self._tap(*pref[0], pause=self._close_tap_pause(), trusted=True)
             time.sleep(ad_close_settle)
             if self._confirm_direct_close(ad_close_dump_timeout,
                                           ad_close_confirm_retries,
@@ -3698,6 +4243,8 @@ class Flow:
         广告成功。真值语义与旧 bool 完全兼容（既有 assertTrue 不受影响）。
         """
         logger.info("==== 处理机器人: %s ====", name)
+        if self._watch:
+            self._watch.set_robot(name)
         # F4/F8：进入失败不再直接放弃 —— 失败后 _safe_back_to_robot_list 复位
         # （清错页残留，避免污染后续机器人）再重试；共 3 次（对齐广告轮转
         # max_fail=3，2026-09-09 f8 实测 2 次不够——藤非/席恩间歇点错）。
@@ -3712,7 +4259,12 @@ class Flow:
         if not entered:
             logger.error("进入任务中心失败 %s（重试 3 次后仍失败），跳过", name)
             self._stat(name)["entered"] = False
+            # 2026-10-23 自探测：连续 2 台进不去才告警（单台抖动不报，见 watch.*）
+            if self._watch:
+                self._watch.enter_block(name)
             return 0
+        if self._watch:
+            self._watch.enter_ok()
         # A3（2026-09-10）：进入任务中心后先清理可能残留/即将弹出的 Badcase
         # 问卷 —— 00:34 全量验证实锤：_feedback 操作中途 Badcase H5 会弹出
         # （腾讯问卷完整正文），若不清掉，_signin/_feedback 的 dump 穿透误判
@@ -3732,6 +4284,9 @@ class Flow:
             self._stat(name)["signin"] = (
                 "失败" if not ok else
                 ("已签" if getattr(self, "_signin_already", False) else "成功"))
+            if self._watch:
+                (self._watch.task_ok("signin") if ok
+                 else self._watch.task_fail("signin", name))
         if do_feedback:
             ok = self._feedback()
             if not ok:
@@ -3742,6 +4297,9 @@ class Flow:
             self._stat(name)["feedback"] = (
                 "失败" if not ok else
                 ("已反馈" if getattr(self, "_feedback_already", False) else "成功"))
+            if self._watch:
+                (self._watch.task_ok("feedback") if ok
+                 else self._watch.task_fail("feedback", name))
         # 首轮广告（2026-09-10）：签到/反馈完成后不退出，同会话先看 1 次。
         # 看前按 A3 同款巡检一次 —— 签到/反馈操作后 QQ 可能推送 Badcase 问卷
         # （坑 8：00:34 实测操作中途弹出），不清掉会让 _find_row 空转计失败。
@@ -3749,9 +4307,17 @@ class Flow:
         if first_ad:
             self._dismiss_badcase()
             if self._watch_ad_once():
-                first_ad_ok = True
-                self._stat(name)["ad"] += 1
-                logger.info("%s 首轮广告完成（剩余次数进入轮转阶段补看）", name)
+                if getattr(self, "_ad_skipped_full", False):
+                    # 满额跳过（2026-11-03）：没看广告就不记账，并声明本台
+                    # 「应看 0 支」，免得账号汇总把它误判成漏看。
+                    # ⚠️ first_ad_ok 必须保持 False —— 它决定返回码 2，
+                    # 进而决定轮换阶段 first_done 是否 +1。
+                    self._stat(name)["ad_need"] = 0
+                    logger.info("%s 今日已满额，首轮广告跳过（不计入支数）", name)
+                else:
+                    first_ad_ok = True
+                    self._stat(name)["ad"] += 1
+                    logger.info("%s 首轮广告完成（剩余次数进入轮转阶段补看）", name)
             else:
                 logger.warning("%s 首轮广告失败（进入轮转阶段补看）", name)
         self._exit_taskcenter()
@@ -3887,6 +4453,40 @@ class Flow:
                                             "feedback": None, "ad": 0,
                                             "note": ""})
 
+    def _missed_ad_robots(self) -> list:
+        """漏看清单（2026-11-03 用户需求）：本次实看 < 应看的机器人。
+
+        用户原话：「把那个账号下的那个机器人漏看的告警出来」—— 他要的是
+        **账号 + 机器人 + 缺口支数**，而不是一句「广告少了 N 支」。
+
+        应看支数 `ad_need` 的三条来源（都在运行期零成本写入）：
+          - 轮换进台基数校准：`min(目标, 屏幕日配额 - 进台基数)`；
+            进台时屏幕已有 X 支的台（手动看过 / 断点续跑），应看数就不是 10。
+          - 满额跳过：显式 0（`_ad_skipped_full` 分支），**不算漏看**。
+          - 从未写入：退化为 `ad_times_per_robot`（顺序连看路径、进台失败的台）。
+
+        返回 [(name, ad, need, note)]，按缺口从大到小。纯内存，零读屏。
+        """
+        stats = getattr(self, "stats", None) or {}
+        try:
+            default_target = int(self.wf.get("ad_times_per_robot", 10) or 0)
+        except (TypeError, ValueError):
+            default_target = 10
+        out = []
+        for name, s in stats.items():
+            need = s.get("ad_need")
+            if need is None:
+                need = default_target
+            need = max(0, int(need))
+            ad = int(s.get("ad") or 0)
+            if need - ad <= 0:
+                continue
+            note = ("进台失败" if not s.get("entered", True)
+                    else (s.get("note") or ""))
+            out.append((name, ad, need, note))
+        out.sort(key=lambda x: (x[1] - x[2], x[0]))
+        return out
+
     def _log_summary(self, do_signin: bool = True,
                      do_feedback: bool = True,
                      title: Optional[str] = None) -> None:
@@ -3941,6 +4541,22 @@ class Flow:
                 lines.append("电量：%d → %d，本流程获得 +%d" % (es, ee, ee - es))
             else:
                 lines.append("电量：起始 %d，结束读数失败（差额缺失）" % es)
+        # 坑 44（2026-11-03）：试玩广告奖励页计数。坑 41 已证「奖励页出现 ⇔
+        # 电量到账」（全期 26 样本零例外），所以 ✗ 的支数就是「时间花了但很可能
+        # 没电」的支数 —— 这是官方创意停发奖励时唯一能在日志里看见的损失口径。
+        # 刻意**不给电量折算**：不同广告位单支奖励不一致，折算数会变成拍脑袋。
+        ms = getattr(self, "_minigame_stats", None)
+        if ms and ms.get("total"):
+            lines.append("试玩广告：%d 支，奖励页 ✓%d / ✗%d（✗ = 大概率未到账）"
+                         % (ms["total"], ms.get("reward", 0),
+                            ms.get("no_reward", 0)))
+        # 2026-11-03 用户需求：漏看机器人点名（账号由 title 体现）。
+        missed = self._missed_ad_robots()
+        if missed:
+            seg = "、".join("%s %d/%d（缺 %d）" % (n, a, nd, nd - a)
+                            for n, a, nd, _ in missed[:6])
+            more = "" if len(missed) <= 6 else " 等共 %d 台" % len(missed)
+            lines.append("漏看 %d 台：%s%s" % (len(missed), seg, more))
         # P1 埋点（2026-10-19）：落点断言三分支分布 + 放行分支后续失败计数。
         # 供收紧「both_false 放行」决策：若 both_false 次数 == both_false_fail
         # （100% 失败）即可安全收紧。仅在触发过落点断言时输出，避免噪音。
@@ -3969,6 +4585,95 @@ class Flow:
             logger.info("汇总已写入 %s", path)
         except Exception as e:  # noqa: BLE001
             logger.warning("汇总文件写入失败（不影响主流程）：%s", e)
+
+    def _push_account_summary(self, nick: str, uin: str, idx: int, total: int,
+                              elapsed: float, ok: bool, robots: List[str],
+                              err: str = "") -> None:
+        """2026-10-23 用户需求：每个账号跑完立刻推一条微信。
+
+        内容 = 该账号耗时 + 本流程获得电量 + 机器人/签到/反馈/广告 计数。
+        数据全部来自运行期内存记账（self.stats / _energy_*），零额外读屏。
+        `notify.account_summary: false` 可一键关闭；任何异常就地吞掉。
+        """
+        try:
+            w = getattr(self, "_watch", None)
+            ncfg = self.cfg.get("notify") or {}
+            if w is None or not getattr(getattr(w, "notifier", None), "enabled", False):
+                return
+            if not ncfg.get("account_summary", True):
+                return
+
+            def _fmt(sec: float) -> str:
+                sec = int(round(sec))
+                if sec >= 3600:
+                    return "%d 时 %d 分" % (sec // 3600, sec % 3600 // 60)
+                if sec >= 60:
+                    return "%d 分 %d 秒" % (sec // 60, sec % 60)
+                return "%d 秒" % sec
+
+            stats = list((getattr(self, "stats", None) or {}).values())
+            n_robot = len(stats) or len(robots)
+            n_sign_pending = sum(1 for s in stats if s.get("signin") == "失败")
+            n_sign_ok = sum(1 for s in stats
+                            if s.get("signin") in ("成功", "已签"))
+            n_fb_ok = sum(1 for s in stats
+                          if s.get("feedback") in ("成功", "已反馈"))
+            n_fb_fail = sum(1 for s in stats if s.get("feedback") == "失败")
+            n_ad = sum(int(s.get("ad") or 0) for s in stats)
+            n_enter_fail = sum(1 for s in stats if not s.get("entered", True))
+
+            es = getattr(self, "_energy_start", None)
+            ee = getattr(self, "_energy_end", None)
+            if es is not None and ee is not None:
+                energy = "**+%d**（%d → %d）" % (ee - es, es, ee)
+            elif es is not None:
+                energy = "起点 %d，结束读数失败" % es
+            else:
+                energy = "读数失败（覆盖层/版式差异）"
+
+            # 2026-11-03 用户需求：标题里直接点出「几台漏看」，正文点名到机器人
+            # —— 用户反馈原来的告警看不出是哪台异常（只显示「最近一台」）。
+            missed = self._missed_ad_robots()
+            miss_head = ("（%d 台漏看）" % len(missed)) if missed else ""
+            head = "%s 账号 %s%s" % ("✅" if ok else "❌", nick or uin, miss_head)
+            lines = [
+                "> 进度：第 %d/%d 个账号 · 耗时 **%s**" % (idx, total, _fmt(elapsed)),
+                "> 获得电量：%s" % energy,
+                "",
+                "**机器人 %d 台** · 签到 %d 成功%s · 反馈 %d 成功%s · 广告 %d 支"
+                % (n_robot,
+                   n_sign_ok, (" / %d 失败" % n_sign_pending) if n_sign_pending else "",
+                   n_fb_ok, (" / %d 失败" % n_fb_fail) if n_fb_fail else "",
+                   n_ad),
+            ]
+            if n_enter_fail:
+                lines.append("")
+                lines.append("> 其中 %d 台进台失败（已跳过）" % n_enter_fail)
+            if n_robot and elapsed > 0:
+                lines.append("> 平均 %.0f 秒/台" % (elapsed / n_robot))
+            # 2026-11-03：漏看块放最后 —— 放中间会把「平均 N 秒/台」挤到清单
+            # 后面，读起来像是清单的续行（干跑时发现）。
+            if missed:
+                lines.append("")
+                lines.append("> ⚠️ **漏看 %d 台 · 共缺 %d 支**"
+                             % (len(missed),
+                                sum(nd - a for _, a, nd, _ in missed)))
+                for nm, a, nd, note in missed[:6]:
+                    lines.append("> · **%s**：实看 %d/%d，缺 %d 支%s"
+                                 % (nm, a, nd, nd - a,
+                                    ("（%s）" % note) if note else ""))
+                if len(missed) > 6:
+                    lines.append("> · …… 等共 %d 台" % len(missed))
+            if err:
+                lines.append("")
+                lines.append("**异常**：%s" % err)
+            if getattr(self, "_energy_start_done", False) is False and es is None:
+                lines.append("")
+                lines.append("> 电量未读到：本账号首台进台时读屏失败，属已知降级")
+            w.push(head, "\n".join(lines), kind="account", level="info",
+                   extra={"account": nick or uin, "elapsed_s": int(elapsed)})
+        except Exception as e:  # noqa: BLE001  统计推送失败绝不影响主流程
+            logger.warning("[账号推送] 生成/发送失败（已忽略）：%s", e)
 
     def run_all(self, robots: List[str], do_signin: bool, do_feedback: bool,
                 ad_times: Optional[int], rotate: bool = False,
@@ -4138,6 +4843,10 @@ class Flow:
                     first_iter = True
                 continue
             t_close = time.time()   # CD 起点：广告关闭时刻（2026-09-10 用户优化）
+            # 2026-10-31：同机连看里的每一支也刷新「最近一支」标记，供
+            # 后续回落判定（_wait_same_device_cd）用同一口径。
+            self._last_ad_ts = t_close
+            self._last_ad_robot = name
             done += 1
             fail = 0
             logger.info("%s 本会话已看 %d/%d 次广告", name, done, target)
@@ -4206,6 +4915,48 @@ class Flow:
                     name, done, target, fail)
         return done - start_done
 
+    def _wait_same_device_cd(self, name: str, cd: float) -> float:
+        """同机连看回落前，补等「上一支广告」剩余的 CD（2026-10-31 新增）。
+
+        **为什么要**（10-31 03:44 觅夏号·游迦 实测丢 2 支）：滑动窗口缩到最后
+        1 台且无待补时会回落 `_watch_ads_session`（同机连看），但那个会话只
+        保证**支与支之间**等到 `t_close + ad_cooldown(60s)`，**首支没有任何
+        CD 门槛** —— 因为正常单机路径的「第一支」离上一支天然很远。而回落
+        场景恰恰相反，上一支通常 1~3s 前刚关：
+        ```
+        03:44:11 游迦 轮换看广告 +1（今日 8/10）   ← 上一支关闭
+        03:44:12 回落同机连看（CD 等待语义）      ← 日志名不副实
+        03:44:17 点广告 → 广告页不出
+        03:44:35 / :54 / 03:45:14 连败 3 次 → 弃权，8/10 收工（丢 2 支）
+        ```
+        修法：回落前若「上一支就是这台、且距关闭不足 cd 秒」，先补等余量。
+        **只补不足部分**，已经等够的不重复等。
+
+        成本：仅「窗口剩 1 台且仍有余量」的尾部场景付出，≤cd 秒；
+        收益：换回该台剩余 1~2 支，而不是白烧 1 分钟换来 3 连败弃权。
+        开关 `workflow.rotate_cd_gate: false` 一键回退（立刻回到旧行为）。
+        返回实际等待秒数（0 = 无需等待）。
+        """
+        if not self.wf.get("rotate_cd_gate", True):
+            return 0.0
+        cd = float(cd or 0)
+        if cd <= 0:
+            return 0.0
+        if getattr(self, "_last_ad_robot", None) != name:
+            return 0.0
+        last = float(getattr(self, "_last_ad_ts", 0.0) or 0.0)
+        if last <= 0:
+            return 0.0
+        elapsed = time.time() - last
+        need = cd - elapsed
+        if need <= 0.5:            # 余量太小（含已等够/时钟回拨）→ 不折腾
+            return 0.0
+        need = min(need, cd)       # 时钟异常时也不许无限等
+        logger.info("%s 回落同机连看前补等 CD：上一支 %.1fs 前关闭，"
+                    "距 ad_cooldown %.0fs 还差 %.1fs", name, elapsed, cd, need)
+        time.sleep(need)
+        return need
+
     def _run_rotate_phase(self, robots: List[str], first_done: dict,
                           target: int, group: int) -> None:
         """滑动窗口轮询看广告（2026-09-26 演进自 2026-09-16 组制轮询）。
@@ -4266,8 +5017,11 @@ class Flow:
                 s = st[name]
                 if (self._quota_left(s, target, quota_target) > 0
                         and s["fail"] < max_fail):
-                    logger.info("%s 窗口仅剩 1 台且无待补，回落同机连看"
-                                "（CD 等待语义）", name)
+                    logger.info("%s 窗口仅剩 1 台且无待补，回落同机连看", name)
+                    # 2026-10-31：会话内只保证「支与支之间」等 CD，首支没有门槛
+                    # → 回落前按需补等余量，否则首支必撞 60s CD 三连败弃权
+                    # （10-31 游迦 8/10 实锤）。
+                    self._wait_same_device_cd(name, cd)
                     d = self._watch_ads_session(name, target, cd,
                                                 start_done=s["done"])
                     s["done"] += d
@@ -4345,6 +5099,11 @@ class Flow:
                     logger.info("%s 复用进台配额缓存（免二次读屏）", name)
                 if r:
                     s["base"] = max(0, r[0] - s["done"])
+                    # 漏看告警口径（2026-11-03 用户需求）：本台「本次应看支数」
+                    # = min(本台目标, 屏幕日配额 - 进台基数)。进台时屏幕已经有
+                    # X 支的台（手动看过/续跑），应看数就不是 10，否则会被误判漏看。
+                    self._stat(name)["ad_need"] = min(
+                        target, max(0, quota_target - s["base"]))
                     logger.info("%s 进台基数校准：屏幕 %d/%d（进程内已看 %d）",
                                 name, r[0], r[1], s["done"])
             elif r and r[1] == quota_target:
@@ -4385,8 +5144,24 @@ class Flow:
                 logger.info("%s 已达每日配额，移出轮换", name)
                 return 0
             if self._watch_ad_once():
+                if getattr(self, "_ad_skipped_full", False):
+                    # 满额跳过（2026-11-03 计数修复）：本支**没有看**，
+                    # 不能 +1；直接按「已达配额」移出轮换，省一次无效进台。
+                    self._stat(name)["ad_need"] = 0
+                    # 防死循环：屏幕已满但 `base` 可能还没校准过（配额读不到时
+                    # `r is None`，`_quota_left` 就只会用 target-done 算，恒 >0）
+                    # → 下一轮又进来又跳过。把 base 对齐到「屏幕=满」，
+                    # `_quota_left` 立刻变 0，调用方按「判定满」出窗。
+                    s["base"] = max(0, quota_target - s["done"])
+                    logger.info("%s 已达每日配额（满额跳过，不计入支数），移出轮换",
+                                name)
+                    return 0
                 s["done"] += 1
                 s["fail"] = 0
+                # 2026-10-31：记录「这一台刚看完一支」—— 供窗口缩到 1 台时
+                # 回落同机连看前补等 CD 余量（_wait_same_device_cd）。
+                self._last_ad_ts = time.time()
+                self._last_ad_robot = name
                 base = s["base"] or 0
                 logger.info("%s 轮换看广告 +1（今日 %d/%d）",
                             name, base + s["done"], quota_target)
@@ -4453,6 +5228,128 @@ class Flow:
         time.sleep(0.8)
         return nick
 
+    # 账号面板里「一行 UIN」的形态：纯数字 6~12 位（真实 UIN 实测 10 位）。
+    _UIN_LIKE_RE = re.compile(r"^[0-9]{6,12}$")
+
+    def _panel_nodes(self) -> List[Node]:
+        """取一次面板 dump 快照；**类型不可信时返回空表**。
+
+        为什么要 isinstance 校验：单测里 `self.ui` 是 `unittest.mock.Mock`，
+        `Mock().nodes()` 返回 Mock（不可迭代）—— 直接 `for` 会 TypeError，
+        而 `len()` 恒报 TypeError 之类都算好的，最怕的是静默当成"有节点"（坑 18）。
+        """
+        try:
+            nodes = self.ui.nodes()
+        except Exception as e:
+            logger.warning("面板 dump 异常：%s", e)
+            return []
+        if not isinstance(nodes, (list, tuple)):
+            return []
+        return list(nodes)
+
+    def _match_uin_node(self, nodes: List[Node], uin: str) -> Optional[Node]:
+        """在快照里找 UIN 行：先整词相等，再容忍「UIN+少量后缀」的粘连。
+
+        后缀容忍 6 字符（实测可能出现 `1766775822 (当前)` 这类 5 字符尾巴）；
+        超过这个长度的整句（如签名里写了 QQ 号）**不算命中** —— 避免误点。
+        """
+        for nd in nodes:
+            if (nd.text or "").strip() == uin:
+                return nd
+        for nd in nodes:
+            t = (nd.text or "").strip()
+            if uin in t and len(t) <= len(uin) + 6:
+                return nd
+        return None
+
+    def _panel_still_open(self, nodes: List[Node]) -> bool:
+        """面板还在吗？判据 = 快照里仍有 ≥1 个「UIN 形态」的数字行。
+
+        ⚠️ **不能用「切换账号」标题做判据**：该面板 dump 里只有账号行
+        （2026-10-30 v4 探针踩过 —— 按标题判"面板已关"导致每轮都误报失败）。
+        """
+        return any(self._UIN_LIKE_RE.match((nd.text or "").strip())
+                   for nd in nodes)
+
+    def _find_account_row_with_scroll(self, uin: str) -> Optional[Node]:
+        """账号列表首屏没读到 UIN 行时，**在面板内小幅上拖后再找**（2026-10-30）。
+
+        **为什么需要**（10-30 11:37 王账号实测，整账号被跳过、损失 100 支广告）：
+        账号从 4 个加到 5 个后，「切换账号」面板一屏装不下。失败现场 dump 只有
+        13 个可读节点：
+
+            唐六爻(616) / 3462182422(679)
+            凌津渡(778) / 3102582976(841)
+            唐灵(940)   / 2593292352(1003)
+            觅夏(1102)  / 2774054368(1165)
+            王(1250)    / ← **UIN 1766775822 不在树上**（y≈1313 被面板视口切掉）
+
+        即最后一个账号只露出**昵称**，UIN 行在可滚动视口之外 →
+        `_wait_for_text(uin)` 6s 打空 → 重试 3 次全失败 → 整账号跳过。
+        **这不是加载慢，是根本不在树里，等多久都不会出现。**
+
+        ⚠️ **不能用 `_find_scroll` / `swipe_up` 来做这件事**（10-30 真机 v2/v4/v7b
+        探针各翻车一次）：面板是**居中对话框**，5 个账号时列表视口 y≈582~1270；
+        `swipe_up` 起点固定 y=1500 落在**对话框外** → 整条手势被 ROM 当成
+        「点面板外关闭」，面板直接消失（切号必失败）。必须用 `swipe_from_to`
+        在列表视口内拖：实测 `(540,1210)→(540,910)` / 700ms 一次即能把第 5 个
+        账号的 UIN（y=1198-1250）拖进视口，面板保持打开（v8 候选 A ✓）。
+        起点 1210 落在「上一个 UIN 行底 1191」与「王 昵称行顶 1230」之间的空隙，
+        **不在任何账号行上**，不会误触切号。
+
+        只在**未命中分支**付成本（每轮 ≈ 拖动 1.0s + dump 0.1~1.9s）；
+        成功路径（UIN 首屏就在）完全零额外开销。
+
+        坐标可通过 `accounts.row_scroll_from_y` / `row_scroll_to_y` /
+        `row_scroll_duration_ms` / `row_scroll_x` 调整（账号继续增加时把
+        `row_scroll_rounds` 提到 3 即可多次拖）。
+        一键回退：`accounts.row_scroll: false`。
+        """
+        acc = getattr(self, "acc", None) or {}
+        if not acc.get("row_scroll", True):
+            return None
+        rounds = max(1, int(acc.get("row_scroll_rounds", 2) or 1))
+        x = int(acc.get("row_scroll_x", 540))
+        y_from = int(acc.get("row_scroll_from_y", 1440))
+        y_to = int(acc.get("row_scroll_to_y", 1140))
+        dur = int(acc.get("row_scroll_duration_ms", 700))
+        drag = getattr(self.ui, "swipe_from_to", None)
+        if drag is None:
+            logger.warning("当前后端没有 swipe_from_to（不支持任意起止点滑动）"
+                           "→ 放弃面板内滚动找账号（避免误用 swipe_up 把面板关掉）")
+            return None
+        logger.info("账号列表首屏未出现 UIN %s → 面板内小幅上拖查找"
+                    "（x=%d，%d→%d，%dms，≤%d 次）",
+                    uin, x, y_from, y_to, dur, rounds)
+        # 先确认面板**真的在**：v6 探针踩过 —— 点「切换账号」被吞时人还停在
+        # 抽屉上，旧实现照样在抽屉上拖一把，报错却写「面板已消失」，误导排查。
+        if not self._panel_still_open(self._panel_nodes()):
+            logger.error("「切换账号」面板未打开（首屏无任何 UIN 行，疑似点击被吞"
+                         "或未离开侧栏）→ 不做拖动，直接判本次切号失败")
+            return None
+        t0 = time.time()
+        for i in range(rounds):
+            try:
+                drag(x, y_from, x, y_to, dur)
+            except Exception as e:
+                logger.warning("面板内拖动异常（第 %d 次）：%s → 停止滚动", i + 1, e)
+                return None
+            nodes = self._panel_nodes()
+            nd = self._match_uin_node(nodes, uin)
+            if nd is not None:
+                logger.info("面板内拖动 %d 次后命中账号 UIN %s @ (%d,%d)-(%d,%d)"
+                            "（+%.1fs）", i + 1, uin,
+                            nd.x1, nd.y1, nd.x2, nd.y2, time.time() - t0)
+                return nd
+            if not self._panel_still_open(nodes):
+                logger.error("面板内拖动第 %d 次后「切换账号」面板已消失"
+                             "（手势被当成点面板外部）→ 停止滚动；"
+                             "请检查 row_scroll_from_y/to_y 是否落在列表区内", i + 1)
+                return None
+        logger.error("面板内拖动 %d 次仍未见 UIN %s（账号可能根本不在这台设备的"
+                     "登录列表里，或列表已滚到底）", rounds, uin)
+        return None
+
     def _switch_account(self, uin: str, nick: Optional[str] = None) -> bool:
         """按 UIN 切换 QQ 登录账号（2026-09-24 实测：免密秒切，单次 ~8.5s）。
 
@@ -4507,7 +5404,11 @@ class Flow:
         self._tap_node(sw, pause=1.2)
 
         # 3. 账号列表按 UIN 文本定位（顺序会变，禁止记坐标）
+        #    2026-10-30：账号 ≥5 个后面板一屏装不下，最后一行常只露出昵称、
+        #    UIN 行被视口切出 a11y 树 → 首屏查找必空。未命中时面板内滚动重找。
         target = self._wait_for_text(uin, timeout=6.0)
+        if target is None:
+            target = self._find_account_row_with_scroll(uin)
         if target is None:
             logger.error("切号失败：账号列表未出现 UIN %s", uin)
             self._log_page_snapshot("switch_no_uin")
@@ -4657,11 +5558,15 @@ class Flow:
                 continue
             logger.info("========== [账号 %d/%d] %s (%s) ==========",
                         idx, total, nick, uin)
+            t_acc0 = time.time()          # 2026-10-23：账号耗时（推送用）
 
             # 1) 切号（首个账号若已是该号则自动跳过切换）
             if not self._ensure_account(uin, nick):
                 logger.error("[账号 %s] 切号失败，跳过该账号", nick)
                 results.append((nick, False, []))
+                self._push_account_summary(nick, uin, idx, total,
+                                           time.time() - t_acc0, False, [],
+                                           err="切号失败，本账号未执行")
                 continue
 
             # 2) 收集该账号机器人（等数据加载就绪，防切号后首次收集漏号）
@@ -4677,6 +5582,9 @@ class Flow:
             if not robots:
                 logger.warning("[账号 %s] 白名单过滤后无可处理机器人，跳过", nick)
                 results.append((nick, True, []))
+                self._push_account_summary(nick, uin, idx, total,
+                                           time.time() - t_acc0, True, [],
+                                           err="白名单过滤后无可处理机器人")
                 continue
             logger.info("[账号 %s] 处理 %d 个机器人: %s", nick, len(robots), robots)
 
@@ -4686,17 +5594,28 @@ class Flow:
             self._energy_start = None      # 电量统计按账号独立（2026-09-29）
             self._energy_end = None
             self._energy_start_done = False
+            err_msg = ""
             try:
                 self.run_all(robots, do_signin, do_feedback, ad_times,
                              rotate=rotate, group=group)
                 results.append((nick, True, robots))
             except Exception as e:  # noqa: BLE001
                 logger.error("[账号 %s] 主流程异常: %s", nick, e)
+                err_msg = "主流程异常：%s" % e
                 results.append((nick, False, robots))
             finally:
                 self._log_summary(do_signin, do_feedback,
                                   title="账号 %s (%s)" % (nick, uin))
+                # 2026-10-23 用户需求：账号跑完立刻推微信（电量 + 耗时 + 计数）
+                self._push_account_summary(nick, uin, idx, total,
+                                           time.time() - t_acc0,
+                                           not err_msg, robots, err=err_msg)
                 self.stats = {}
+                # 2026-11-03：试玩广告统计也按账号清零。旧版只在 `__init__` 建一次
+                # → `_log_summary` 打出来的是**跨账号累计**（11-03 实测：唐灵那份
+                # 写的「30 支」其实是前 4 个账号的总和），读汇总时会被当成单账号
+                # 数据，属于口径误导。
+                self._minigame_stats = {"total": 0, "reward": 0}
 
         logger.info("多账号主流程结束：%s",
                     ", ".join("%s=%s" % (n, "OK" if ok else "FAIL")

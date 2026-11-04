@@ -31,6 +31,9 @@ node_modules/
 # ---- 本地真实账号（脱敏用：config.yaml 里是占位号，真实 QQ 号只在这里）----
 accounts.local.yaml
 
+# ---- 本地告警凭据（企业微信 corpid / agentid / secret）----
+notify.local.yaml
+
 # ---- WorkBuddy 内部目录（含项目工作记忆，非源码） ----
 .workbuddy/
 .jssdd/

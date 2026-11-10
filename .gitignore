@@ -13,6 +13,14 @@ logs/
 screenshots/
 *.log
 
+# ---- 业务状态（2026-11-09 由 logs/ 迁出）----
+# 与 logs/ 的区别：这里「删了会出事故」——
+#   feedback_used.txt    丢了 → 反馈内容被判重复，反馈任务全失败
+#   notify_pending.jsonl 丢了 → 待补发告警永久丢失
+#   notify_state.json    丢了 → 去重窗口重置，可能重复推送
+# 故不入库、也不随 logs/ 一起清理；需要迁移机器时请单独备份。
+state/
+
 # ---- 调试快照 / UI dump ----
 *.png
 *.jpg
@@ -49,3 +57,13 @@ _git_status.txt
 _unittest_out.txt
 # 抓包/下载的 apk、临时素材，与工程无关
 downloads/
+
+# ---- 巨型非源码目录（2026-11-10 上传前排除，合计约 3 GB）----
+# 三者都不是本仓库的源码，且体积远超 GitHub 单文件 100 MB 限制：
+#   _archive/            947 MB  目录重组前的 zip 归档（downloads/legacy/logs/screenshots）
+#   robot/               738 MB  NapCat QQ 机器人框架（12054 个文件，含 Node 运行时 zip）
+#   robote2--onlytalk/   1.4 GB  另一个机器人项目（27864 个文件）
+# 需要迁移时请单独打包同步，不要走 git。
+_archive/
+robot/
+robote2--onlytalk/

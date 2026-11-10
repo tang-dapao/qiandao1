@@ -41,7 +41,8 @@ def _make_worker_notifier(delay: float = 0.0, recorder: list | None = None):
     """构造 enabled=True 且已启动 worker 的 Notifier（绕开网络/落盘）。
 
     2026-10-30：`flush()` 现在会顺带补发 `pending_file`，必须把队列文件指到
-    临时目录 —— 否则单测会去读/删仓库里真实的 `logs/notify_pending.jsonl`。
+    临时目录 —— 否则单测会去读/删仓库里真实的 `state/notify_pending.jsonl`
+    （2026-11-09 由 logs/ 迁至 state/，见 config.yaml 的 state 段）。
     """
     import tempfile
     tmp = tempfile.mkdtemp(prefix="notify_flush_")

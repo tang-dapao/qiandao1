@@ -130,10 +130,15 @@ class TestRotatePhaseStats(unittest.TestCase):
             return state["cur"] == "A"   # A 每轮成功 1 支；B 恒失败
 
         def _session(name, target, cd, start_done=0):
-            # 桩：B 弃权后 A 单独回落连看的路径（真实实现会继续看满），
-            # 这里不补看（返回 0），仅验证回落记账与收尾覆盖。
-            self.assertEqual(name, "A")
-            self.assertEqual(start_done, 4)   # 3 轮轮换 + 首轮 1 支
+            # 桩：两条路径都会走到这里 ——
+            #   A：B 弃权后窗口剩 1 台 → 回落同机连看；
+            #   B：本轮弃权 → 2026-11-06 新增的回补（整轮跑完后同台连看）。
+            # 两者都不真补看（返回 0），仅验证回落/回补记账与收尾覆盖。
+            if name == "A":
+                self.assertEqual(start_done, 4)   # 3 轮轮换 + 首轮 1 支
+            else:
+                self.assertEqual(name, "B")
+                self.assertEqual(start_done, 0)   # B 本轮一支没看成
             return 0
 
         with mock.patch.object(f, "_enter_taskcenter", side_effect=_enter), \

@@ -7,6 +7,7 @@
 
 任务中心行按钮固定 X≈879（各行右侧对齐，实测 1080 宽）。
 """
+import gc
 import io
 import logging
 import os
@@ -276,7 +277,15 @@ class Flow:
         # 已用、生成后追加记录（跨进程防重复 —— 官方按「账号+内容」去重且窗口
         # 未知，宁可永久不用）。相对路径与 _diag_shot 的 screenshots/ 风格一致；
         # 单测里置 None 可完全跳过文件 IO。
-        self._fb_used_path = "logs/feedback_used.txt"
+        # 2026-11-09 目录整理：由 logs/ 迁至 state/ —— 这是**业务状态**，删掉会
+        # 导致反馈内容重复被官方拒掉（logs/ 则是可随时清空的诊断输出）。
+        # 路径取 workflow.feedback_used_file；缺省 <state.dir>/feedback_used.txt；
+        # 显式配成空字符串 = 不落盘、不排除历史（仅供单测/调试）。
+        _fb_file = self.wf.get("feedback_used_file")
+        if _fb_file is None:
+            _fb_file = (f"{config.get('state', {}).get('dir') or 'state'}"
+                        "/feedback_used.txt")
+        self._fb_used_path = _fb_file or None
         # ---- A2/A3 缓存（2026-09-12）：截图 TTL 缓存 + OCR 结果短缓存 ----
         # 背景：_ocr_shot 每次都跑一次 screencap subprocess（~0.5-1s），而
         # _dismiss_badcase 一次连做两张全屏 OCR、_close_ad 确认阶段反复读屏 ——
@@ -343,6 +352,16 @@ class Flow:
         # 11-02 的 0% 跳到 ~70% ⇒ 需要常态化计数才能在日志/汇总里看见损失。
         # 纯计数 + 连续告警，**零行为改动**；汇总见 _log_summary。
         self._minigame_stats = {"total": 0, "reward": 0}
+        # 2026-11-10（用户需求）：模拟器**没装微信** → 试玩广告点「点击进入」
+        # 必然跳小程序授权页失败（授权页→白等 ad_minigame_wait 19s→无奖励页，
+        # 11-08/11-09 实测奖励页 0/9）。改为「退回 + 重看一次」：
+        #   命中试玩落地页 → 只点「返回」退回任务中心（不点「点击进入」）→ 重看；
+        #   重看仍是试玩 → 本支放弃，**不计 fail**（避免 3 连败弃权级联），
+        #   由后续轮换圈 / 本轮回补自然再试。
+        # 三个标记都由 _watch_ad_once 入口重置，只在本支生命周期内有效。
+        self._minigame_skipped = False      # 本支失败原因是「试玩跳过」
+        self._minigame_skip_final = False   # 本支两次都是试玩 → 交上层记账
+        self._minigame_skip_streak = 0      # 连续跳过的支数（防死循环，跨本会话）
 
     def _landing_stat(self, branch: str) -> None:
         """P1 埋点（2026-10-19）：落点断言分支计数 + 记录当前台分支。
@@ -495,11 +514,17 @@ class Flow:
 
     def _diag_shot(self, tag: str):
         """失败现场截图（F5）：存 screenshots/fail_<tag>_<HHMMSS>.png。
-        尽力而为，失败不影响主流程；供真机排障还原当时页面。"""
+        尽力而为，失败不影响主流程；供真机排障还原当时页面。
+
+        2026-11-10：目录缺失时自动创建。此前假设 `screenshots/` 一定存在，
+        仓库整理/清理后被删掉 → 所有失败现场截图静默失败（只剩一条 warning），
+        无人值守时等于失去排障证据（02:12 冒烟实测 `No such file or directory`）。
+        """
         try:
             img = self._ocr_shot()
             if img is None:
                 return
+            os.makedirs("screenshots", exist_ok=True)
             fn = f"screenshots/fail_{tag}_{time.strftime('%H%M%S')}.png"
             img.save(fn)
             logger.info("失败现场已存 %s", fn)
@@ -2222,7 +2247,7 @@ class Flow:
         """生成 5 位随机反馈内容，持久化记录防重复（2026-09-26 用户方案）。
 
         官方按「账号+内容」去重（用户实测：同账号内只要输入过一次，往后同
-        内容全部被拒），去重窗口未知 → 每次生成前排除 logs/feedback_used.txt
+        内容全部被拒），去重窗口未知 → 每次生成前排除 state/feedback_used.txt
         里的历史已用、生成后立即追加记录（跨进程永久不用；5 位数共 9 万个，
         按每账号每天 ~10 次提交可用 6 年+）。文件 IO 异常不阻断主流程（退化为
         会话内防重）。_fb_used is None 时从记录文件懒加载；单测预设空 set 且
@@ -2265,7 +2290,7 @@ class Flow:
         → 断言「提交成功」结果页。
 
         内容方案（2026-09-26 用户指定，替代 09-25 序号方案）：5 位随机数，
-        每次生成前排除历史已用并记录（logs/feedback_used.txt）。官方按
+        每次生成前排除历史已用并记录（state/feedback_used.txt）。官方按
         「账号+内容」去重（实测 toast「反馈内容重复了」，toast 不进 dump），
         同账号内重复内容必被拒；去重窗口未知 → 记录永久不用。
 
@@ -2341,6 +2366,9 @@ class Flow:
         logger.info("看一次广告")
         # 满额跳过标记入口重置（2026-11-03 计数修复，见 _init_cache_state 注释）
         self._ad_skipped_full = False
+        # 2026-11-10：试玩跳过标记入口重置（只在本支生命周期内有效）
+        self._minigame_skipped = False
+        self._minigame_skip_final = False
         # 2026-09-09 观察确认：任务中心不会自动弹问卷 —— 之前的「Badcase 反馈
         # 问卷」是 _close_ad 盲点 (160,152) 在广告已自动关闭、画面回到任务中心
         # 后误点顶部「QQ AI好友·常见问题答疑」banner 打开的。
@@ -2398,15 +2426,56 @@ class Flow:
             logger.info("看广告已达目标次数（%d/%d 目标 %d），跳过（不计入支数）",
                         ratio[0], ratio[1], target)
             return True
-        self._tap_node(btn)
-        ok = self._ad_play_and_close()
+        # 2026-11-10（用户需求）：试玩跳过 → 重看一次，再试玩即放弃本支。
+        # 循环次数：ad_minigame_skip 开启时 2 次（首看 + 重看），否则 1 次
+        # （行为与改动前完全一致）。重看前重新取行节点 —— 退回任务中心后
+        # 广告行会重排，旧节点坐标可能失效。
+        max_try = 2 if self.wf.get("ad_minigame_skip", True) else 1
+        ok = False
+        for attempt in range(1, max_try + 1):
+            self._tap_node(btn)
+            ok = self._ad_play_and_close()
+            if ok:
+                break
+            if not getattr(self, "_minigame_skipped", False):
+                break
+            if attempt < max_try:
+                logger.info("试玩已跳过 → 重看一支（第 %d/%d 次尝试）",
+                            attempt, max_try)
+                row2 = self._find_row(AD_ROW_LABELS[0],
+                                      alt_labels=AD_ROW_LABELS[1:])
+                if row2 is None:
+                    logger.warning("重看时找不到广告行（页面已变），放弃本支")
+                    self._minigame_skip_final = True
+                    break
+                btn = row2[0]
+                self._minigame_skipped = False
+                continue
+            # 跳过功能关闭（max_try=1）时**不得**走下面的「放弃」语义 ——
+            # 那条语义只属于新增的试玩跳过路径，旧行为必须原样失败返回。
+            if max_try <= 1:
+                break
+            # 两次都是试玩版式 → 本支放弃。**不计失败**：这不是点击路径问题
+            # （模拟器没装微信），计入 fail 会触发 3 连败弃权级联。
+            self._minigame_skip_final = True
+            self._minigame_skip_streak = int(
+                getattr(self, "_minigame_skip_streak", 0)) + 1
+            stats = getattr(self, "_minigame_stats", None)
+            if stats is not None:
+                stats["skipped"] = int(stats.get("skipped", 0)) + 1
+            logger.warning("连续 %d 次遇到试玩版式 → 本支放弃（不计失败），"
+                           "留待后续轮次/本轮回补再试（连续跳过 %d 支）",
+                           max_try, self._minigame_skip_streak)
+            break
         # N4-c（2026-10-22）：广告页压根没打开 → 重取行节点**补点一次**。
         # 与「发消息 / 个人」被吞同源：QQ 会吞掉一次点击（no-op），补点即可救回
         # （10-16 探针 60+40 样本实测补点 100% 救回）。这里只在
         # `_ad_not_opened`（双 dump 确定停在任务中心）时补点；状态未知一律不补，
         # 避免在「加载慢」时重复开广告。
         # workflow.ad_open_retry: false 可回退为「不补点，直接算这支失败」。
-        if (not ok and getattr(self, "_ad_not_opened", False)
+        if (not ok and not self._minigame_skipped
+                and not self._minigame_skip_final
+                and getattr(self, "_ad_not_opened", False)
                 and self.wf.get("ad_open_retry", True)):
             self._ad_not_opened = False
             logger.warning("广告未打开 → 重取行节点补点一次")
@@ -2441,6 +2510,22 @@ class Flow:
         if self.wf.get("ad_minigame", True):
             mg_cta = self._probe_minigame_ad(t_play0)
             if mg_cta is not None:
+                # 2026-11-10（用户需求）：模拟器未装微信，试玩必失败 → 直接退回。
+                # 只做「点返回退回任务中心」，不点「点击进入」，因此代价从
+                # 19s 等待 + 2~3 次返回 + 关闭兜底（实测 27~38s）降到约 4s。
+                if self.wf.get("ad_minigame_skip", True):
+                    logger.warning("识别到「试玩小游戏」版式（CTA=「%s」@%s）"
+                                   "→ 跳过试玩：只退回，不点「点击进入」",
+                                   mg_cta.text, mg_cta.center)
+                    self._prefetch_close = None   # 本观看周期的预定位作废
+                    ok = self._exit_minigame_landing()
+                    self._minigame_skipped = True
+                    if not ok:
+                        logger.error("试玩退回失败（未确认回到任务中心）")
+                        return False
+                    logger.info("试玩已退回任务中心（本支未看成，交上层重看）")
+                    time.sleep(self.t.get("ad_close_wait", 2.0))
+                    return False
                 return self._play_minigame_ad(mg_cta, sheet_ok=sheet_ok)
         # N4-a（2026-10-22）：点开校验 —— 广告页压根没打开就别白等 16s。
         # 见 `_ad_landing_is_taskcenter` docstring（探针里连续复现「返回 True /
@@ -2608,8 +2693,33 @@ class Flow:
                 return True
         return False
 
+    def _exit_minigame_landing(self) -> bool:
+        """试玩落地页「退回」：点 dump 里的「返回」回任务中心（2026-11-10）。
+
+        **为什么不点「点击进入」**：模拟器没装微信，点进去只会落到
+        「授权使用微信小程序 → 去官网下载」，白等 ad_minigame_wait(19s) 且
+        拿不到奖励页（11-08/11-09 实测奖励页 0/9、电量不到账）。
+
+        安全边界（与 `_play_minigame_ad` 同款）：
+          - 只点 dump 节点「返回」，**绝不点**「继续了解详情 / 去官网下载」；
+          - 退回后必须 dump 确认已回任务中心才算成功；确认不了 → 回退
+            `_close_ad()` 兜底（此时落地页通常仍有广告关闭药丸/可 BACK）。
+        返回 True=已在任务中心；False=未确认（交上层按失败处理）。
+        """
+        node = self._find("返回", timeout=self._MINIGAME_DUMP_TIMEOUT)
+        if node is None:
+            logger.warning("试玩退回：落地页未见「返回」节点 → 走关闭链兜底")
+            return self._close_ad()
+        logger.info("试玩退回：点「返回」@%s", node.center)
+        self._tap_node(node, pause=1.5)
+        if self._at_taskcenter_by_dump():
+            return True
+        logger.info("试玩退回：一次返回后未确认任务中心 → 走关闭链兜底")
+        return self._close_ad()
+
     def _play_minigame_ad(self, cta: Node, sheet_ok: bool = False) -> bool:
-        """试玩小游戏广告专用链路：点进 → 等 15s → 返回×N → 关闭确认。
+        """试玩小游戏广告专用链路：点进 → 等 ad_minigame_wait(19s) → 返回×N
+        → 关闭确认。
 
         返回 True 表示最终已回到任务中心（广告关闭），语义与 `_close_ad` 一致。
         """
@@ -2625,7 +2735,7 @@ class Flow:
             node = self._minigame_cta_node()
             if node is not None:
                 self._tap_node(node, pause=1.5)
-        wait = float(self.wf.get("ad_minigame_wait", 15.5))
+        wait = float(self.wf.get("ad_minigame_wait", 19))
         logger.info("试玩计时 %.1fs（页面静止，仅等待）", wait)
         time.sleep(wait)
         # 退出：反复点「返回」dump 节点，最多 ad_minigame_backs 次。
@@ -4550,6 +4660,12 @@ class Flow:
             lines.append("试玩广告：%d 支，奖励页 ✓%d / ✗%d（✗ = 大概率未到账）"
                          % (ms["total"], ms.get("reward", 0),
                             ms.get("no_reward", 0)))
+        # 2026-11-10：试玩跳过计数（模拟器无微信 → 退回重看后仍试玩即放弃本支）。
+        # 与上面的「试玩广告」互斥：跳过的支数**没有**进入 _play_minigame_ad，
+        # 所以不属于 total；它是「时间/支数损失」的口径，单列才不会被混淆。
+        if ms and ms.get("skipped"):
+            lines.append("试玩跳过：%d 支（无微信跳小程序 → 退回重看后放弃，"
+                         "留待后续补看）" % ms["skipped"])
         # 2026-11-03 用户需求：漏看机器人点名（账号由 title 体现）。
         missed = self._missed_ad_robots()
         if missed:
@@ -4675,6 +4791,59 @@ class Flow:
         except Exception as e:  # noqa: BLE001  统计推送失败绝不影响主流程
             logger.warning("[账号推送] 生成/发送失败（已忽略）：%s", e)
 
+    # ----------------------------------------------------------
+    # 进程内存观测与账号间缓存回收（2026-11-10 用户需求）
+    # ----------------------------------------------------------
+    def _rss_mb(self) -> float:
+        """当前进程 RSS（MB）；任何异常返回 -1。只用于日志，绝不阻断流程。"""
+        try:
+            import psutil
+            return psutil.Process().memory_info().rss / 1048576.0
+        except Exception:  # noqa: BLE001
+            return -1.0
+
+    def _release_memory(self, tag: str = "") -> float:
+        """账号结束后的缓存回收 + RSS 观测（2026-11-10）。
+
+        **为什么要**：宿主物理内存只有 3.92GB，MuMu guest 固定占 2GB
+        （`vms/MuMuPlayer-15.0-0/configs/vm_config.json` memory=2），逐账号
+        跑批 5~6 小时时只要缓存跨账号累积就会加剧换页（11-09 深夜实测宿主
+        可用内存仅 0.3GB、进台一度涨到 108s）。
+
+        只清**可即时重建**的缓存，不动任何业务状态：
+          - `_shot_cache`（截图）/ `_ocr_result_cache`（OCR 命中坐标）
+          - `_prefetch_close`（关闭按钮预定位）
+          - `ui._nodes_cache`（dump 节点缓存，下次 nodes() 自动重建）
+        并 `gc.collect()` 回收循环引用。
+
+        可观测（用户硬要求）：调用前后各记一次 RSS，日志 `[内存]` 行给出
+        「前 → 后（±N MB）」，据此判断是否真有累积，而不是假设有效。
+        `workflow.mem_release: false` → 只观测不清理（一键回退）。
+        """
+        before = self._rss_mb()
+        do_release = bool(self.wf.get("mem_release", True))
+        if do_release:
+            self._shot_cache = None
+            self._prefetch_close = None
+            try:
+                self._ocr_result_cache.clear()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.ui._nodes_cache = None
+            except Exception:  # noqa: BLE001
+                pass
+            gc.collect()
+        after = self._rss_mb()
+        prefix = (tag + " ") if tag else ""
+        if before < 0 or after < 0:
+            logger.info("[内存] %sRSS 不可读（psutil 缺失），回收已执行=%s",
+                        prefix, do_release)
+        else:
+            logger.info("[内存] %sRSS %.0f MB → %.0f MB（%+.0f MB）",
+                        prefix, before, after, after - before)
+        return after
+
     def run_all(self, robots: List[str], do_signin: bool, do_feedback: bool,
                 ad_times: Optional[int], rotate: bool = False,
                 group: int = 3):
@@ -4788,6 +4957,7 @@ class Flow:
             return done - start_done
         first_iter = True     # D 优化：首轮 dismiss 在循环顶；后续挪进 CD 窗口
         pre_row = None        # CD 窗口预取的行节点（一次性使用，用过即弃）
+        mg_skip = 0           # 2026-11-10：本会话「试玩跳过」支数（防死循环）
         while done < target and fail < max_fail:
             # L3：每轮看广告前先巡检 Badcase 问卷并清除 —— 上一轮广告
             # 关闭后 ~35-40s QQ 可能延迟弹出腾讯问卷 H5，若不清掉，
@@ -4803,6 +4973,20 @@ class Flow:
             ok = self._watch_ad_once(row=pre_row)
             pre_row = None
             if not ok:
+                # 2026-11-10：试玩跳过（模拟器无微信）不算失败 —— 不是点击路径
+                # 问题，计入 fail 会 3 连败弃权把整台踢出。但必须有上界：
+                # 连续 max_fail 支都是试玩 ⇒ 该台当前只有试玩创意，结束本会话，
+                # 剩余支数留待轮换/本轮回补再试（防 `while done < target` 空转）。
+                if getattr(self, "_minigame_skip_final", False):
+                    self._minigame_skip_final = False
+                    mg_skip += 1
+                    logger.warning("%s 试玩跳过累计 %d/%d 支（不计失败）",
+                                   name, mg_skip, max_fail)
+                    if mg_skip >= max_fail:
+                        logger.warning("%s 连续 %d 支都是试玩版式 → 结束本会话，"
+                                       "剩余支数留待回补", name, mg_skip)
+                        break
+                    continue
                 fail += 1
                 logger.warning("%s 看广告失败，累计失败 %d/%d",
                                name, fail, max_fail)
@@ -4957,6 +5141,90 @@ class Flow:
         time.sleep(need)
         return need
 
+    def _backfill_cd_wait(self, name: str, s: dict, cd: float) -> float:
+        """回补前按**该台自己的**上支时间补等 CD 余量（2026-11-06）。
+
+        与 `_wait_same_device_cd` 的区别：那个只看全局「最近一支是不是这台」
+        （只服务窗口剩 1 台的回落场景）；回补发生在整轮结束之后，最近一支
+        几乎总是别的台，用全局标记会漏判 —— 所以这里用 st 里按台记的
+        `last_ts`。语义相同：同台连看**首支**没有门槛，只补不足部分。
+        开关沿用 `workflow.rotate_cd_gate`。
+        """
+        if not self.wf.get("rotate_cd_gate", True):
+            return 0.0
+        cd = float(cd or 0)
+        if cd <= 0:
+            return 0.0
+        last = float(s.get("last_ts") or 0.0)
+        if last <= 0:
+            return 0.0
+        elapsed = time.time() - last
+        need = cd - elapsed
+        if need <= 0.5:
+            return 0.0
+        need = min(need, cd)
+        logger.info("%s 回补前补等 CD：上次看完该台 %.1fs 前，"
+                    "距 ad_cooldown %.0fs 还差 %.1fs", name, elapsed, cd, need)
+        time.sleep(need)
+        return need
+
+    def _backfill_after_rotate(self, deferred: List[dict], st: dict,
+                               target: int, quota_target: int,
+                               cd: float) -> int:
+        """本轮弃权台的同台连看回补（2026-11-06 用户需求）。
+
+        **为什么要**（11-06 唐灵·古禹 实测）：屏幕真值 2/10 vs 进程口径 3/10，
+        连续 3 次重锚未到账即弃权出窗 —— 而 `_rotate_out` 把台移出窗口后
+        **没有任何回访路径**，剩余 8 支直接白丢。用户要求：优先保障电量到账，
+        弃权只作为「本轮的判定」，跑完整轮后要回来补。
+
+        为什么放在整轮之后而不是当场重进：
+          - 当场重试等于在同一个瞬时故障窗口里连打，命中率低；
+          - 不打断滑动窗口吸收 CD 的节奏（窗口轮换的核心收益）。
+        为什么不会死循环：`_watch_ads_session` 内部 **不做屏幕真值重锚**，
+        `done` 单调递增，`while done < target` 必然收敛；且这里 for 循环
+        每台只跑一次，不递归。
+
+        代价：最坏情况每台多花「剩支数 × 单支墙钟」，换来的是到账电量。
+        开关 `workflow.rotate_backfill: false` 一键回退（弃权即放弃，旧行为）。
+        返回本轮回补新看支数。
+        """
+        names = [d["name"] for d in deferred]
+        if not self.wf.get("rotate_backfill", True):
+            logger.info("回补关闭（rotate_backfill=false）：%d 台弃权不补看 %s",
+                        len(names), names)
+            return 0
+        logger.info("========== 本轮回补开始：%d 台弃权待补 %s ==========",
+                    len(names), names)
+        total = 0
+        for item in deferred:
+            name = item["name"]
+            s = st[name]
+            left = self._quota_left(s, target, quota_target)
+            if left <= 0:
+                logger.info("%s 回补跳过：配额已满", name)
+                continue
+            self._backfill_cd_wait(name, s, cd)
+            # 3 次弃权是「本轮判定」，不代表这台不可救 → 回补前清零，
+            # 让会话内自己的 max_fail 从 0 重新计数。
+            s["fail"] = 0
+            s["reanchor"] = 0
+            # 2026-11-10：试玩跳过计数也清零 —— 回补是「重新给一次机会」，
+            # 若这时仍全是试玩，会话内自己的 max_fail 守卫会快速收敛。
+            s["mg_skip"] = 0
+            logger.info("%s 回补开始：剩 %d 支（弃权原因 %s）→ 同台连看",
+                        name, left, item["reason"])
+            base_done = s["done"]
+            d = self._watch_ads_session(name, target, cd, start_done=base_done)
+            s["done"] = base_done + d
+            s["backfill"] = int(s.get("backfill") or 0) + d
+            total += d
+            logger.info("%s 回补结束：本轮补看 %d 支，剩 %d 支（今日 %d/%d）",
+                        name, d, self._quota_left(s, target, quota_target),
+                        (s["base"] or 0) + s["done"], quota_target)
+        logger.info("========== 本轮回补完成：共补看 %d 支 ==========", total)
+        return total
+
     def _run_rotate_phase(self, robots: List[str], first_done: dict,
                           target: int, group: int) -> None:
         """滑动窗口轮询看广告（2026-09-26 演进自 2026-09-16 组制轮询）。
@@ -4972,7 +5240,8 @@ class Flow:
         quota_target = int(self.wf.get("ad_times_per_robot", 10))
         cd = self.wf.get("ad_cooldown", 60)
         st = {n: {"done": int(first_done.get(n) or 0), "fail": 0,
-                  "base": None, "reanchor": 0}
+                  "base": None, "reanchor": 0, "last_ts": 0.0,
+                  "backfill": 0, "mg_skip": 0}
               for n in robots}
         pending = [n for n in robots
                    if self._quota_left(st[n], target, quota_target) > 0]
@@ -4995,10 +5264,27 @@ class Flow:
         logger.info("轮换阶段：%d 台待看，滑动窗口 %d 台，日配额 %d",
                     len(pending), group, quota_target)
         total = 0
+        # 2026-11-06（用户需求）：弃权不再等于「放弃」。
+        # 旧行为：某台连败 3 次（打不开 / 播完未到账）→ 出窗且永不再访，
+        # 剩余支数白丢（11-06 唐灵·古禹 屏幕 2/10、缺 8 支）。
+        # 新行为：出窗时若仍有剩余配额 → 记入 deferred，等**本轮窗口全部跑完**
+        # 后逐台同台连看补完（`_backfill_after_rotate`）。回合内不做，避免打断
+        # 窗口节奏。
+        deferred: List[dict] = []
 
-        def _rotate_out(name: str, reason: str) -> None:
-            """出窗 + 补位（队列下一位排窗口尾部）。"""
+        def _rotate_out(name: str, reason: str, defer: bool = False) -> None:
+            """出窗 + 补位（队列下一位排窗口尾部）。
+
+            defer=True（连败弃权）且仍有剩余配额时，把该台记入本轮回补队列。
+            """
             window.remove(name)
+            if defer:
+                left = self._quota_left(st[name], target, quota_target)
+                if left > 0:
+                    deferred.append({"name": name, "reason": reason,
+                                     "left": left})
+                    logger.info("%s %s出窗 → 记入本轮回补队列（剩 %d 支，"
+                                "待本轮窗口跑完再补）", name, reason, left)
             if queue:
                 nxt = queue.pop(0)
                 window.append(nxt)
@@ -5033,7 +5319,10 @@ class Flow:
                 # 过滤，这里主要是连败弃权兜底），再做本轮观看。
                 if (self._quota_left(s, target, quota_target) <= 0
                         or s["fail"] >= max_fail):
-                    _rotate_out(name, "（判定满/弃权）")
+                    if self._quota_left(s, target, quota_target) <= 0:
+                        _rotate_out(name, "（判定满）")
+                    else:
+                        _rotate_out(name, "（连败弃权）", defer=True)
                     continue
                 total += self._rotate_watch_once(
                     name, st, target, quota_target, max_fail)
@@ -5041,23 +5330,34 @@ class Flow:
                 s = st[name]
                 if (self._quota_left(s, target, quota_target) <= 0
                         or s["fail"] >= max_fail):
-                    reason = ("（配额满）" if self._quota_left(
-                        s, target, quota_target) <= 0 else "（连败弃权）")
-                    _rotate_out(name, reason)
+                    if self._quota_left(s, target, quota_target) <= 0:
+                        _rotate_out(name, "（配额满）")
+                    else:
+                        _rotate_out(name, "（连败弃权）", defer=True)
             if not window:
                 break
+        # 2026-11-06（用户需求）：本轮窗口全部跑完后，逐台回补弃权台的剩余支数。
+        if deferred:
+            total += self._backfill_after_rotate(
+                deferred, st, target, quota_target, cd)
+        deferred_names = {d["name"] for d in deferred}
         for n in robots:
             s = st[n]
             # 汇总记账（2026-09-22）：st["done"] 已含签到首轮广告，与
             # stats["ad"] 当前值同口径，直接绝对值覆盖防重复累计。
             self._stat(n)["ad"] = s["done"]
-            if (s["fail"] >= max_fail
-                    and self._quota_left(s, target, quota_target) > 0):
-                left = self._quota_left(s, target, quota_target)
-                logger.warning("%s 连败 %d 次弃权，剩余 %d 支未看",
-                               n, max_fail, left)
-                self._stat(n)["note"] = "连败%d次弃权，余%d支未看" % (
-                    max_fail, left)
+            left = self._quota_left(s, target, quota_target)
+            # 回补会重置 s["fail"]，所以「曾弃权」还要靠 deferred_names 兜住，
+            # 否则回补没补完的台会静默丢掉漏看告警。
+            if left > 0 and (s["fail"] >= max_fail or n in deferred_names):
+                bf = int(s.get("backfill") or 0)
+                if bf:
+                    note = "连败%d次弃权→回补%d支，余%d支未看" % (
+                        max_fail, bf, left)
+                else:
+                    note = "连败%d次弃权，余%d支未看" % (max_fail, left)
+                logger.warning("%s %s", n, note)
+                self._stat(n)["note"] = note
         logger.info("轮换阶段完成：本进程共看 %d 支广告", total)
 
     def _rotate_watch_once(self, name: str, st: dict, target: int,
@@ -5160,12 +5460,28 @@ class Flow:
                 s["fail"] = 0
                 # 2026-10-31：记录「这一台刚看完一支」—— 供窗口缩到 1 台时
                 # 回落同机连看前补等 CD 余量（_wait_same_device_cd）。
+                # 2026-11-06：同一时刻也写进 st（按台口径），供本轮弃权回补
+                # 时补 CD（_backfill_cd_wait）—— 回补时全局标记早已是别的台。
                 self._last_ad_ts = time.time()
                 self._last_ad_robot = name
+                s["last_ts"] = self._last_ad_ts
                 base = s["base"] or 0
                 logger.info("%s 轮换看广告 +1（今日 %d/%d）",
                             name, base + s["done"], quota_target)
                 return 1
+            # 2026-11-10：试玩跳过（模拟器无微信）不计 fail，但必须收敛 ——
+            # 连续 max_fail 圈都只遇到试玩 ⇒ 判该台本轮无望，置 fail=max_fail
+            # 让调用方按「连败弃权」出窗并记入本轮回补队列（剩余支数不丢）。
+            if getattr(self, "_minigame_skip_final", False):
+                self._minigame_skip_final = False
+                s["mg_skip"] = int(s.get("mg_skip") or 0) + 1
+                logger.warning("%s 试玩跳过（不计失败），本台累计 %d/%d",
+                               name, s["mg_skip"], max_fail)
+                if s["mg_skip"] >= max_fail:
+                    logger.warning("%s 连续 %d 圈只遇到试玩版式 → 移出窗口，"
+                                   "剩余支数进本轮回补", name, max_fail)
+                    s["fail"] = max_fail
+                return 0
             s["fail"] += 1
             logger.warning("%s 轮换看广告失败，累计失败 %d/%d",
                            name, s["fail"], max_fail)
@@ -5616,6 +5932,9 @@ class Flow:
                 # 写的「30 支」其实是前 4 个账号的总和），读汇总时会被当成单账号
                 # 数据，属于口径误导。
                 self._minigame_stats = {"total": 0, "reward": 0}
+                # 2026-11-10：账号间内存回收 + RSS 观测（宿主仅 3.92GB，
+                # MuMu guest 2GB → 必须防止缓存跨账号累积）。只清可再生缓存。
+                self._release_memory("账号 %s 收尾" % nick)
 
         logger.info("多账号主流程结束：%s",
                     ", ".join("%s=%s" % (n, "OK" if ok else "FAIL")

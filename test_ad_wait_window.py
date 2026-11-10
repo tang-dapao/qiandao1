@@ -297,10 +297,16 @@ class TestMinigameSkipClose(unittest.TestCase):
 class TestMinigameProbe(unittest.TestCase):
     """版式探针：命中才分流，普通广告行为与时长必须完全不变。"""
 
-    def _run(self, screen_nodes, wf_extra=None):
+    def _run(self, screen_nodes, wf_extra=None, mg_skip=None):
         clock = _Clock()
         f = make_flow(wf_extra)
         f.wf["ad_minigame"] = True
+        # 2026-11-10：新增 workflow.ad_minigame_skip（模拟器无微信 → 试玩退回重看）。
+        # 默认 True 会改变本文件的「命中试玩」路由断言，故显式指定：
+        #   mg_skip=False → 旧链路（点进 + 等 19s，本类原断言对象）
+        #   mg_skip=True  → 新链路（只退回，不点「点击进入」）
+        if mg_skip is not None:
+            f.wf["ad_minigame_skip"] = mg_skip
         f.ui = _ScreenUI(screen_nodes)
         f._prefetch_ad_close_pos = mock.Mock()
         seen = {"closes": 0}
@@ -312,6 +318,7 @@ class TestMinigameProbe(unittest.TestCase):
 
         f._close_ad = _close
         f._play_minigame_ad = mock.Mock(return_value=True)
+        f._exit_minigame_landing = mock.Mock(return_value=True)
         start = clock.t
         with mock.patch.object(flow_mod, "time", clock.ns), \
                 mock.patch.object(flow_mod.random, "uniform",
@@ -320,9 +327,19 @@ class TestMinigameProbe(unittest.TestCase):
         return seen, f
 
     def test_cta_hit_routes_to_minigame(self):
-        seen, f = self._run(LANDING)
+        """旧链路（ad_minigame_skip=false）：命中试玩 → 进完整试玩链路。"""
+        seen, f = self._run(LANDING, mg_skip=False)
         f._play_minigame_ad.assert_called_once()
+        f._exit_minigame_landing.assert_not_called()
         self.assertEqual(seen["closes"], 0)        # 不走原关闭链
+
+    def test_cta_hit_skips_when_switch_on(self):
+        """新链路（ad_minigame_skip=true，默认）：只退回，不点「点击进入」。"""
+        seen, f = self._run(LANDING, mg_skip=True)
+        f._exit_minigame_landing.assert_called_once()
+        f._play_minigame_ad.assert_not_called()
+        self.assertTrue(f._minigame_skipped)
+        self.assertEqual(seen["closes"], 0)
 
     def test_normal_ad_still_exact_wait(self):
         """普通广告：探针耗时被吸收，总时长仍严格 = wait（回归 P0-a）。"""

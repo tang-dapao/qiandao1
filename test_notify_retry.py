@@ -10,7 +10,8 @@
 修复后必须守住：
   1. **网络层异常**（Timeout/ConnectionError）会重试，重试期间放宽单次超时；
   2. **配置类异常**（errcode/webhook 失效/IP 未授信）**不重试**（重试不会变好）；
-  3. 全部通道仍失败 → 写进待补发队列 `logs/notify_pending.jsonl`；
+  3. 全部通道仍失败 → 写进待补发队列 `state/notify_pending.jsonl`（2026-11-09
+     由 logs/ 迁至 state/：业务状态不能随 logs/ 一起清空）；
   4. 补发成功 → 该行从队列删除；仍失败 → 原样保留；
   5. `flush()` 收尾时自动补发一次（有配额与耗时预算，不能拖住退出）；
   6. 成功路径零额外开销（不写文件、不多发请求）。
@@ -193,7 +194,7 @@ class ConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(conf["send_retries"], 2)
         self.assertEqual(conf["retry_backoff"], 2.0)
         self.assertEqual(conf["retry_timeout"], 10.0)
-        self.assertEqual(conf["pending_file"], "logs/notify_pending.jsonl")
+        self.assertEqual(conf["pending_file"], "state/notify_pending.jsonl")
         self.assertEqual(conf["resend_max"], 5)
 
     def test_new_keys_overridable(self):

@@ -12,6 +12,7 @@
 
 运行：py -3.13 -m unittest test_3bot_rotate -v
 """
+import time
 import unittest
 from unittest import mock
 
@@ -236,6 +237,9 @@ class TestRotateGroupMode(ThreeBotRotationBase):
 
     def test_three_strikes_drops_robot_others_continue(self):
         # 全员看广告失败：每轮每人 fail+1，3 轮后全部弃权（3 台 × 3 次 = 9）
+        # 2026-11-06：本用例断言的是「窗口内弃权」的旧语义，关掉回补以免被
+        # 整轮结束后的补看干扰（回补行为见 TestBackfillAfterRotate）。
+        self.f.wf["rotate_backfill"] = False
         self.f._watch_ad_once = mock.Mock(return_value=False)
         self.f.run_all(ROBOTS_3, False, False, 1, rotate=True, group=3)
         self.assertEqual(self.f._watch_ad_once.call_count, 9)
@@ -339,6 +343,9 @@ class TestSlidingWindowRotate(ThreeBotRotationBase):
     def test_refill_after_strike_out_keeps_window_full(self):
         # 4 台 group=3 target=1，R1 进台三连败弃权出窗 → R4 补位，
         # R2/R3/R4 各看 1 支。弃权台不再进台，窗口保持轮换到耗尽。
+        # 2026-11-06：关掉回补 —— 本用例只测「窗口满员」语义；弃权后台在
+        # 整轮结束后会被回补重试，属于 TestBackfillAfterRotate 的范围。
+        self.f.wf["rotate_backfill"] = False
         self.f._enter_taskcenter = mock.Mock(
             side_effect=lambda name: name != "R1")
         self.f.run_all(["R1", "R2", "R3", "R4"], False, False, 1,
@@ -497,6 +504,99 @@ class TestReanchorKeng25(ThreeBotRotationBase):
         self.assertEqual(st["R1"]["reanchor"], 3)
         self.assertEqual(st["R1"]["fail"], 3)       # 触发既有弃权出窗路径
         self.assertEqual(n, 0)                      # 第 3 次：达上限 → 不再看
+
+
+class TestBackfillAfterRotate(ThreeBotRotationBase):
+    """本轮弃权回补（2026-11-06 用户需求）：弃权 ≠ 放弃。
+
+    规则：某台连败 3 次（打不开 / 播完未到账）出窗 → 记入 deferred →
+    **整轮窗口跑完后**同台连看把剩余支数补完。开关
+    `workflow.rotate_backfill`（false = 旧行为，弃权即放弃）。
+
+    为什么单独一组用例：回补发生在 `_run_rotate_phase` 末尾，属于「轮换
+    结束后」的第二阶段，与窗口内的出窗/补位语义正交。
+    """
+
+    ROBOTS_5 = ["R1", "R2", "R3", "R4", "R5"]
+
+    def _only_r1_enter_fails(self):
+        self.f._enter_taskcenter = mock.Mock(
+            side_effect=lambda name: name != "R1")
+
+    def test_strike_out_with_left_quota_is_backfilled(self):
+        # R1 进台三连败弃权（剩 1 支）→ 本轮结束后回补，补看成功即销账
+        self._only_r1_enter_fails()
+        self.f._watch_ads_session = mock.Mock(return_value=1)
+        self.f.run_all(self.ROBOTS_5, False, False, 1, rotate=True, group=5)
+        self.assertEqual(self.f._watch_ads_session.call_args_list,
+                         [mock.call("R1", 1, 0, start_done=0)])
+        self.assertEqual(self.f._stat("R1")["ad"], 1)   # 补到的支数计入汇总
+        self.assertFalse(self.f._stat("R1").get("note"))  # 补齐 → 不再报漏看
+
+    def test_backfill_disabled_keeps_old_give_up_behaviour(self):
+        # 回退开关：弃权即放弃，不补看、照常记漏看
+        self.f.wf["rotate_backfill"] = False
+        self._only_r1_enter_fails()
+        self.f._watch_ads_session = mock.Mock(return_value=0)
+        self.f.run_all(self.ROBOTS_5, False, False, 1, rotate=True, group=5)
+        self.f._watch_ads_session.assert_not_called()
+        self.assertEqual(self.f._stat("R1")["ad"], 0)
+        self.assertIn("连败3次弃权", self.f._stat("R1")["note"])
+
+    def test_backfill_no_progress_still_records_note(self):
+        # 回补也没补到 → 不能静默：note 必须写「余 N 支未看」
+        self._only_r1_enter_fails()
+        self.f._watch_ads_session = mock.Mock(return_value=0)
+        self.f.run_all(self.ROBOTS_5, False, False, 1, rotate=True, group=5)
+        self.f._watch_ads_session.assert_called_once()
+        self.assertIn("余1支未看", self.f._stat("R1")["note"])
+
+    def test_quota_full_out_is_not_queued_for_backfill(self):
+        # 配额满出窗 ≠ 弃权 → 不进回补队列（避免满额台被反复进台）
+        calls = {"n": 0}
+
+        def fake_ratio():
+            calls["n"] += 1
+            return (9, 10) if calls["n"] == 1 else None   # R1 首访只剩 1 支
+        self.f._read_ad_ratio = mock.Mock(side_effect=fake_ratio)
+        self.f._watch_ads_session = mock.Mock(return_value=0)
+        self.f.run_all(self.ROBOTS_5, False, False, 2, rotate=True, group=5)
+        self.f._watch_ads_session.assert_not_called()
+        self.assertFalse(self.f._stat("R1").get("note"))
+
+    def test_backfill_terminates_when_ad_watch_succeeds(self):
+        # 真实 _watch_ads_session：R1 回补时进台转成功 → 看 1 支即达 target，
+        # 循环收敛（done 单调递增，不存在「未到账反复归零」的死循环）
+        calls = {"n": 0}
+
+        def enter(name):
+            if name != "R1":
+                return True
+            calls["n"] += 1
+            return calls["n"] > 3          # 窗口内 3 次失败，回补时成功
+        self.f._enter_taskcenter = mock.Mock(side_effect=enter)
+        self.f.run_all(self.ROBOTS_5, False, False, 1, rotate=True, group=5)
+        # R2~R5 各 1 支 + R1 回补 1 支 = 5
+        self.assertEqual(self.f._watch_ad_once.call_count, 5)
+        self.assertEqual(self.f._stat("R1")["ad"], 1)
+
+    def test_backfill_cd_wait_uses_per_robot_last_ts(self):
+        # 回补首支无 CD 门槛 → 必须按「该台上支时间」补足余量
+        s = {"last_ts": time.time() - 10}
+        flow_mod.time.sleep.reset_mock()
+        waited = self.f._backfill_cd_wait("R1", s, 60)
+        self.assertGreaterEqual(waited, 49.0)
+        self.assertLessEqual(waited, 51.0)
+        flow_mod.time.sleep.assert_called_once()
+        self.assertAlmostEqual(flow_mod.time.sleep.call_args.args[0], waited,
+                               places=3)
+
+    def test_backfill_cd_wait_noop_when_never_watched(self):
+        # 该台本轮一支没看成（last_ts=0）→ 无需等，也不许瞎等
+        s = {"last_ts": 0.0}
+        flow_mod.time.sleep.reset_mock()
+        self.assertEqual(self.f._backfill_cd_wait("R1", s, 60), 0.0)
+        flow_mod.time.sleep.assert_not_called()
 
 
 if __name__ == "__main__":

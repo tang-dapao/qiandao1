@@ -37,8 +37,14 @@ log = logging.getLogger("notify")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_FILE = "notify.local.yaml"
-STATE_FILE = os.path.join(BASE_DIR, "logs", ".notify_state.json")
-TOKEN_FILE = os.path.join(BASE_DIR, "logs", ".wecom_token.json")
+# 业务状态目录（2026-11-09 目录整理）：与 logs/ 严格分离 ——
+#   logs/  = 诊断输出，可随时清空；state/ = 删了会出事故的持久业务状态。
+# ⚠️ 这两个常量写死 BASE_DIR/state，不随 config.yaml 的 state.dir 变化：
+#    它们是进程级去重窗口 / token 缓存，改路径需同时改常量与配置文件，
+#    避免出现「一半在 logs 一半在 state」的半迁移状态。
+STATE_DIR = os.path.join(BASE_DIR, "state")
+STATE_FILE = os.path.join(STATE_DIR, "notify_state.json")
+TOKEN_FILE = os.path.join(STATE_DIR, "wecom_token.json")
 API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 
 # access_token 有效期 7200s；提前 200s 刷新，避免边界失效
@@ -74,6 +80,8 @@ def load_notify_config(cfg: dict | None = None, base_dir: str = BASE_DIR) -> dic
     """
     cfg = cfg or {}
     raw = cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+    # 业务状态目录（2026-11-09）：待补发队列属于业务状态，默认落 state/ 而非 logs/
+    state_dir = str((cfg.get("state") or {}).get("dir") or "state")
     out = {
         "enabled": bool(raw.get("enabled", False)),
         "channel": str(raw.get("channel") or "wecom_app"),
@@ -92,7 +100,7 @@ def load_notify_config(cfg: dict | None = None, base_dir: str = BASE_DIR) -> dic
         "send_retries": int(raw.get("send_retries", 2)),
         "retry_backoff": float(raw.get("retry_backoff", 2.0)),
         "retry_timeout": float(raw.get("retry_timeout", 10.0)),
-        "pending_file": raw.get("pending_file", "logs/notify_pending.jsonl"),
+        "pending_file": raw.get("pending_file", f"{state_dir}/notify_pending.jsonl"),
         "resend_max": int(raw.get("resend_max", 5)),
         "wecom_app": {},
         "wecom_bot": {},
@@ -534,7 +542,7 @@ class Notifier:
 
     # -- 待补发队列（2026-10-30）----------------------------------------
     def _pending_path(self) -> str:
-        p = self.conf.get("pending_file", "logs/notify_pending.jsonl")
+        p = self.conf.get("pending_file", "state/notify_pending.jsonl")
         return p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
 
     def _pending_add(self, ev: dict, err) -> None:
@@ -737,7 +745,7 @@ if __name__ == "__main__":
     ap.add_argument("--test", action="store_true", help="发送测试消息")
     ap.add_argument("--ip", action="store_true", help="打印本机公网 IP")
     ap.add_argument("--resend", action="store_true",
-                    help="补发待补发队列（logs/notify_pending.jsonl）后退出")
+                    help="补发待补发队列（state/notify_pending.jsonl）后退出")
     ap.add_argument("--limit", type=int, default=None,
                     help="配合 --resend：本次最多补发几条（默认取 notify.resend_max）")
     a = ap.parse_args()
